@@ -1,0 +1,41 @@
+# Core ML & Analysis
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+lightgbm>=4.3.0
+shap>=0.44.0
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+
+# Data Ingestion
+aiohttp>=3.9.0
+websockets>=12.0
+requests>=2.31.0
+pynmea2>=1.19.0         # GPS NMEA parsing
+gpxpy>=1.6.0             # GPX file parsing
+
+# Database
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+
+# Async & Streaming
+asyncio-mqtt>=0.16.0
+asyncpg>=0.29.0
+
+# Validation & Config
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.0
+
+# Logging & Monitoring
+structlog>=24.1.0
+prometheus-client>=0.20.0
+
+# Serialization
+orjson>=3.9.0
+msgpack>=1.0.8
+
+# Testing & Quality
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
