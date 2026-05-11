@@ -1,18 +1,8 @@
 """
 Players Data — IBM CIC Germany
-Main Analysis Orchestrator
+Main Analysis Orchestrator  (v2 — Sequence Models)
 
-Entry point for the full analysis pipeline:
-  1. Baseline computation (per-player)
-  2. Model training (Isolation Forest, per-player)
-  3. SHAP explainer setup
-  4. Real-time inference loop
-  5. Feedback logging
-  6. Scheduled recalibration
-  7. Fairness auditing
 
-This module wires all components together without a frontend or backend.
-It exposes PlayersDataAnalysisPipeline — the production interface.
 """
 from __future__ import annotations
 
@@ -20,20 +10,21 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Tuple
 
 import numpy as np
 import pandas as pd
 
 from analysis.anomaly_detection import (
-    PatternAnalysisEngine, PlayerAnomalyModel, FEATURE_NAMES
+    PatternAnalysisEngine, AnomalyResult
 )
+
 from analysis.baseline import BaselineBuilder, PlayerBaselineProfile
-from explainability.xai_layer import XAILayer, SHAPExplanation
+from explainability.xai_layer import XAILayer, SHAPExplanation, FEATURE_NAMES as XAI_FEATURE_NAMES
 from feedback.recalibration import (
-    FeedbackStore, FairnessMonitor, OverrideRecord, RecalibrationPipeline
+    FeedbackStore, FairnessMonitor, OverrideRecord, RecalibrationPipeline,
 )
-from ingestion.pipeline import IngestionPipeline, RawPlayerObservation
+from ingestion.pipeline import IngestionPipeline
 from config.settings import CONFIG
 
 logger = logging.getLogger(__name__)
@@ -45,34 +36,21 @@ logging.basicConfig(
 
 
 # ─────────────────────────────────────────────
-# Player registry entry
+# Player registry
 # ─────────────────────────────────────────────
 class PlayerRegistry:
-    """Holds all per-player state: metadata, baseline, model, session history."""
-
     def __init__(self):
         self._players: Dict[int, dict] = {}
 
     def register(
-        self,
-        player_id: int,
-        external_id: str,
-        name: str,
-        position: str,
-        age: int,
-        age_group: str,
-        nationality: str = "",
+        self, player_id: int, external_id: str, name: str,
+        position: str, age: int, age_group: str = "Senior", nationality: str = "",
     ) -> None:
         self._players[player_id] = {
-            "player_id": player_id,
-            "external_id": external_id,
-            "name": name,
-            "position": position,
-            "age": age,
-            "age_group": age_group,
-            "nationality": nationality,
-            "baseline": None,
-            "model": None,
+            "player_id": player_id, "external_id": external_id,
+            "name": name, "position": position, "age": age,
+            "age_group": age_group, "nationality": nationality,
+            "baseline": None, "model": None,
             "sessions_df": pd.DataFrame(),
             "events_df": pd.DataFrame(),
             "annotations_df": pd.DataFrame(),
@@ -81,11 +59,8 @@ class PlayerRegistry:
     def get(self, player_id: int) -> Optional[dict]:
         return self._players.get(player_id)
 
-    def get_by_external_id(self, external_id: str) -> Optional[dict]:
-        for p in self._players.values():
-            if p["external_id"] == external_id:
-                return p
-        return None
+    def get_by_external_id(self, eid: str) -> Optional[dict]:
+        return next((p for p in self._players.values() if p["external_id"] == eid), None)
 
     def all_player_ids(self) -> List[int]:
         return list(self._players.keys())
@@ -94,47 +69,33 @@ class PlayerRegistry:
         if not self._players:
             return pd.DataFrame()
         return pd.DataFrame([
-            {
-                "player_id": p["player_id"],
-                "name": p["name"],
-                "position": p["position"],
-                "age_group": p["age_group"],
-                "nationality": p["nationality"],
-            }
+            {"player_id": p["player_id"], "name": p["name"],
+             "position": p["position"], "age_group": p["age_group"],
+             "nationality": p["nationality"]}
             for p in self._players.values()
         ])
 
 
 # ─────────────────────────────────────────────
-# Main Analysis Pipeline
+# Main pipeline
 # ─────────────────────────────────────────────
 class PlayersDataAnalysisPipeline:
     """
-    Production-level analysis pipeline for the Players Data IBM project.
+    Production-level analysis pipeline.
 
-    Usage
-    -----
+    Quick start
+    ───────────
     pipeline = PlayersDataAnalysisPipeline()
-
-    # 1. Register players
-    pipeline.register_player(player_id=1, external_id="p001", name="Player 7", ...)
-
-    # 2. Load historical data and train
-    pipeline.load_historical_data(player_id=1, sessions_df=..., events_df=..., annotations_df=...)
+    pipeline.register_player(player_id=7, external_id="p007", ...)
+    pipeline.load_historical_data(7, sessions_df, events_df)
+    pipeline.compute_baselines()
     pipeline.train_all_models()
-
-    # 3. Start live ingestion
-    await pipeline.run_live(enable_ws=True, enable_mqtt=True)
-
-    # 4. Log coach decisions
-    pipeline.log_coach_decision(inference_id=1, player_id=1, decision="override", ...)
-
-    # 5. Run recalibration and fairness audit
-    pipeline.recalibrate()
-    pipeline.run_fairness_audit()
+    pipeline.set_alert_callback(my_fn)
+    pipeline.process_live_event(event_dict)
     """
 
-    def __init__(self):
+    def __init__(self, model_type: str = None):
+        self.model_type = model_type or CONFIG.active_model
         self.registry = PlayerRegistry()
         self.baseline_builder = BaselineBuilder()
         self.pattern_engine = PatternAnalysisEngine()
@@ -143,34 +104,19 @@ class PlayersDataAnalysisPipeline:
         self.recalibration_pipeline = RecalibrationPipeline()
         self.fairness_monitor = FairnessMonitor()
 
-        self._inference_log: List[dict] = []      # In-memory; DB-persisted in production
+        self._inference_log: List[dict] = []
         self._on_alert_callback: Optional[Callable] = None
         self._inference_id_counter = 0
 
     # ──────────────────────────────────────────
-    # Registration & Data Loading
+    # Registration & data loading
     # ──────────────────────────────────────────
     def register_player(
-        self,
-        player_id: int,
-        external_id: str,
-        name: str,
-        position: str,
-        age: int,
-        age_group: str = "Senior",
-        nationality: str = "",
+        self, player_id: int, external_id: str, name: str,
+        position: str, age: int, age_group: str = "Senior", nationality: str = "",
     ) -> None:
-        """Register a player in the system."""
-        self.registry.register(
-            player_id=player_id,
-            external_id=external_id,
-            name=name,
-            position=position,
-            age=age,
-            age_group=age_group,
-            nationality=nationality,
-        )
-        logger.info("Registered player: %s (id=%d, pos=%s)", name, player_id, position)
+        self.registry.register(player_id, external_id, name, position, age, age_group, nationality)
+        logger.info("Registered player: %s (id=%d pos=%s)", name, player_id, position)
 
     def load_historical_data(
         self,
@@ -179,186 +125,360 @@ class PlayersDataAnalysisPipeline:
         events_df: pd.DataFrame,
         annotations_df: pd.DataFrame = None,
     ) -> None:
-        """
-        Load historical data for a player. Required before training.
-
-        Parameters
-        ----------
-        sessions_df : DataFrame[session_id, started_at, total_distance_m,
-                                sprint_count, max_speed_ms, high_speed_distance_m,
-                                avg_speed_ms, avg_heart_rate_bpm]
-        events_df   : DataFrame[session_id, ts, x_pitch, y_pitch, speed_ms, is_sprint]
-        annotations_df : DataFrame[session_id, annotation_type, value, severity]
-        """
         player = self.registry.get(player_id)
         if player is None:
             raise ValueError(f"Player {player_id} not registered")
-
         player["sessions_df"] = sessions_df
-        player["events_df"] = events_df
+        player["events_df"]   = events_df
         player["annotations_df"] = annotations_df if annotations_df is not None else pd.DataFrame()
-
-        logger.info(
-            "Historical data loaded for player %d: %d sessions, %d events",
-            player_id, len(sessions_df), len(events_df)
-        )
+        logger.info("Data loaded for player %d: %d sessions, %d events",
+                    player_id, len(sessions_df), len(events_df))
 
     # ──────────────────────────────────────────
-    # Baseline & Model Training
+    # Baseline computation
     # ──────────────────────────────────────────
     def compute_baselines(self, window_days: int = 28) -> Dict[int, PlayerBaselineProfile]:
-        """Compute personal baselines for all registered players."""
         baselines = {}
         for pid in self.registry.all_player_ids():
-            player = self.registry.get(pid)
-            if player["sessions_df"].empty:
-                logger.warning("Player %d: no sessions — baseline skipped", pid)
+            p = self.registry.get(pid)
+            if p["sessions_df"].empty:
                 continue
-
             baseline = self.baseline_builder.compute(
                 player_id=pid,
-                external_id=player["external_id"],
-                sessions_df=player["sessions_df"],
-                events_df=player["events_df"],
+                external_id=p["external_id"],
+                sessions_df=p["sessions_df"],
+                events_df=p["events_df"],
                 window_days=window_days,
             )
-
             if baseline:
-                player["baseline"] = baseline
+                p["baseline"] = baseline
                 self.pattern_engine.register_player(pid, baseline)
                 baselines[pid] = baseline
                 logger.info(
-                    "Baseline computed for player %d: sessions=%d, "
-                    "dist_mean=%.0fm, sprint_mean=%.1f",
+                    "Baseline: player %d | sessions=%d | dist_mean=%.0fm | "
+                    "sprint_mean=%.1f | fatigue_r2=%.3f",
                     pid, baseline.n_sessions,
-                    baseline.distance_mean, baseline.sprint_count_mean
+                    baseline.distance_mean, baseline.sprint_count_mean,
+                    baseline.fatigue_r_squared or 0,
                 )
-            else:
-                logger.warning("Player %d: baseline computation failed", pid)
-
         return baselines
 
-    def train_all_models(self) -> None:
-        """Train Isolation Forest for every player with a baseline."""
+    # ──────────────────────────────────────────
+    # Model training 
+    # ──────────────────────────────────────────
+    def train_all_models(self) -> dict:
+        """
+        Collects sliding-window sequences from all players, then trains ONE
+        shared backbone model across all players simultaneously.
+        Per-player thresholds are calibrated from each player's held-out slice.
+        XAI background is registered per-player from their own windows.
+        """
+
+        # ── Phase 1: build sequences for every eligible player ──────────────
+        all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
+
         for pid in self.registry.all_player_ids():
-            player = self.registry.get(pid)
-            if player["baseline"] is None:
-                logger.warning("Player %d: no baseline — model training skipped", pid)
+            p = self.registry.get(pid)
+
+            if p["baseline"] is None:
+                logger.warning("Player %d: no baseline — skipped", pid)
+                continue
+            if p["events_df"].empty:
+                logger.warning("Player %d: no events — skipped", pid)
                 continue
 
-            # Build historical feature matrix from session data
-            feature_matrix = self.pattern_engine.build_historical_feature_matrix(
-                player_id=pid,
-                sessions_df=player["sessions_df"],
-                events_df=player["events_df"],
-                annotations_df=player["annotations_df"],
+            sequences = self.pattern_engine.build_training_sequences(
+                events_df=p["events_df"],
+                sessions_df=p["sessions_df"],
             )
 
-            if len(feature_matrix) == 0:
-                logger.warning("Player %d: empty feature matrix — training skipped", pid)
+            if len(sequences) == 0:
+                logger.warning("Player %d: 0 sequences built — skipped", pid)
                 continue
 
-            model = PlayerAnomalyModel(pid)
-            model.train(feature_matrix)
-            player["model"] = model
-            self.pattern_engine._models[pid] = model
+            all_windows[pid] = sequences
+            logger.info("Player %d: %d training sequences built", pid, len(sequences))
 
-            # Build SHAP explainer
-            self.xai_layer.register_explainer(model, feature_matrix)
+        if not all_windows:
+            logger.warning("No eligible players — shared model training aborted")
+            return {}
 
-            # Save model
-            save_path = model.save()
-            logger.info("Player %d: model trained and saved to %s", pid, save_path)
+        # ── Phase 2: train ONE shared model across all players ───────────────
+        result = self.pattern_engine.train_player_model(all_windows)
+        logger.info(
+            "Shared backbone trained | players=%d | total_windows=%d | version=%s",
+            result.get("n_players", 0),
+            result.get("n_windows", 0),
+            self.pattern_engine._shared_model.model_version
+            if self.pattern_engine._shared_model else "n/a",
+        )
 
+        # ── Phase 3: per-player XAI background registration ─────────────────
+        results: Dict[int, dict] = {}
+
+        for pid, sequences in all_windows.items():
+            p = self.registry.get(pid)
+
+            shared_model = self.pattern_engine._shared_model
+            if shared_model is None:
+                continue
+
+            # Store reference on the player record so process_live_event can reach it
+            p["model"] = shared_model
+
+            # ── Build XAI-space background from REAL windows ──────────────────
+            # Each background row is derived from an actual training window using
+            # the same feature-engineering transforms as inference. This ensures
+            # SHAP explanations reflect the true data manifold.
+            # Previously used synthetic random samples (bg_rng.normal, bg_rng.uniform)
+            # for unmapped features — that creates a fake manifold which can make
+            # SHAP attributions directionally misleading.
+            from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
+            _sfn_idx     = {n: i for i, n in enumerate(_SFN)}
+            window_steps = CONFIG.window.window_steps
+
+            n_bg_samples = min(200, len(sequences))
+            results[pid] = {
+                    "status": "trained",
+                    "n_sequences": len(sequences),
+                    "xai_background_rows": n_bg_samples,
+                }
+            xai_dim      = len(XAI_FEATURE_NAMES)
+            bg_xai       = np.zeros((n_bg_samples, xai_dim), dtype=np.float32)
+            _c           = {n: i for i, n in enumerate(XAI_FEATURE_NAMES)}
+            baseline_p   = p.get("baseline")
+
+            for bi, (w, mask_w) in enumerate(sequences[:n_bg_samples]):
+                last = w[-1]   # last timestep (N_SEQUENCE_FEATURES,)
+
+                # --- Features derived directly from window data ---------------
+                spd = float(last[_sfn_idx["speed_ms"]])
+                hr  = float(last[_sfn_idx["heart_rate_bpm"]])
+                spr = float(last[_sfn_idx["sprint_flag"]])
+                ddt = float(last[_sfn_idx["distance_delta_m"]])
+
+                bg_xai[bi, _c["window_avg_speed_ms"]]  = spd
+                bg_xai[bi, _c["heart_rate_bpm"]]       = hr
+                bg_xai[bi, _c["window_sprint_count"]]  = spr
+                # Window distance: per-tick displacement × number of valid ticks
+                n_valid = max(int(mask_w.sum()), 1)
+                bg_xai[bi, _c["window_distance_m"]]    = ddt * n_valid
+
+                # HR recovery: fractional HR change × current HR gives bpm-delta display value.
+                # hr_recovery_rate is now in [-1, 1] (fractional), not bpm/s.
+                # The old * 15.0 multiplier assumed bpm/s units — now incorrect.
+                hr_rec_frac = abs(float(last[_sfn_idx["hr_recovery_rate"]]))
+                hr_current  = max(float(last[_sfn_idx["heart_rate_bpm"]]), 1.0)
+                bg_xai[bi, _c["hr_recovery_time_s"]] = hr_rec_frac * hr_current
+
+                # Missingness ratio as informative feature
+                missing_frac = 1.0 - float(mask_w.mean())
+
+                # Baseline z-scores from real baseline (not random)
+                if baseline_p is not None:
+                    window_dist = ddt * n_valid
+                    bg_xai[bi, _c["z_distance"]]       = float(np.clip(
+                        baseline_p.zscore("distance", window_dist), -4, 4))
+                    bg_xai[bi, _c["z_sprint_count"]]   = float(np.clip(
+                        baseline_p.zscore("sprint_count", spr * 10), -4, 4))
+                    bg_xai[bi, _c["z_top_speed"]]      = float(np.clip(
+                        baseline_p.zscore("top_speed", spd), -4, 4))
+                    bg_xai[bi, _c["z_high_speed_dist"]] = float(np.clip(
+                        baseline_p.zscore("high_speed_dist", window_dist * 0.28), -4, 4))
+
+                # Fatigue residual: speed vs expected decay at window midpoint
+                # Use baseline fatigue curve if available, else 0
+                if baseline_p is not None and baseline_p.fatigue_alpha:
+                    import math as _math
+                    t_mid   = (bi / max(n_bg_samples, 1)) * 90.0  # rough match-minute proxy
+                    beta    = baseline_p.fatigue_beta or spd * 1.3
+                    alpha   = baseline_p.fatigue_alpha
+                    exp_spd = beta * _math.exp(-alpha * t_mid)
+                    bg_xai[bi, _c["fatigue_decay_residual"]] = float(
+                        np.clip((spd - exp_spd) * n_valid, -500, 500))
+
+                # ACWR default 1.0 for background (normal training load)
+                bg_xai[bi, _c["acwr"]] = 1.0
+
+                # Coach features default to 0 (no annotation for training windows)
+                # positional_drift_score defaults to 0 (no drift for most windows)
+
+            self.xai_layer.register_explainer_for_player(pid, bg_xai)
+            logger.info("Player %d: XAI background registered from real windows (%d rows)",
+                        pid, n_bg_samples)
+
+            # ── Store raw sequence background for true SHAP ───────────────────
+            # xai_layer._explain_sequence_shap() needs the raw (unnormalised)
+            # sequences in (N_bg, T, F) shape. The model normaliser is applied
+            # inside _explain_sequence_shap so perturbations happen in the same
+            # space the LSTM sees.
+            raw_bg_sequences = np.stack(
+                [w for w, _ in sequences[:n_bg_samples]], axis=0
+            )   # (N_bg, T, F)
+            p["sequence_background"] = raw_bg_sequences
+            logger.info(
+                "Player %d: sequence background stored (%d × %s) for true SHAP",
+                pid, len(raw_bg_sequences), raw_bg_sequences.shape[1:],
+            )
+
+        return {
+                "status": "success",
+                "shared_model": {
+                    "n_players": result.get("n_players", 0),
+                    "n_windows": result.get("n_windows", 0),
+                    "model_version": (
+                        self.pattern_engine._shared_model.model_version
+                        if self.pattern_engine._shared_model else "n/a"
+                    ),
+                },
+                "players": results,
+            }
     # ──────────────────────────────────────────
-    # Real-Time Inference
+    # Live inference
     # ──────────────────────────────────────────
     def process_live_event(
         self,
         normalized_event: dict,
-        match_id: Optional[str] = None,
         segment_index: int = 0,
     ) -> Optional[SHAPExplanation]:
         """
-        Process one normalized event from the ingestion pipeline.
-        Returns a SHAPExplanation if an alert is triggered, None otherwise.
-        Max latency target: 200 ms (per proposal spec).
+        Process one raw normalised event from the ingestion pipeline.
+        Returns SHAPExplanation if an alert is triggered, None otherwise.
+        <200 ms latency target.
         """
-        t_start = time.perf_counter()
+        t0 = time.perf_counter()
 
-        external_id = normalized_event.get("player_external_id")
-        if not external_id:
+        eid = normalized_event.get("player_external_id")
+        if not eid:
             return None
 
-        player = self.registry.get_by_external_id(external_id)
+        player = self.registry.get_by_external_id(eid)
         if player is None:
             return None
 
         pid = player["player_id"]
 
-        # Get latest coach annotation for this player
-        ann = self._get_latest_annotation(player)
-
-        # Run pattern analysis
+        # Run sequence anomaly analysis
         result = self.pattern_engine.analyze(
             player_id=pid,
-            live_window=normalized_event,
+            live_event=normalized_event,
             sessions_df=player["sessions_df"],
-            segment_index=segment_index,
-            coach_annotation=ann,
         )
 
         if result is None or result.recommendation_type is None:
             return None
 
-        # Compute SHAP explanation
+        # SHAP explanation
         model = player.get("model")
         if model is None:
-            logger.debug("Player %d: no trained model — SHAP skipped", pid)
             return None
 
-        explanation = self.xai_layer.explain(result, model, player["name"])
+        # Build a flattened feature vector for XAI (sequence last-step + derived)
+        xai_fv = self._build_xai_feature_vector(result)
+
+        explanation = self.xai_layer.explain_from_dict(
+            player_id=pid,
+            external_id=player["external_id"],
+            model=model,
+            feature_vector=xai_fv,
+            recommendation_type=result.recommendation_type,
+            confidence=result.confidence,
+            workload_status=result.workload_status,
+            anomaly_score=result.anomaly_score,
+            player_name=player["name"],
+            # ── True SHAP arguments ──────────────────────────────────────────
+            # Pass the raw (unnormalised) sequence so xai_layer can normalise
+            # via model.normaliser and run real encoder→decoder perturbations.
+            sequence=result.raw_sequence if hasattr(result, "raw_sequence") else None,
+            mask=result.raw_mask if hasattr(result, "raw_mask") else None,
+            sequence_background=player.get("sequence_background"),
+        )
 
         # Log inference
         self._inference_id_counter += 1
-        inference_record = {
-            "inference_id": self._inference_id_counter,
-            "player_id": pid,
-            "session_id": normalized_event.get("session_id"),
+        log_entry = {
+            "inference_id":        self._inference_id_counter,
+            "player_id":           pid,
             "recommendation_type": result.recommendation_type,
-            "confidence": result.confidence,
-            "triggered_at": result.triggered_at.isoformat(),
-            "shap_values": explanation.shap_values,
-            "feature_values": explanation.feature_values,
-            "nlg_summary": explanation.nlg_summary,
-            "counterfactual": explanation.counterfactual,
-            "anomaly_score": result.anomaly_score,
-            "model_version": model.model_version,
-            "is_anomaly": result.is_anomaly,
+            "confidence":          result.confidence,
+            "triggered_at":        result.triggered_at.isoformat(),
+            "anomaly_score":       result.anomaly_score,
+            "model_type":          result.model_type,
+            "model_version":       getattr(model, "model_version", ""),
+            "is_anomaly":          result.is_anomaly,
+            "feature_values":      result.feature_vector,
+            "shap_values":         explanation.shap_values if explanation else {},
+            "nlg_summary":         explanation.nlg_summary if explanation else "",
         }
-        self._inference_log.append(inference_record)
+        self._inference_log.append(log_entry)
 
-        # Fire callback if registered
-        if self._on_alert_callback:
+        if self._on_alert_callback and explanation:
             try:
                 self._on_alert_callback(explanation)
             except Exception as exc:
-                logger.exception("Alert callback failed: %s", exc)
+                logger.exception("Alert callback error: %s", exc)
 
-        t_ms = (time.perf_counter() - t_start) * 1000
+        t_ms = (time.perf_counter() - t0) * 1000
         if t_ms > CONFIG.inference.max_latency_ms:
-            logger.warning("Inference latency %.1f ms exceeds 200 ms SLA", t_ms)
-        else:
-            logger.debug("Inference latency: %.1f ms", t_ms)
+            logger.warning("Inference latency %.1f ms > 200 ms SLA", t_ms)
 
         return explanation
 
-    def set_alert_callback(self, callback: Callable[[SHAPExplanation], None]) -> None:
-        """Register a callback invoked every time an alert is generated."""
-        self._on_alert_callback = callback
+    def _build_xai_feature_vector(self, result: AnomalyResult) -> dict:
+        """
+        Maps sequence AnomalyResult → 15-feature XAI dict.
+
+        Key corrections vs. prior version:
+        • window_distance_m = distance_delta_m * window_steps (not * 8 hardcoded)
+        • reconstruction_loss excluded — not in FEATURE_NAMES, was silently dropped
+        • z-scores computed from real baseline, not fabricated
+        """
+        sfv          = result.feature_vector
+        window_steps = CONFIG.window.window_steps   # 24 at 5 s/tick
+
+        xai: dict = {}
+        xai["window_sprint_count"] = sfv.get("sprint_flag", 0.0)
+        # Scale single-tick displacement to full window distance
+        xai["window_distance_m"]   = sfv.get("distance_delta_m", 0.0) * window_steps
+        xai["window_avg_speed_ms"] = sfv.get("speed_ms", 0.0)
+        xai["heart_rate_bpm"]      = sfv.get("heart_rate_bpm", 0.0)
+        # hr_recovery_rate is now a fractional HR change in [-1, 1]
+        # Convert to a display-friendly bpm delta: |fraction| x current HR.
+        # The old abs(hr_recovery_rate) * 15.0 assumed bpm/s and produced junk values.
+        _hr_rec_frac = sfv.get("hr_recovery_rate", 0.0)
+        _hr_bpm      = sfv.get("heart_rate_bpm", 150.0)
+        xai["hr_recovery_time_s"] = sfv.get("hr_recovery_time_s",
+                                             abs(_hr_rec_frac) * max(_hr_bpm, 1.0))
+        xai["acwr"]                    = sfv.get("acwr", 1.0)
+        xai["positional_drift_score"]  = sfv.get("drift_score", 0.0)
+        xai["fatigue_decay_residual"]  = sfv.get("fatigue_decay_residual", 0.0)
+        xai["speed_drop_pct"]          = sfv.get("speed_drop_pct", 0.0)
+        xai["coach_fatigue_severity"]  = sfv.get("coach_fatigue_severity", 0.0)
+        xai["coach_pre_match_status_encoded"] = sfv.get("coach_pre_match_status_encoded", 0.0)
+
+        player   = self.registry.get_by_external_id(result.external_id)
+        baseline = player["baseline"] if player else None
+        if baseline is not None:
+            speed       = xai["window_avg_speed_ms"]
+            window_dist = xai["window_distance_m"]
+            xai["z_distance"]        = baseline.zscore("distance",       window_dist)
+            xai["z_sprint_count"]    = baseline.zscore("sprint_count",   xai["window_sprint_count"] * 10)
+            xai["z_top_speed"]       = baseline.zscore("top_speed",      speed)
+            xai["z_high_speed_dist"] = baseline.zscore("high_speed_dist", window_dist * 0.28)
+        else:
+            xai["z_distance"] = xai["z_sprint_count"] = xai["z_top_speed"] = xai["z_high_speed_dist"] = 0.0
+
+        from explainability.xai_layer import FEATURE_NAMES as _XAI_FN
+        for fname in _XAI_FN:
+            xai.setdefault(fname, 0.0)
+
+        return xai
+
+    def set_alert_callback(self, cb: Callable) -> None:
+        self._on_alert_callback = cb
 
     # ──────────────────────────────────────────
-    # Coach Feedback
+    # Coach feedback
     # ──────────────────────────────────────────
     def log_coach_decision(
         self,
@@ -369,27 +489,22 @@ class PlayersDataAnalysisPipeline:
         coach_note: Optional[str] = None,
         session_id: Optional[int] = None,
     ) -> None:
-        """
-        Log a coach's accept/override/defer decision.
-        This is the primary human feedback signal for recalibration.
-        """
         inference = next(
             (r for r in self._inference_log if r["inference_id"] == inference_id), None
         )
-        if inference is None:
-            logger.warning("Inference ID %d not found in log", inference_id)
+        if not inference:
+            logger.warning("Inference ID %d not found", inference_id)
             return
 
         player = self.registry.get(player_id)
-        if player is None:
-            logger.warning("Player %d not registered", player_id)
+        if not player:
             return
 
         record = OverrideRecord(
             inference_id=inference_id,
             player_id=player_id,
             player_external_id=player["external_id"],
-            session_id=session_id or inference.get("session_id", 0),
+            session_id=session_id or 0,
             recommendation_type=inference["recommendation_type"],
             decision=decision,
             coach_id=coach_id,
@@ -400,64 +515,38 @@ class PlayersDataAnalysisPipeline:
             age_group=player.get("age_group"),
             nationality=player.get("nationality"),
         )
-
         self.feedback_store.log_override(record)
+        logger.info("Coach decision logged: player=%d decision=%s coach=%s",
+                    player_id, decision, coach_id)
 
     # ──────────────────────────────────────────
-    # Recalibration & Fairness
+    # Recalibration & fairness
     # ──────────────────────────────────────────
     def recalibrate(self, trigger_reason: str = "manual") -> List[dict]:
-        """
-        Run the recalibration pipeline.
-        Returns list of adjustment summaries.
-        """
         player_models = {
             pid: self.registry.get(pid)["model"]
             for pid in self.registry.all_player_ids()
             if self.registry.get(pid).get("model") is not None
         }
-
         results = self.recalibration_pipeline.run(
-            feedback_store=self.feedback_store,
-            player_models=player_models,
-            trigger_reason=trigger_reason,
+            self.feedback_store, player_models, trigger_reason
         )
-
-        summaries = []
-        for r in results:
-            summaries.append({
-                "player_id": r.player_id,
-                "recalibrated_at": r.recalibrated_at.isoformat(),
-                "trigger": r.trigger_reason,
-                "n_overrides": r.n_overrides_analyzed,
-                "adjustments": r.adjustments,
-                "notes": r.notes,
-            })
-            logger.info(
-                "Recalibration: player=%s reason=%s adjustments=%d",
-                r.player_id, r.trigger_reason, len(r.adjustments)
-            )
-
-        return summaries
+        return [
+            {"player_id": r.player_id, "recalibrated_at": r.recalibrated_at.isoformat(),
+             "trigger": r.trigger_reason, "adjustments": r.adjustments, "notes": r.notes}
+            for r in results
+        ]
 
     def run_fairness_audit(self) -> str:
-        """Run fairness audit and return a plain-text report."""
         if not self._inference_log:
             return "No inference data available for fairness audit."
-
         inference_df = pd.DataFrame(self._inference_log)
-        inference_df["is_anomaly"] = inference_df.get("is_anomaly", False)
-
-        metadata_df = self.registry.metadata_dataframe()
-
+        metadata_df  = self.registry.metadata_dataframe()
         audit_results = self.fairness_monitor.audit(inference_df, metadata_df)
-        report = self.fairness_monitor.generate_audit_report(audit_results)
-
-        logger.info("Fairness audit complete — %d attributes audited", len(audit_results))
-        return report
+        return self.fairness_monitor.generate_audit_report(audit_results)
 
     # ──────────────────────────────────────────
-    # Live Ingestion Integration
+    # Live ingestion
     # ──────────────────────────────────────────
     async def run_live(
         self,
@@ -468,25 +557,16 @@ class PlayersDataAnalysisPipeline:
         pitch_origin: Optional[tuple] = None,
         gps_player_id: Optional[str] = None,
     ) -> None:
-        """
-        Start the full live ingestion + inference loop.
-        Blocks until the pipeline is stopped.
-        """
         ingestion = IngestionPipeline(
-            on_event=lambda event: self.process_live_event(event),
+            on_event=lambda ev: self.process_live_event(ev),
             pitch_origin=pitch_origin,
         )
-
-        # Schedule weekly recalibration
         recal_task = asyncio.create_task(self._scheduled_recalibration())
-
-        logger.info("Players Data Analysis Pipeline — LIVE MODE STARTED")
+        logger.info("PlayersDataAnalysisPipeline LIVE — model=%s", self.model_type.upper())
         await asyncio.gather(
             ingestion.run(
-                enable_gps=enable_gps,
-                enable_api=enable_api,
-                enable_ws=enable_ws,
-                enable_mqtt=enable_mqtt,
+                enable_gps=enable_gps, enable_api=enable_api,
+                enable_ws=enable_ws, enable_mqtt=enable_mqtt,
                 gps_player_id=gps_player_id,
             ),
             recal_task,
@@ -494,47 +574,25 @@ class PlayersDataAnalysisPipeline:
         )
 
     async def _scheduled_recalibration(self) -> None:
-        """Run recalibration every N days as configured."""
         interval_s = CONFIG.feedback.recalibration_cadence_days * 86400
         while True:
             await asyncio.sleep(interval_s)
             logger.info("Scheduled recalibration triggered")
-            self.recalibrate(trigger_reason="weekly_cadence")
-            logger.info("Scheduled fairness audit triggered")
+            self.recalibrate("weekly_cadence")
             print(self.run_fairness_audit())
 
     # ──────────────────────────────────────────
-    # Inspection / Reporting
+    # Inspection helpers
     # ──────────────────────────────────────────
     def get_inference_log(self) -> pd.DataFrame:
-        """Return all logged inferences as a DataFrame for analysis."""
         return pd.DataFrame(self._inference_log) if self._inference_log else pd.DataFrame()
 
     def get_override_summary(self) -> dict:
-        """Summary statistics for coach overrides."""
         df = self.feedback_store.to_dataframe()
         if df.empty:
             return {"total": 0, "override_rate": 0.0}
-
         return {
             "total_decisions": len(df),
             "total_overrides": int((df["decision"] == "override").sum()),
-            "total_accepts": int((df["decision"] == "accept").sum()),
-            "override_rate": round(self.feedback_store.override_rate, 4),
-            "by_recommendation_type": df.groupby("recommendation_type")["decision"]
-            .value_counts()
-            .to_dict(),
-        }
-
-    def _get_latest_annotation(self, player: dict) -> Optional[dict]:
-        """Get the most recent coach annotation for a player."""
-        ann_df = player.get("annotations_df")
-        if ann_df is None or ann_df.empty:
-            return None
-
-        latest = ann_df.sort_values("annotated_at", ascending=False).iloc[0]
-        return {
-            "fatigue_severity": float(latest.get("severity", 0.0)),
-            "pre_match_status": latest.get("value", "good"),
-            "annotation_type": latest.get("annotation_type", ""),
+            "override_rate":   round(self.feedback_store.override_rate, 4),
         }

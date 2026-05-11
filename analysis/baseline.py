@@ -1,18 +1,6 @@
 """
 Players Data — IBM CIC Germany
 Personal Baseline Modelling
-
-Builds and maintains an individual performance baseline for each player
-from their own historical session data.
-
-Metrics tracked against personal baseline:
-  - Total distance per 15-min segment
-  - Sprint count per 15-min segment
-  - High-speed distance
-  - Top speed
-  - Fatigue decay curve (exponential fit across match segments)
-  - Positional norms (mean position, std radius)
-  - Rolling 7-day and 28-day workload windows
 """
 from __future__ import annotations
 
@@ -102,9 +90,8 @@ class PlayerBaselineProfile:
 # ─────────────────────────────────────────────
 # Fatigue curve model
 # ─────────────────────────────────────────────
-def _exponential_decay(t: np.ndarray, alpha: float, beta: float) -> np.ndarray:
-    """Exponential decay: y = beta * exp(-alpha * t)."""
-    return beta * np.exp(-alpha * t)
+def _linear_fatigue(t: np.ndarray, slope: float, intercept: float) -> np.ndarray:
+    return slope * t + intercept
 
 
 def fit_fatigue_curve(
@@ -125,13 +112,27 @@ def fit_fatigue_curve(
 
     try:
         # Initial guess: alpha=0.1, beta=mean distance
-        p0 = [0.1, float(np.mean(y))]
-        bounds = ([0.0, 0.0], [5.0, y.max() * 2])
-        popt, _ = curve_fit(_exponential_decay, t, y, p0=p0, bounds=bounds, maxfev=5000)
+        p0 = [-50.0, float(np.mean(y))]
+
+        bounds = (
+            [-10000.0, 0.0],
+            [10000.0, y.max() * 2],
+        )
+
+        popt, _ = curve_fit(
+            _linear_fatigue,
+            t,
+            y,
+            p0=p0,
+            bounds=bounds,
+            maxfev=5000,
+        )
+
+        slope, intercept = popt
         alpha, beta = popt
 
         # Coefficient of determination R²
-        y_pred = _exponential_decay(t, alpha, beta)
+        y_pred = _linear_fatigue(t, slope, intercept)
         ss_res = np.sum((y - y_pred) ** 2)
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
@@ -218,66 +219,164 @@ class BaselineBuilder:
         )
 
     def _compute_fatigue_curve(
-        self,
-        events_df: pd.DataFrame,
-        sessions_df: pd.DataFrame,
-    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    self,
+    events_df: pd.DataFrame,
+    sessions_df: pd.DataFrame,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
-        Average fatigue decay curve across all sessions.
-        Each session is segmented into 15-min windows; distance per segment is extracted.
-        The average distance profile across sessions is fitted with exponential decay.
+        Computes a robust per-player fatigue trend from historical telemetry.
+
+        Method:
+        1. Split each session into fixed time windows (e.g. 15 min)
+        2. Estimate distance covered in each segment using speed × dt
+        3. Fit a linear decay trend per session
+        4. Aggregate session trends using median statistics
+
+        Returns
+        -------
+        (slope, intercept, r_squared)
+
+        slope:
+            Negative slope => performance decay over match duration
+            Near 0         => stable work rate
+            Positive       => unrealistic / noisy telemetry
+
+        intercept:
+            Estimated starting segment workload
+
+        r_squared:
+            Goodness of fit of the fatigue trend
         """
         if events_df.empty or "ts" not in events_df.columns:
             return None, None, None
 
-        events_df = events_df.copy()
-        events_df["ts"] = pd.to_datetime(events_df["ts"])
+        MIN_EVENTS_PER_SEGMENT = 30
 
-        all_segment_profiles: List[List[float]] = []
+        events_df = events_df.copy()
+        events_df["ts"] = pd.to_datetime(events_df["ts"], utc=True)
+
+        all_profiles: List[List[float]] = []
 
         for _, session in sessions_df.iterrows():
-            sess_events = events_df[events_df["session_id"] == session["session_id"]].copy()
+
+            sess_events = events_df[
+                events_df["session_id"] == session["session_id"]
+            ].copy()
+
             if sess_events.empty:
                 continue
 
             sess_events = sess_events.sort_values("ts")
-            start = sess_events["ts"].min()
+
+            start_ts = sess_events["ts"].min()
+
             sess_events["elapsed_min"] = (
-                (sess_events["ts"] - start).dt.total_seconds() / 60.0
+                (sess_events["ts"] - start_ts).dt.total_seconds() / 60.0
             )
 
             seg_width = self.fatigue_cfg.window_minutes
-            max_seg = int(sess_events["elapsed_min"].max() // seg_width) + 1
+
+            max_seg = int(
+                sess_events["elapsed_min"].max() // seg_width
+            ) + 1
 
             segment_distances: List[float] = []
+
             for seg_idx in range(max_seg):
+
                 seg_start = seg_idx * seg_width
-                seg_end = (seg_idx + 1) * seg_width
+                seg_end   = (seg_idx + 1) * seg_width
+
                 seg_events = sess_events[
                     (sess_events["elapsed_min"] >= seg_start) &
                     (sess_events["elapsed_min"] < seg_end)
-                ]
-                if seg_events.empty or "speed_ms" not in seg_events:
-                    segment_distances.append(0.0)
+                ].copy()
+
+                # Ignore sparse / unreliable telemetry
+                if len(seg_events) < MIN_EVENTS_PER_SEGMENT:
                     continue
 
-                # Approximate distance: sum(speed * dt)
-                speeds = seg_events["speed_ms"].fillna(0).values
-                dt_s = (seg_width * 60) / max(len(speeds), 1)
-                segment_distances.append(float(np.sum(speeds) * dt_s))
+                if "speed_ms" not in seg_events.columns:
+                    continue
 
+                seg_events = seg_events.sort_values("ts")
+
+                times = (
+                    pd.to_datetime(seg_events["ts"], utc=True)
+                    .astype("int64") / 1e9
+                )
+
+                speeds = (
+                    seg_events["speed_ms"]
+                    .fillna(0)
+                    .clip(lower=0, upper=12)
+                    .values
+                )
+
+                if len(times) < 2:
+                    continue
+
+                dt = np.diff(times)
+
+                # Remove corrupted timestamp gaps/spikes
+                dt = np.clip(dt, 0, 5)
+
+                # Distance integration
+                dist = np.sum(speeds[:-1] * dt)
+
+                # Reject corrupted segments
+                if not np.isfinite(dist):
+                    continue
+
+                if dist <= 0:
+                    continue
+
+                segment_distances.append(float(dist))
+
+            # Need enough valid segments for fatigue estimation
             if len(segment_distances) >= self.fatigue_cfg.min_segments:
-                all_segment_profiles.append(segment_distances)
+                all_profiles.append(segment_distances)
 
-        if not all_segment_profiles:
+        if not all_profiles:
             return None, None, None
 
-        # Align profiles (pad shorter ones) and average
-        max_len = max(len(p) for p in all_segment_profiles)
-        padded = [p + [np.nan] * (max_len - len(p)) for p in all_segment_profiles]
-        avg_profile = np.nanmean(np.array(padded), axis=0).tolist()
+        slopes = []
+        intercepts = []
+        r2s = []
 
-        return fit_fatigue_curve(avg_profile)
+        for profile in all_profiles:
+
+            slope, intercept, r2 = fit_fatigue_curve(profile)
+
+            if (
+                slope is None or
+                intercept is None or
+                r2 is None
+            ):
+                continue
+
+            # Reject nonsense fits
+            if not np.isfinite(slope):
+                continue
+
+            if not np.isfinite(intercept):
+                continue
+
+            if not np.isfinite(r2):
+                continue
+
+            slopes.append(slope)
+            intercepts.append(intercept)
+            r2s.append(r2)
+
+        if not slopes:
+            return None, None, None
+
+        return (
+            float(np.median(slopes)),
+            float(np.median(intercepts)),
+            float(np.median(r2s)),
+        )
 
     def _compute_positional_norms(
         self, events_df: pd.DataFrame

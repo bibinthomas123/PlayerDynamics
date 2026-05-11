@@ -141,7 +141,7 @@ class GPSIngestionAdapter:
         self._prev_ts: Optional[float] = None
 
     def _compute_speed(self, lat: float, lon: float, ts: float) -> Optional[float]:
-        """Compute speed from consecutive GPS fixes (fallback if NMEA lacks speed)."""
+        """Compute speed from consecutive GPS points (fallback if NMEA lacks speed)."""
         if self._prev_lat is None:
             return None
         R = 6_371_000

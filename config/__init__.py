@@ -6,7 +6,6 @@ __all__ = [
     SportRadarConfig,
     LiveEventWSConfig,
     WearableSensorConfig,
-    IsolationForestConfig,
     FatigueCurveConfig,
     BaselineConfig,
     PositionalDriftConfig,

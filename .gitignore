@@ -6,6 +6,10 @@ __pycache__/
 
 venv/
 data/
+.DS_Store
+models/*.pt
+claude
+CLAUDE.md
 # C extensions
 *.so
 

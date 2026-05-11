@@ -5,7 +5,7 @@ In environments where the `shap` library is not installed,
 this module provides a lightweight fallback that preserves
 the full explanation interface using feature-magnitude proxies.
 
-When `shap` IS installed, this module is not used — the real
+When `shap` is installed, this module is not used — the real
 shap.KernelExplainer runs instead (see xai_layer.py).
 """
 from __future__ import annotations
@@ -39,8 +39,18 @@ def compute_shap_values(
     -------
     (shap_values, base_value)
     """
+    n_fv = len(feature_vector)  # authoritative feature count
+
     if SHAP_AVAILABLE and background_data is not None:
         try:
+            # Guard: background must have the same column count as the feature vector.
+            # When the background was built from flattened sequences (T*F cols) but the
+            # feature vector has only F cols, KernelExplainer raises an index OOB error.
+            if background_data.shape[1] != n_fv:
+                raise ValueError(
+                    f"Background column count ({background_data.shape[1]}) != "
+                    f"feature vector length ({n_fv}). Falling back to proxy."
+                )
             bg = _real_shap.kmeans(background_data, min(n_background, len(background_data)))
             explainer = _real_shap.KernelExplainer(predict_fn, bg)
             vals = explainer.shap_values(feature_vector.reshape(1, -1), silent=True)
@@ -53,9 +63,15 @@ def compute_shap_values(
     # ── Fallback: magnitude proxy ──
     # Approximate SHAP contributions proportional to |feature| deviation from zero.
     # This preserves the explanation shape and sign while lacking mathematical SHAP guarantees.
-    base_value = float(predict_fn(np.zeros_like(feature_vector).reshape(1, -1))[0])
+    # The proxy predict_fn operates on the feature_vector directly (not background columns).
     fv = feature_vector.copy()
-    total_effect = float(predict_fn(fv.reshape(1, -1))[0]) - base_value
+    try:
+        base_value = float(predict_fn(np.zeros(n_fv, dtype=np.float32).reshape(1, -1))[0])
+        total_effect = float(predict_fn(fv.reshape(1, -1))[0]) - base_value
+    except Exception:
+        # predict_fn may be incompatible with the feature dimensionality; use safe defaults
+        base_value = 0.0
+        total_effect = float(np.abs(fv).mean())
 
     # Distribute total effect proportionally by |feature value|
     magnitudes = np.abs(fv)
@@ -69,10 +85,32 @@ def compute_shap_values(
 
 
 def build_kmeans_background(data: np.ndarray, k: int = 50) -> np.ndarray:
-    """Return k representative background samples via k-means centroids."""
+    """
+    Return k representative background samples for SHAP KernelExplainer.
+
+    shap.kmeans wraps sklearn KMeans.  Two failure modes:
+      A) n_clusters > n_unique_rows → sklearn finds fewer clusters than requested
+         → shap.DenseData raises "# of weights must match data matrix!"
+      B) n_clusters > len(data)     → trivially wrong request
+
+    deduplicate first, then cap k to the number of unique rows.
+    If shap.kmeans still raises (e.g. degenerate 1-point cluster), fall back
+    to a random subsample — an equally valid (if less optimal) background.
+    """
+    # Deduplicate rows so sklearn KMeans never finds fewer clusters than k
+    unique_data = np.unique(data, axis=0)
+    k_safe = min(k, len(unique_data))
+
     if SHAP_AVAILABLE:
-        summary = _real_shap.kmeans(data, min(k, len(data)))
-        return summary.data
-    # Fallback: random subsample
-    idx = np.random.choice(len(data), min(k, len(data)), replace=False)
-    return data[idx]
+        try:
+            summary = _real_shap.kmeans(unique_data, k_safe)
+            return summary.data
+        except Exception as exc:
+            logger.warning(
+                "shap.kmeans failed (k=%d, unique_rows=%d): %s — using random subsample",
+                k_safe, len(unique_data), exc,
+            )
+
+    # Fallback: random subsample (no replacement; safe because k_safe <= len(unique_data))
+    idx = np.random.choice(len(unique_data), k_safe, replace=False)
+    return unique_data[idx]
