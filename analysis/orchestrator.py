@@ -255,7 +255,7 @@ class PlayersDataAnalysisPipeline:
             _c           = {n: i for i, n in enumerate(XAI_FEATURE_NAMES)}
             baseline_p   = p.get("baseline")
 
-            for bi, (w, mask_w) in enumerate(sequences[:n_bg_samples]):
+            for bi, (w, mask_w,_) in enumerate(sequences[:n_bg_samples]):
                 last = w[-1]   # last timestep (N_SEQUENCE_FEATURES,)
 
                 # --- Features derived directly from window data ---------------
@@ -320,7 +320,7 @@ class PlayersDataAnalysisPipeline:
             # inside _explain_sequence_shap so perturbations happen in the same
             # space the LSTM sees.
             raw_bg_sequences = np.stack(
-                [w for w, _ in sequences[:n_bg_samples]], axis=0
+                [w for w, _ , _ in sequences[:n_bg_samples]], axis=0
             )   # (N_bg, T, F)
             p["sequence_background"] = raw_bg_sequences
             logger.info(
@@ -328,18 +328,16 @@ class PlayersDataAnalysisPipeline:
                 pid, len(raw_bg_sequences), raw_bg_sequences.shape[1:],
             )
 
+            
         return {
-                "status": "success",
-                "shared_model": {
-                    "n_players": result.get("n_players", 0),
-                    "n_windows": result.get("n_windows", 0),
-                    "model_version": (
-                        self.pattern_engine._shared_model.model_version
-                        if self.pattern_engine._shared_model else "n/a"
-                    ),
-                },
-                "players": results,
-            }
+            "status": "success",
+            "shared_model": {
+                "n_players": result["n_players"],
+                "n_windows": result["n_windows"],
+                "model_version": self.pattern_engine.get_model_version(),
+            },
+            "players": results,
+        }
     # ──────────────────────────────────────────
     # Live inference
     # ──────────────────────────────────────────

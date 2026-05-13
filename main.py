@@ -541,12 +541,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
             masks=masks_arr,
             normalised=True,
         )
-
-        print("POST NORM MEAN", seqs_arr.mean())
-        print("POST NORM STD ", seqs_arr.std())
-        print("MODEL OUTPUT  ", recon.mean(), recon.std())
-        print("LOSS          ", loss.item())
-
+        
         store   = RegimeAwareThresholdStore()
         smoother = EMASmoother(alpha)
         for loss, (seq, _, _) in zip(losses, calib):
@@ -989,10 +984,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 "top_features": [
                     {
                         "feature": c.feature_name,
-                        "shap": round(
-                            c.shap_value,
-                            6,
-                        ),
+                        "shap": round(c.shap_value, 10),
                         "value": round(
                             c.feature_value,
                             4,
@@ -1128,6 +1120,14 @@ def _restore_serve_state(pipeline, path: Path) -> None:
                 p_reg["baseline"] = baseline
                 p_reg["model"] = pipeline.pattern_engine._shared_model
 
+                seq_bg = ps.get("sequence_background")
+
+                if seq_bg is not None:
+                    p_reg["sequence_background"] = np.asarray(
+                        seq_bg,
+                        dtype=np.float32,
+                    )
+
         # Restore threshold tracker (best-effort)
         t = ps.get("threshold_tracker")
         if t:
@@ -1191,6 +1191,25 @@ def _save_serve_state(pipeline, path: Path) -> None:
             # writes calibrated thresholds. pattern_engine._threshold_trackers is
             # never populated during training so it is always empty at save time.
             tracker = pipeline.pattern_engine.inference_engine._threshold_trackers.get(pid)
+
+
+            # Save SHAP background windows for AE explainability
+            seq_bg = player_info.get("sequence_background")
+
+            if seq_bg is not None:
+                try:
+                    ps["sequence_background"] = (
+                        np.asarray(seq_bg, dtype=np.float32)[:50]
+                        .tolist()
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Could not serialize sequence background for player %d: %s",
+                        pid,
+                        exc,
+                    )
+
+
             if tracker and isinstance(tracker, RegimeAwareThresholdStore):
                 try:
                     ps["threshold_tracker"] = tracker.state_dict()

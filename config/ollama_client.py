@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 _BASE_URL         = os.getenv("OLLAMA_BASE_URL",       "http://localhost:11434")
 _TIMEOUT_S        = float(os.getenv("OLLAMA_TIMEOUT_S",     "30"))
-_NLG_TIMEOUT_S    = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", "2"))
+_NLG_TIMEOUT_S    = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", "0.10"))
 _RETRIES          = int(os.getenv("OLLAMA_RETRIES",          "2"))
 _DEFAULT_MODEL    = "qwen2.5:14b"
 _SLOW_CALL_MS     = 500   # warn if a call takes longer than this

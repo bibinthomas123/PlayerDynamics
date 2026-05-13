@@ -37,7 +37,7 @@ from explainability.shap_compat import compute_shap_values
 
 logger = logging.getLogger(__name__)
 
-_NLG_TIMEOUT_S = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", "2"))
+_NLG_TIMEOUT_S = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", "0.10"))
 
 # ─────────────────────────────────────────────
 # Feature registry
@@ -76,6 +76,32 @@ FEATURE_LABELS: Dict[str, str] = {
     "hr_recovery_time_s":             "HR slope (bpm/s — rising = exerting)",
     "coach_fatigue_severity":         "Coach fatigue annotation",
     "coach_pre_match_status_encoded": "Coach pre-match status",
+}
+
+FEATURE_SEMANTICS = {
+    "window_avg_speed_ms":
+        "movement intensity",
+
+    "window_distance_m":
+        "ground coverage",
+
+    "window_sprint_count":
+        "explosive sprint activity",
+
+    "heart_rate_bpm":
+        "cardiovascular strain",
+
+    "hr_recovery_time_s":
+        "cardiovascular recovery dynamics",
+
+    "positional_drift_score":
+        "tactical positioning stability",
+
+    "fatigue_decay_residual":
+        "fatigue adaptation consistency",
+
+    "acwr":
+        "workload balance",
 }
 
 
@@ -166,10 +192,19 @@ class SHAPExplanation:
 # Counterfactual generator
 # ─────────────────────────────────────────────
 class CounterfactualGenerator:
+
     def generate(self, shap_dict: Dict[str, float], feature_values: Dict[str, float]) -> str:
         if not shap_dict:
             return "Insufficient data for counterfactual generation."
-        top = max(shap_dict, key=lambda k: shap_dict[k])
+        positive_items = {
+            k: v for k, v in shap_dict.items()
+            if v > 0
+        }
+
+        if not positive_items:
+            return "No strong anomaly-driving feature identified."
+
+        top = max(positive_items, key=lambda k: positive_items[k])
         val = feature_values.get(top, 0.0)
         label = FEATURE_LABELS.get(top, top)
 
@@ -235,10 +270,24 @@ class TemplateNLGEngine:
         action  = labels.get(recommendation_type, f"Performance anomaly — {player_name}")
         summary = f"{action} (confidence: {conf_pct}%). "
 
-        top_pos = [c for c in top_contributions[:3] if c.shap_value > 0]
+        top_pos = sorted([c for c in top_contributions if c.shap_value > 0], key=lambda c: c.shap_value,reverse=True,
+        )[:3]
+
+        risk_factors = [c for c in top_contributions[:5] if c.shap_value > 0]
+
+        protective_factors = [c for c in top_contributions[:5] if c.shap_value < 0]
+
+        if risk_factors:
+            parts = [ f"{c.human_label} ({c.formatted_value})" for c in risk_factors[:3]]
+            summary += ("Primary anomaly drivers: " + "; ".join(parts) + ". " )
+
+        if protective_factors:
+            parts = [f"{c.human_label} ({c.formatted_value})" for c in protective_factors[:2]]
+            summary += ("Stabilizing signals: " + "; ".join(parts) + ". ")
         if top_pos:
             parts = [f"{c.human_label} ({c.formatted_value})" for c in top_pos]
             summary += "Primary factors: " + "; ".join(parts) + ". "
+
 
         if workload_status == "high_risk":
             summary += "Acute workload significantly exceeds chronic baseline — elevated injury risk. "
@@ -252,17 +301,17 @@ class TemplateNLGEngine:
 # ─────────────────────────────────────────────
 # LLM NLG engine  (qwen2.5:14b via Ollama)
 # ─────────────────────────────────────────────
-_LLM_SYSTEM_PROMPT = """\
-You are a professional sports-science analyst for an elite football club.
-Your task: write a concise, precise, actionable alert summary for the performance
-coaching staff when the ML pipeline flags a player event.
+_LLM_SYSTEM_PROMPT = """
+You are a constrained explainability engine.
 
 Rules:
-- 2-3 sentences maximum.
-- Clinical, factual tone. No emojis. No bullet points.
-- Reference specific metric values (e.g. "ACWR 1.42", "HR rising at 0.8 bpm/s").
-- Conclude with a concrete, time-bound action (e.g. "Recommend substitution before 75'").
-- Do NOT invent data beyond what is provided.
+- Use ONLY provided features.
+- Do NOT infer unseen causes.
+- Do NOT speculate about injuries or tactics.
+- Mention ONLY top contributors.
+- If a feature has negative SHAP, describe it as stabilizing or reducing anomaly risk.
+- If a feature has positive SHAP, describe it as contributing to anomaly risk.
+- Maximum 3 sentences.
 """
 
 _LLM_PROMPT_TEMPLATE = """\
@@ -342,7 +391,10 @@ class LLMNLGEngine:
                     )
 
         return self._client, self._available
+    
+
     # ── Main generate ─────────────────────────────────────────────────────────
+
     def generate(
         self,
         recommendation_type: str,
@@ -365,10 +417,15 @@ class LLMNLGEngine:
                 "template",
                 0.0,
             )
-
+        
         # Build the prompt
         feature_lines = "\n".join(
-            f"  • {c.human_label}: {c.formatted_value}  (SHAP={c.shap_value:+.3f})"
+            (
+                f"• Feature: {FEATURE_SEMANTICS.get(c.feature_name, c.human_label)} | "
+                f"Observed: {c.formatted_value} | "
+                f"Attribution: {'anomaly-driving' if c.shap_value > 0 else 'stabilizing'} | "
+                f"Effect size: {c.shap_value:+.3f}"
+            )
             for c in top_contributions[:5]
         )
         prompt = _LLM_PROMPT_TEMPLATE.format(
@@ -502,6 +559,13 @@ class XAILayer:
             and hasattr(model, "reconstruction_loss_for_shap")
             and model.is_trained
         )
+        print("\nPERTURBATION ATTRIBUTION DEBUG")
+        print("sequence:", sequence is not None)
+        print("mask:", mask is not None)
+        print("sequence_background:", sequence_background is not None)
+        print("has_method:", hasattr(model, "reconstruction_loss_for_shap"))
+        print("model_trained:", getattr(model, "is_trained", None))
+        print("MODEL TYPE:", type(model))
 
         if has_true_shap:
             shap_dict, base_value, feature_values_for_display = self._explain_sequence_shap(
@@ -569,7 +633,7 @@ class XAILayer:
         waterfall = self._build_waterfall(shap_dict, base_value, confidence)
 
         shap_method = (
-            "channel_ablation" if has_true_shap
+            "temporal_feature_ablation" if has_true_shap
             else ("kernel_proxy" if SHAP_AVAILABLE else "magnitude_proxy")
         )
 
@@ -619,15 +683,30 @@ class XAILayer:
         bg_mean = bg_norm.mean(axis=0)
 
         shap_f = np.zeros(F, dtype=np.float32)
+
         for fi in range(F):
             perturbed = seq_norm.copy()
+
+            # Replace feature channel with background baseline
             perturbed[:, fi] = bg_mean[:, fi]
-            ablated_loss = float(model.reconstruction_loss_for_shap(
-                player_id=player_id,
-                sequences_norm=perturbed[np.newaxis].astype(np.float32),
-                mask=mask,
-            )[0])
-            shap_f[fi] = float(base_loss - ablated_loss)
+
+            ablated_loss = float(
+                model.reconstruction_loss_for_shap(
+                    player_id=player_id,
+                    sequences_norm=perturbed[np.newaxis].astype(np.float32),
+                    mask=mask,
+                )[0]
+            )
+
+            shap_f[fi] = float(ablated_loss - base_loss)
+
+            print(
+                f"FEATURE {_SFN[fi]} | "
+                f"base={base_loss:.6f} "
+                f"ablated={ablated_loss:.6f} "
+                f"delta={(base_loss - ablated_loss):.6f}"
+            )
+            
 
         bg_sequence = bg_mean.copy()
         base_value  = float(model.reconstruction_loss_for_shap(
@@ -640,23 +719,42 @@ class XAILayer:
             name: float(shap_f[i]) for i, name in enumerate(_SFN)
         }
 
+
+        print("\nSEQ SHAP DEBUG")
+        print("FEATURE NAMES:", _SFN)
+        print("SEQ SHAP:", seq_shap)
+
         shap_dict: Dict[str, float] = {n: 0.0 for n in FEATURE_NAMES}
+
         _lstm_to_xai = {
-            "speed_ms":          "window_avg_speed_ms",
-            "heart_rate_bpm":    "heart_rate_bpm",
-            "sprint_flag":       "window_sprint_count",
-            "distance_delta_m":  "window_distance_m",
-            "hr_recovery_rate":  "hr_recovery_time_s",
+            _SFN[0]: "window_avg_speed_ms",
+            _SFN[2]: "heart_rate_bpm",
+            _SFN[3]: "window_sprint_count",
+            _SFN[6]: "window_distance_m",
+            _SFN[7]: "hr_recovery_time_s",
         }
+
         for lstm_name, xai_name in _lstm_to_xai.items():
             if lstm_name in seq_shap and xai_name in shap_dict:
                 shap_dict[xai_name] = seq_shap[lstm_name]
 
         x_shap = seq_shap.get("x_pitch", 0.0)
         y_shap = seq_shap.get("y_pitch", 0.0)
-        shap_dict["positional_drift_score"] = float(
+
+        # Default positional attribution from latent spatial channels
+        positional_effect = float(
             np.sign(x_shap + y_shap) * np.sqrt(x_shap**2 + y_shap**2)
         )
+
+        # If the actual alert came from drift logic,
+        # inject the real tactical drift contribution.
+        if extra_features.get("positional_drift_score", 0.0) > 0:
+            positional_effect = float(
+                extra_features.get("positional_drift_score", 0.0)
+            )
+
+        shap_dict["positional_drift_score"] = positional_effect
+
         shap_dict["window_avg_speed_ms"] += seq_shap.get("acceleration_ms2", 0.0)
 
         last_step = sequence[-1]

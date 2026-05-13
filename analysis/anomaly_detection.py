@@ -2110,19 +2110,20 @@ class SharedBackboneAutoencoder:
         self.n_players = len(player_ids)
 
     def train(
-        self,
-        all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray, int]]]
-    ) -> dict:
+    self, all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray, int]]]
+) -> dict:
         """
         Train shared backbone using session-level splitting to prevent leakage.
         """
 
         if not TORCH_AVAILABLE:
             return {"status": "no_torch"}
+
         import gc
 
         try:
             from tqdm import tqdm as _tqdm
+
             TQDM_AVAILABLE = True
         except ImportError:
             TQDM_AVAILABLE = False
@@ -2141,10 +2142,12 @@ class SharedBackboneAutoencoder:
         )
 
         seq_len = next(iter(all_windows.values()))[0][0].shape[0]
+
         self._encoder = SharedLSTMEncoder(
             self.cfg,
             self.embedding_dim,
         )
+
         self._decoder = _LSTMDecoder(
             self.cfg.latent_dim,
             self.cfg.hidden_size,
@@ -2153,10 +2156,16 @@ class SharedBackboneAutoencoder:
             seq_len,
             self.cfg.dropout,
         )
+
         self._embedding = nn.Embedding(
             self.n_players,
             self.embedding_dim,
         )
+
+        # ─────────────────────────────────────────────
+        # Reverse mapping (embedding idx -> real pid)
+        # ─────────────────────────────────────────────
+        self._index_to_player_id = {v: k for k, v in self._player_index.items()}
 
         # ─────────────────────────────────────────────
         # Flatten windows
@@ -2167,7 +2176,9 @@ class SharedBackboneAutoencoder:
         all_session_ids = []
 
         for pid, windows in all_windows.items():
+
             idx = self._player_index[pid]
+
             for seq, mask, session_id in windows:
                 all_seqs.append(seq)
                 all_masks.append(mask)
@@ -2197,27 +2208,22 @@ class SharedBackboneAutoencoder:
         n_val = max(int(n_sessions * 0.15), 1)
 
         train_sessions = set(unique_sessions[:n_train])
-        val_sessions = set(
-            unique_sessions[n_train:n_train + n_val]
-        )
-        calib_sessions = set(
-            unique_sessions[n_train + n_val:]
-        )
 
-        idx_train = np.where(
-            np.isin(sarr, list(train_sessions))
-        )[0]
-        idx_val = np.where(
-            np.isin(sarr, list(val_sessions))
-        )[0]
-        idx_calib = np.where(
-            np.isin(sarr, list(calib_sessions))
-        )[0]
+        val_sessions = set(unique_sessions[n_train : n_train + n_val])
+
+        calib_sessions = set(unique_sessions[n_train + n_val :])
+
+        idx_train = np.where(np.isin(sarr, list(train_sessions)))[0]
+
+        idx_val = np.where(np.isin(sarr, list(val_sessions)))[0]
+
+        idx_calib = np.where(np.isin(sarr, list(calib_sessions)))[0]
 
         if len(idx_val) == 0:
-            idx_val = idx_train[:max(1, len(idx_train) // 5)]
+            idx_val = idx_train[: max(1, len(idx_train) // 5)]
+
         if len(idx_calib) == 0:
-            idx_calib = idx_train[:max(1, len(idx_train) // 5)]
+            idx_calib = idx_train[: max(1, len(idx_train) // 5)]
 
         # ─────────────────────────────────────────────
         # Fit normaliser ONLY on training
@@ -2420,17 +2426,6 @@ class SharedBackboneAutoencoder:
                     patience=patience_ct,
                 )
 
-            else:
-                logger.info(
-                    "Shared LSTM epoch=%d train=%.5f val=%.5f",
-                    epoch + 1,
-                    train_loss,
-                    val_loss,
-                )
-
-            # ─────────────────────────────────────────
-            # Early stopping on validation
-            # ─────────────────────────────────────────
             if val_loss < best_loss - MIN_IMPROVEMENT:
 
                 best_loss = val_loss
@@ -2471,36 +2466,30 @@ class SharedBackboneAutoencoder:
         if best_state is not None:
 
             self._encoder.load_state_dict(
-                {
-                    k: v.to(DEVICE)
-                    for k, v in best_state["encoder"].items()
-                }
+                {k: v.to(DEVICE) for k, v in best_state["encoder"].items()}
             )
 
             self._decoder.load_state_dict(
-                {
-                    k: v.to(DEVICE)
-                    for k, v in best_state["decoder"].items()
-                }
+                {k: v.to(DEVICE) for k, v in best_state["decoder"].items()}
             )
 
             self._embedding.load_state_dict(
-                {
-                    k: v.to(DEVICE)
-                    for k, v in best_state["embedding"].items()
-                }
+                {k: v.to(DEVICE) for k, v in best_state["embedding"].items()}
             )
 
         # ─────────────────────────────────────────────
-        # Calibration thresholds (BATCHED)
+        # Calibration thresholds
         # ─────────────────────────────────────────────
-
         self.is_trained = True
+
         alpha = CONFIG.scoring.score_ema_alpha
 
         for pid_tensor in self._calib_player_ids.unique():
 
-            pid = pid_tensor.item()
+            player_idx = pid_tensor.item()
+
+            # FIX: convert embedding index -> real player ID
+            pid = self._index_to_player_id[player_idx]
 
             mask = self._calib_player_ids == pid_tensor
 
@@ -2545,9 +2534,7 @@ class SharedBackboneAutoencoder:
 
         self.is_trained = True
 
-        self.model_version = (
-            f"shared_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        )
+        self.model_version = f"shared_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
         return {
             "status": "trained",
@@ -2701,9 +2688,9 @@ class SharedBackboneAutoencoder:
         if not self.is_trained:
             return 0.0, False, 0.0
         
-        print("MODEL TRAINED?", self.is_trained)
-        print("PLAYER INDEX SIZE", len(self._player_index))
-        print("PLAYER EXISTS?", player_id in self._player_index)
+        # print("MODEL TRAINED?", self.is_trained)
+        # print("PLAYER INDEX SIZE", len(self._player_index))
+        # print("PLAYER EXISTS?", player_id in self._player_index)
 
         idx = self._player_index.get(player_id)
         if idx is None:
@@ -2779,29 +2766,29 @@ class SharedBackboneAutoencoder:
                     f"Expected {expected_shape}, got {recon.shape}"
                 )
 
-            # -----------------------------
-            # Debug
-            # -----------------------------
-            print("\nPREDICT DEBUG")
-            print("norm shape :", norm.unsqueeze(0).shape)
-            print("recon shape:", recon.shape)
+            # # -----------------------------
+            # # Debug
+            # # -----------------------------
+            # print("\nPREDICT DEBUG")
+            # print("norm shape :", norm.unsqueeze(0).shape)
+            # print("recon shape:", recon.shape)
 
-            print("POST NORM MEAN", norm.mean().item())
-            print("POST NORM STD ", norm.std().item())
+            # print("POST NORM MEAN", norm.mean().item())
+            # print("POST NORM STD ", norm.std().item())
 
-            print("MODEL OUTPUT MEAN", recon.mean().item())
-            print("MODEL OUTPUT STD ", recon.std().item())
+            # print("MODEL OUTPUT MEAN", recon.mean().item())
+            # print("MODEL OUTPUT STD ", recon.std().item())
 
-            diff = (norm.unsqueeze(0) - recon).abs()
+            # diff = (norm.unsqueeze(0) - recon).abs()
 
-            print("DIFF MEAN", diff.mean().item())
-            print("DIFF MAX ", diff.max().item())
+            # print("DIFF MEAN", diff.mean().item())
+            # print("DIFF MAX ", diff.max().item())
 
-            print(
-                "MASK SUM",
-                mask_t.sum().item()
-                if mask_t is not None else None
-            )
+            # print(
+            #     "MASK SUM",
+            #     mask_t.sum().item()
+            #     if mask_t is not None else None
+            # )
 
             # -----------------------------
             # Loss
@@ -2811,8 +2798,6 @@ class SharedBackboneAutoencoder:
                 recon,
                 mask_t
             )
-
-            print("LOSS", loss.item())
 
         return float(loss.item()), False, 0.0
 
@@ -4148,7 +4133,14 @@ class PatternAnalysisEngine:
         all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]]
     ) -> dict:
         """Train the shared backbone and calibrate per-player thresholds."""
-        return self.inference_engine.train(all_windows)
+        result = self.inference_engine.train(all_windows)
+        self._shared_model = self.inference_engine._shared_model
+        return result
+
+    def get_model_version(self):
+        if self._shared_model is None:
+            raise RuntimeError("Shared model not initialized")
+        return self._shared_model.model_version
 
     def analyze(
         self,
@@ -4254,10 +4246,10 @@ class PatternAnalysisEngine:
         fv = {SEQUENCE_FEATURE_NAMES[i]: float(last[i])
               for i in range(N_SEQUENCE_FEATURES)}
         fv.update({
-            "acwr":                float(acwr),
-            "reconstruction_loss": float(raw_loss),
-            "drift_score":         float(drift["drift_score"]),
-            "mask_completeness":   float(mask.mean()),
+            "acwr":                     float(acwr),
+            "reconstruction_loss":      float(raw_loss),
+            "positional_drift_score":   float(drift["drift_score"]),
+            "mask_completeness":        float(mask.mean()),
         })
 
         for _enriched_key in ("fatigue_decay_residual", "speed_drop_pct",
