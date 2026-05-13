@@ -129,6 +129,7 @@ class SHAPExplanation:
     nlg_summary: str
     counterfactual: str
     waterfall_data: List[dict]
+    uncertainty: float = 0.0
     shap_method: str = field(default_factory=lambda: "kernel" if SHAP_AVAILABLE else "magnitude_proxy")
     nlg_engine: str = "template"   # "llm_qwen" | "template"
 
@@ -298,31 +299,49 @@ class LLMNLGEngine:
         self._client      = None          # lazy: import inside generate to avoid startup crash
         self._client_lock = threading.Lock()
         self._available: Optional[bool] = None   # None = not yet probed
+        self._last_probe_ts: float = 0.0
 
     # ── Lazy client init ──────────────────────────────────────────────────────
-    def _get_client(self):
-        if self._client is None:
-            with self._client_lock:
-                if self._client is None:
-                    try:
-                        self._client = OllamaClient(
-                            default_model=self._model,
-                            timeout_s=self._timeout_s * 3,  # client-level: generous
-                            max_retries=0,                   # per-call timeout handles it
-                            cache=True,
-                        )
-                        self._available = self._client.is_available(self._model)
-                        if not self._available:
-                            logger.warning(
-                                "LLMNLGEngine: Ollama not available or model '%s' not loaded. "
-                                "Falling back to template NLG. Start Ollama and run: "
-                                "ollama pull %s", self._model, self._model,
-                            )
-                    except Exception as exc:
-                        logger.warning("LLMNLGEngine init failed: %s — using template NLG", exc)
-                        self._available = False
-        return self._client, self._available
+    _REPROBE_INTERVAL_S = 30.0  # re-check Ollama every 30 s after a failure
 
+    def _get_client(self):
+        with self._client_lock:
+            # Build the HTTP client once
+            if self._client is None:
+                try:
+                    self._client = OllamaClient(
+                        default_model=self._model,
+                        timeout_s=self._timeout_s * 3,
+                        max_retries=0,
+                        cache=True,
+                    )
+                except Exception as exc:
+                    logger.warning("LLMNLGEngine init failed: %s — using template NLG", exc)
+                    self._available = False
+                    return None, False
+
+            # Re-probe availability periodically so recovery is automatic
+            # when Ollama starts up after the pipeline is already running.
+            now = time.monotonic()
+            last_probe = getattr(self, "_last_probe_ts", 0.0)
+            if self._available is None or (
+                not self._available
+                and now - last_probe >= self._REPROBE_INTERVAL_S
+            ):
+                self._available = self._client.is_available(self._model)
+                self._last_probe_ts = now
+                if not self._available:
+                    logger.warning(
+                        "LLMNLGEngine: Ollama not available or model '%s' not loaded. "
+                        "Falling back to template NLG. Start Ollama and run: "
+                        "ollama pull %s", self._model, self._model,
+                    )
+                else:
+                    logger.info(
+                        "LLMNLGEngine: Ollama available, model '%s' loaded.", self._model
+                    )
+
+        return self._client, self._available
     # ── Main generate ─────────────────────────────────────────────────────────
     def generate(
         self,
@@ -331,10 +350,9 @@ class LLMNLGEngine:
         player_name: str,
         top_contributions: List[FeatureContribution],
         workload_status: str = "optimal",
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, float]:
         """
-        Returns (summary_text, engine_name).
-        engine_name is 'llm_qwen' on success, 'template' on fallback.
+        Returns (summary_text, engine_name, uncertainty).
         """
         client, available = self._get_client()
 
@@ -345,6 +363,7 @@ class LLMNLGEngine:
                     top_contributions, workload_status,
                 ),
                 "template",
+                0.0,
             )
 
         # Build the prompt
@@ -379,7 +398,9 @@ class LLMNLGEngine:
                 "LLMNLGEngine: player=%s  engine=qwen2.5:14b  %.0f ms  tokens=%d",
                 player_name, elapsed_ms, resp.eval_count,
             )
-            return text, "llm_qwen"
+            # Using prompt evaluation count as a proxy for uncertainty/complexity
+            uncertainty = float(resp.prompt_eval_count) / 1000.0
+            return text, "llm_qwen", uncertainty
 
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -392,6 +413,7 @@ class LLMNLGEngine:
                     top_contributions, workload_status,
                 ),
                 "template",
+                0.0,
             )
 
 
@@ -537,7 +559,7 @@ class XAILayer:
         )
 
         counterfactual            = self._cf_gen.generate(shap_dict, feature_values_for_display)
-        nlg_summary, nlg_engine   = self._llm_nlg.generate(
+        nlg_summary, nlg_engine, uncertainty = self._llm_nlg.generate(
             recommendation_type=recommendation_type,
             confidence=confidence,
             player_name=player_name,
@@ -564,6 +586,7 @@ class XAILayer:
             nlg_summary=nlg_summary,
             counterfactual=counterfactual,
             waterfall_data=waterfall,
+            uncertainty=uncertainty,
             shap_method=shap_method,
             nlg_engine=nlg_engine,
         )
@@ -585,6 +608,7 @@ class XAILayer:
         T, F = sequence.shape
 
         seq_norm  = model.normaliser.transform(sequence[np.newaxis])[0]
+    
         base_loss = float(model.reconstruction_loss_for_shap(
             player_id=player_id,
             sequences_norm=seq_norm[np.newaxis].astype(np.float32),

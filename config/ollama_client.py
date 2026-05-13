@@ -59,6 +59,7 @@ class OllamaResponse:
     eval_count: int = 0
     total_duration_ms: float = 0.0
     cached: bool = False
+    uncertainty: float = 0.0  # Estimated uncertainty/entropy of the response
 
     def as_json(self) -> Optional[Dict[str, Any]]:
         """Parse .text as JSON; return None if it fails."""

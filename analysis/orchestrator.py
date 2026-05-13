@@ -11,14 +11,15 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Tuple
-
+from analysis.telemetry_validity import TelemetryValidityLayer, TelemetryStatus
+from utils.alert_manager import AlertLevel
 import numpy as np
 import pandas as pd
-
+from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
 from analysis.anomaly_detection import (
     PatternAnalysisEngine, AnomalyResult
 )
-
+from utils.reliability.invariants import SystemInvariantGuard
 from analysis.baseline import BaselineBuilder, PlayerBaselineProfile
 from explainability.xai_layer import XAILayer, SHAPExplanation, FEATURE_NAMES as XAI_FEATURE_NAMES
 from feedback.recalibration import (
@@ -103,6 +104,14 @@ class PlayersDataAnalysisPipeline:
         self.feedback_store = FeedbackStore()
         self.recalibration_pipeline = RecalibrationPipeline()
         self.fairness_monitor = FairnessMonitor()
+        self.tvl = TelemetryValidityLayer()
+        self.guard = SystemInvariantGuard()
+        self._last_xai_ts: Dict[int, float] = {}
+
+        # ── Determinism & Recovery Layers ────────────────────────────────────
+        from utils.reliability.determinism import MutationJournal, TemporalCausalityGuard
+        self.journal = MutationJournal()
+        self.causality_guard = TemporalCausalityGuard()
 
         self._inference_log: List[dict] = []
         self._on_alert_callback: Optional[Callable] = None
@@ -233,11 +242,9 @@ class PlayersDataAnalysisPipeline:
             # Previously used synthetic random samples (bg_rng.normal, bg_rng.uniform)
             # for unmapped features — that creates a fake manifold which can make
             # SHAP attributions directionally misleading.
-            from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
             _sfn_idx     = {n: i for i, n in enumerate(_SFN)}
-            window_steps = CONFIG.window.window_steps
 
-            n_bg_samples = min(200, len(sequences))
+            n_bg_samples = min(32, len(sequences))
             results[pid] = {
                     "status": "trained",
                     "n_sequences": len(sequences),
@@ -340,7 +347,7 @@ class PlayersDataAnalysisPipeline:
         self,
         normalized_event: dict,
         segment_index: int = 0,
-    ) -> Optional[SHAPExplanation]:
+    ) -> Optional[AnomalyResult]:
         """
         Process one raw normalised event from the ingestion pipeline.
         Returns SHAPExplanation if an alert is triggered, None otherwise.
@@ -358,6 +365,31 @@ class PlayersDataAnalysisPipeline:
 
         pid = player["player_id"]
 
+        # ── Determinism Gate: Temporal Causality ───────────────────────────────
+        event_ts = normalized_event.get("timestamp")
+        if event_ts:
+            if not self.causality_guard.validate_sequence(pid, event_ts):
+                logger.error("Determinism Error: Out-of-order event for player %d. Rejecting.", pid)
+                return None
+
+        # ── Reliability Gate: Telemetry Validity ───────────────────────────────
+        from analysis.telemetry_validity import TelemetryStatus
+        from utils.reliability.invariants import InvariantSeverity
+        validity = self.tvl.validate_event(pid, normalized_event)
+
+        # Invariant: INVALID telemetry must NEVER generate physiological alerts.
+        self.guard.check(
+            "TELEMETRY_VALIDITY_GATE",
+            condition=(validity.status != TelemetryStatus.INVALID),
+            severity=InvariantSeverity.WARNING if validity.status == TelemetryStatus.INVALID else InvariantSeverity.INFO,
+            message=f"Event rejected or flagged: status={validity.status.name} issues={validity.issues}",
+            context={"player_id": pid, "validity": validity}
+        )
+
+        if validity.status == TelemetryStatus.INVALID:
+            logger.warning("Inference gated: INVALID telemetry for player %d", pid)
+            return None
+
         # Run sequence anomaly analysis
         result = self.pattern_engine.analyze(
             player_id=pid,
@@ -365,34 +397,81 @@ class PlayersDataAnalysisPipeline:
             sessions_df=player["sessions_df"],
         )
 
-        if result is None or result.recommendation_type is None:
+        if result is None:
             return None
+        
+       # ── SHAP/XAI Gating ───────────────────────────────────────────────────
 
-        # SHAP explanation
+        explanation = None
+
         model = player.get("model")
-        if model is None:
-            return None
 
-        # Build a flattened feature vector for XAI (sequence last-step + derived)
-        xai_fv = self._build_xai_feature_vector(result)
+        if model is not None:
 
-        explanation = self.xai_layer.explain_from_dict(
-            player_id=pid,
-            external_id=player["external_id"],
-            model=model,
-            feature_vector=xai_fv,
-            recommendation_type=result.recommendation_type,
-            confidence=result.confidence,
-            workload_status=result.workload_status,
-            anomaly_score=result.anomaly_score,
-            player_name=player["name"],
-            # ── True SHAP arguments ──────────────────────────────────────────
-            # Pass the raw (unnormalised) sequence so xai_layer can normalise
-            # via model.normaliser and run real encoder→decoder perturbations.
-            sequence=result.raw_sequence if hasattr(result, "raw_sequence") else None,
-            mask=result.raw_mask if hasattr(result, "raw_mask") else None,
-            sequence_background=player.get("sequence_background"),
-        )
+            from utils.reliability.safe_mode import (
+                safe_mode,
+                SafeModeLevel,
+            )
+
+            # Safe Mode suppression
+            shap_allowed = safe_mode.is_feature_enabled(
+                "shap_explanation",
+                SafeModeLevel.LEVEL_1,
+            )
+
+            # Only explain sustained operational alerts
+            sustained_alert = result.alert_level in (
+                AlertLevel.WARNING,
+                AlertLevel.CRITICAL,
+            )
+
+            # Require persistence before XAI
+            sufficient_persistence = result.persistence_windows >= 3
+
+            # Per-player cooldown
+            now = time.time()
+
+            last_xai_ts = self._last_xai_ts.get(pid, 0.0)
+
+            cooldown_ok = (
+                now - last_xai_ts
+            ) >= 60.0
+
+            run_xai = (
+                shap_allowed
+                and sustained_alert
+                and sufficient_persistence
+                and cooldown_ok
+            )
+            # run_xai = True  # FOR TESTING - BYPASS ALL GATES
+
+            print("\nXAI DEBUG")
+            print("shap_allowed:", shap_allowed)
+            print("sustained_alert:", sustained_alert)
+            print("sufficient_persistence:", sufficient_persistence)
+            print("cooldown_ok:", cooldown_ok)
+            print("run_xai:", run_xai)
+
+            if run_xai:
+
+                xai_fv = self._build_xai_feature_vector(result)
+
+                explanation = self.xai_layer.explain_from_dict(
+                    player_id=pid,
+                    external_id=player["external_id"],
+                    model=model,
+                    feature_vector=xai_fv,
+                    recommendation_type=result.recommendation_type,
+                    confidence=result.confidence,
+                    workload_status=result.workload_status,
+                    anomaly_score=result.anomaly_score,
+                    player_name=player["name"],
+                    sequence=result.raw_sequence if hasattr(result, "raw_sequence") else None,
+                    mask=result.raw_mask if hasattr(result, "raw_mask") else None,
+                    sequence_background=player.get("sequence_background"),
+                )
+
+                self._last_xai_ts[pid] = now
 
         # Log inference
         self._inference_id_counter += 1
@@ -422,7 +501,13 @@ class PlayersDataAnalysisPipeline:
         if t_ms > CONFIG.inference.max_latency_ms:
             logger.warning("Inference latency %.1f ms > 200 ms SLA", t_ms)
 
-        return explanation
+        if explanation is not None:
+            result.nlg_summary = explanation.nlg_summary
+            result.counterfactual = explanation.counterfactual
+            result.shap_values = explanation.shap_values
+            result.top_contributions = explanation.top_contributions
+
+        return result
 
     def _build_xai_feature_vector(self, result: AnomalyResult) -> dict:
         """

@@ -10,6 +10,10 @@ data/
 models/*.pt
 claude
 CLAUDE.md
+
+*.json
+*.jsonl
+
 # C extensions
 *.so
 

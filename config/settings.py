@@ -118,10 +118,10 @@ class LSTMAutoencoderConfig:
     num_layers: int             = 2
     dropout: float              = 0.2
     latent_dim: int             = 16
-    batch_size: int             = 32
+    batch_size: int             = 256
     learning_rate: float        = 1e-3
-    max_epochs: int             = 50
-    patience: int               = 8
+    max_epochs: int             = 10
+    patience: int               = 20
     min_sessions_to_train: int  = 15
     random_state: int           = 42
 

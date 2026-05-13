@@ -1,0 +1,137 @@
+"""
+Telemetry Validity Layer (TVL)
+Hardens the pipeline against corrupted or implausible sports telemetry.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Dict, Any, Tuple, Optional
+import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TelemetryStatus(Enum):
+    VALID = auto()     # High confidence, suitable for all inference
+    DEGRADED = auto()  # Minor issues, inference allowed but flagged
+    INVALID = auto()   # Plausibility failure, MUST NOT trigger physiological alerts
+    UNKNOWN = auto()   # Insufficient data to determine status
+
+@dataclass
+class ValidityMetrics:
+    status: TelemetryStatus
+    confidence: float  # 0.0 to 1.0
+    mask_completeness: float
+    jitter_ms: float
+    plausibility_score: float
+    issues: list[str]
+
+class TelemetryValidityLayer:
+    """
+    Analyzes raw event streams for physical plausibility and sensor health.
+    Prevents corrupted data from poisoning adaptive calibration.
+    """
+    def __init__(self):
+        # Per-player health tracking
+        self._player_health: Dict[int, Dict[str, Any]] = {}
+
+        # Physical constants for plausibility checks
+        self.MAX_SPEED_MS = 13.5        # ~48 km/h - elite sprint peak (Mbappe-class burst)
+        self.MAX_HR_BPM = 220.0         # Human physiological ceiling
+        self.MAX_ACCEL_MS2 = 15.0       # Peak acceleration for athlete change-of-direction
+        self.MIN_HR_BPM = 30.0          # Rest/Bradycardia floor
+
+    def validate_event(self, player_id: int, event: Dict[str, Any]) -> ValidityMetrics:
+        """
+        Performs a multi-stage validity check on a single event.
+        """
+        issues = []
+        confidence = 1.0
+
+        # 1. Mask Completeness
+        # Assume event has a set of expected keys
+        expected_keys = {"speed_ms", "heart_rate_bpm", "distance_delta_m", "sprint_flag"}
+        present_keys = {k for k in expected_keys if event.get(k) is not None}
+        completeness = len(present_keys) / len(expected_keys)
+
+        if completeness < 0.75:
+            return ValidityMetrics(
+                status=TelemetryStatus.INVALID,
+                confidence=0.0,
+                mask_completeness=completeness,
+                jitter_ms=0.0,
+                plausibility_score=0.0,
+                issues=[f"low_completeness_{completeness:.2f}"],
+            )
+
+        # 2. Physical Plausibility
+        spd = event.get("speed_ms", 0.0)
+        hr = event.get("heart_rate_bpm", 0.0)
+        accel = abs(event.get("accel_ms2", 0.0))
+
+        if accel > 12.0:
+            issues.append(f"implausible_accel_{accel:.2f}")
+            confidence = 0.0
+
+        if spd > self.MAX_SPEED_MS:
+            overage = (spd - self.MAX_SPEED_MS) / self.MAX_SPEED_MS
+            if overage > 0.20:          # >20% over ceiling → hard reject
+                issues.append(f"implausible_speed_{spd:.2f}")
+                confidence = 0.0
+            else:                        # borderline → degrade, don't discard
+                issues.append(f"borderline_speed_{spd:.2f}")
+                confidence = max(0.0, confidence - 0.25)
+
+        if hr > self.MAX_HR_BPM or hr < self.MIN_HR_BPM:
+            issues.append(f"implausible_hr_{hr}")
+            confidence = 0.0
+
+        # 3. Temporal Monotonicity (if timestamp present)
+        ts = event.get("timestamp")
+
+        if ts:
+            prev_ts = self._get_prev_ts(player_id)
+            if prev_ts:
+                dt = (ts - prev_ts).total_seconds()
+                if dt <= 0:
+                    issues.append("non_monotonic_timestamp")
+                    confidence = 0.0
+                elif dt > 5.0:
+                    issues.append(f"timestamp_gap_{dt:.2f}s")
+                    confidence -= 0.3
+            self._update_ts(player_id, ts)
+
+        # Determine overall status
+        if confidence <= 0.0:
+            status = TelemetryStatus.INVALID
+        elif confidence < 0.8:
+            status = TelemetryStatus.DEGRADED
+        else:
+            status = TelemetryStatus.VALID
+ 
+        if status != TelemetryStatus.VALID:
+            logger.warning(
+                "Telemetry degraded | player=%d | status=%s | issues=%s",
+                player_id,
+                status.name,
+                issues,
+            )
+
+    
+        
+        return ValidityMetrics(
+            status=status,
+            confidence=max(0.0, confidence),
+            mask_completeness=completeness,
+            jitter_ms=0.0, # Requires window-level analysis
+            plausibility_score=confidence,
+            issues=issues
+        )
+
+    def _get_prev_ts(self, player_id: int) -> Optional[float]:
+        return self._player_health.get(player_id, {}).get("last_ts")
+
+    def _update_ts(self, player_id: int, ts: Any) -> None:
+        if player_id not in self._player_health:
+            self._player_health[player_id] = {}
+        self._player_health[player_id]["last_ts"] = ts

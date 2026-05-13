@@ -44,6 +44,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn import pipeline
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging: structured to stderr, JSON in production; human-readable in dev
@@ -367,10 +368,10 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     print(json.dumps(summary))
 
-    # Save serve state if requested
-    if args.save_serve_state:
-        serve_state_path = model_dir / "serve_state.json"
-        _save_serve_state(pipeline, serve_state_path)
+    # Always save serve state so `serve` can load baselines + thresholds without retraining.
+    # --save-serve-state flag is kept for backwards-compat but is no longer required.
+    serve_state_path = model_dir / "serve_state.json"
+    _save_serve_state(pipeline, serve_state_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,6 +393,17 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     The evaluation intentionally does NOT re-generate or re-inject anomalies.
     It uses the ground_truth_labels seeded by the data generator.
     """
+    # ── Progress-bar helper (graceful tqdm fallback) ──────────────────────────
+    try:
+        from tqdm import tqdm as _tqdm
+        def _progress(it, **kw):
+            return _tqdm(it, dynamic_ncols=True, **kw)
+    except ImportError:
+        def _progress(it, desc="", **kw):  # type: ignore[misc]
+            if desc:
+                logger.info("%s …", desc)
+            return it
+
     data_dir  = Path(args.data_dir)
     model_dir = Path(args.model_dir)
 
@@ -410,6 +422,23 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     annot_df    = frames["annotations"]
     gt_df       = frames["ground_truth_labels"]
 
+    # ── Pre-group for O(1) lookup — avoids O(n) DataFrame filter per player/session ──
+    logger.info("Pre-grouping events and sessions …")
+    session_events_map: Dict[int, pd.DataFrame] = {
+        int(sid): grp for sid, grp in events_df.groupby("session_id")
+    }
+    player_sessions_map: Dict[int, pd.DataFrame] = {
+        int(pid): grp for pid, grp in sessions_df.groupby("player_id")
+    }
+    player_annot_map: Dict[int, pd.DataFrame] = {
+        int(pid): grp
+        for pid, grp in annot_df.groupby(
+            annot_df["session_id"].map(
+                sessions_df.set_index("session_id")["player_id"]
+            )
+        )
+    } if not annot_df.empty and "session_id" in annot_df.columns else {}
+
     # ── Load backbone ─────────────────────────────────────────────────────────
     from analysis.anomaly_detection import SharedBackboneAutoencoder
     shared = SharedBackboneAutoencoder.load(backbone_path)
@@ -417,6 +446,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         _exit(2, "Could not load trained backbone from checkpoint")
 
     pipeline.pattern_engine._shared_model = shared
+    pipeline.pattern_engine.inference_engine._shared_model = shared
     logger.info("Loaded backbone v=%s  players=%d",
                 shared.model_version, shared.n_players)
 
@@ -426,6 +456,10 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     for col, fill in [("window_distance_m", 0), ("window_avg_speed_ms", 0),
                       ("window_sprint_count", 0), ("heart_rate_bpm", 120)]:
         sessions_with_features[col] = sessions_with_features[col].fillna(fill)
+
+    swf_by_player: Dict[int, pd.DataFrame] = {
+        int(pid): grp for pid, grp in sessions_with_features.groupby("player_id")
+    }
 
     for _, row in players_df.iterrows():
         pipeline.register_player(
@@ -438,66 +472,114 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         )
 
     baselines = {}
-    for pid in players_df["player_id"].tolist():
-        psessions = sessions_with_features[sessions_with_features["player_id"] == pid]
+    for pid in _progress(players_df["player_id"].tolist(),
+                         desc="Loading player histories", unit="player"):
+        psessions = swf_by_player.get(pid, pd.DataFrame())
         if psessions.empty:
             continue
-        pevents = events_df[events_df["session_id"].isin(psessions["session_id"])]
-        pannot  = annot_df[annot_df["session_id"].isin(psessions["session_id"])]
+        sids      = set(psessions["session_id"])
+        pevents   = pd.concat(
+            [session_events_map[sid] for sid in sids if sid in session_events_map],
+            ignore_index=True,
+        ) if sids else pd.DataFrame()
+        pannot = player_annot_map.get(pid, pd.DataFrame())
         pipeline.load_historical_data(pid, psessions, pevents, pannot)
 
     baselines = pipeline.compute_baselines(window_days=28)
     logger.info("Baselines ready for %d players", len(baselines))
 
-    # Rebuild threshold trackers from calibration windows (20% hold-out)
-    # This mirrors what train does, using all data (no session filter here)
+    # ── Rebuild threshold trackers — batched predict for speed ────────────────
     from analysis.regime import RegimeAwareThresholdStore, SessionRegimeClassifier
+    from analysis.anomaly_detection import EMASmoother  # re-export via anomaly_detection
+    from config.settings import CONFIG
     classifier = SessionRegimeClassifier()
-    cfg_alpha  = pipeline.pattern_engine.workload_tracker.cfg
+    alpha      = CONFIG.scoring.score_ema_alpha
 
-    for pid in baselines:
-        psessions = sessions_df[sessions_df["player_id"] == pid].sort_values("started_at")
+    for pid in _progress(sorted(baselines.keys()),
+                         desc="Calibrating thresholds", unit="player"):
+        psessions = player_sessions_map.get(pid, pd.DataFrame())
         if psessions.empty:
             continue
-        pevents = events_df[events_df["session_id"].isin(psessions["session_id"])]
+        psessions = psessions.sort_values("started_at")
+        sids    = set(psessions["session_id"])
+        pevents = pd.concat(
+            [session_events_map[sid] for sid in sids if sid in session_events_map],
+            ignore_index=True,
+        ) if sids else pd.DataFrame()
+
         windows = pipeline.pattern_engine.build_training_sequences(pevents, psessions)
         if not windows:
             continue
-        calib   = windows[int(len(windows) * 0.80):]
-        from config.settings import CONFIG
-        alpha   = CONFIG.scoring.score_ema_alpha
+        split = max(1, int(len(windows) * 0.8))
+        calib = windows[split:]  # use held-out windows for calibration
+        if len(calib) < 5:        
+            calib = windows
+        if not calib:
+            continue
+
+        # ── Batch predict — ONE forward pass for all calib windows ────────────
+        seqs_arr = np.stack(
+            [s for s, _, _ in calib]
+        ).astype(np.float32)
+
+        masks_arr = np.stack(
+            [m for _, m, _ in calib]
+        ).astype(bool)
+
+        pids_arr = np.full(
+            len(calib),
+            pid,
+            dtype=np.int64,
+        )
+
+        # pre-normalise ONCE outside model
+        seqs_arr = shared.normaliser.transform(seqs_arr)
+
+        losses = shared.predict_batch(
+            player_ids=pids_arr,
+            sequences=seqs_arr,
+            masks=masks_arr,
+            normalised=True,
+        )
+
+        print("POST NORM MEAN", seqs_arr.mean())
+        print("POST NORM STD ", seqs_arr.std())
+        print("MODEL OUTPUT  ", recon.mean(), recon.std())
+        print("LOSS          ", loss.item())
+
         store   = RegimeAwareThresholdStore()
-        ema_val = None
-        for seq, mask in calib:
-            loss, _, _ = shared.predict(pid, seq, mask)
-            ema_val    = loss if ema_val is None else (alpha * loss + (1 - alpha) * ema_val)
+        smoother = EMASmoother(alpha)
+        for loss, (seq, _, _) in zip(losses, calib):
+            ema_val = smoother.update(float(loss))
             store.update(ema_val, classifier.classify(seq).key)
+        pipeline.pattern_engine.inference_engine._threshold_trackers[pid] = store
+
         pipeline.pattern_engine._threshold_trackers[pid] = store
 
     # ── Build labeled window set ──────────────────────────────────────────────
-    # Map session → is_anomaly from ground truth
     gt_map = dict(zip(gt_df["session_id"].astype(int),
                       gt_df["is_anomaly"].astype(bool)))
 
     all_player_metrics: List[dict] = []
     total_tp = total_fp = total_fn = total_tn = 0
-    all_scores: List[float] = []
-    all_labels: List[int]   = []
 
-    for pid in sorted(baselines.keys()):
-        psessions = sessions_df[sessions_df["player_id"] == pid].sort_values("started_at")
+    for pid in _progress(sorted(baselines.keys()),
+                         desc="Evaluating players", unit="player"):
+        psessions = player_sessions_map.get(pid, pd.DataFrame())
         if psessions.empty:
             continue
-        pevents = events_df[events_df["session_id"].isin(psessions["session_id"])]
+        psessions = psessions.sort_values("started_at")
 
-        # Build labeled windows: (sequence, mask, label)
+        # Build labeled windows using pre-grouped session events
         labeled: List = []
-        for _, sess in psessions.iterrows():
-            sid = int(sess["session_id"])
-            label = gt_map.get(sid, False)
-            sess_evs = pevents[pevents["session_id"] == sid]
-            windows = pipeline.pattern_engine.window_builder.build_from_session(sess_evs)
-            for seq, mask in windows:
+        for sid, label in (
+            (int(r.session_id), gt_map.get(int(r.session_id), False))
+            for r in psessions.itertuples(index=False)
+        ):
+            sess_evs = session_events_map.get(sid, pd.DataFrame())
+            if sess_evs.empty:
+                continue
+            for seq, mask in pipeline.pattern_engine.window_builder.build_from_session(sess_evs):
                 labeled.append((seq, mask, label))
 
         if not labeled:
@@ -583,115 +665,166 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 def cmd_serve(args: argparse.Namespace) -> None:
     """
     Production inference loop.
-
-    Reads newline-delimited JSON events from stdin; one event per line.
-    Writes newline-delimited JSON alerts to stdout.
-    Logs to stderr.
-
-    Input event schema (minimum required fields):
-        {
-          "player_external_id": "p001",
-          "ts": "2024-01-15T20:31:00Z",
-          "speed_ms": 4.2,
-          "heart_rate_bpm": 162,
-          "x_pitch": 55.0,
-          "y_pitch": 34.0,
-          "elapsed_seconds": 2100
-        }
-
-    Output alert schema:
-        {
-          "player_id": 1,
-          "external_id": "p001",
-          "recommendation_type": "fatigue_alert",
-          "confidence": 0.83,
-          "anomaly_score": 0.041,
-          "nlg_summary": "...",
-          "counterfactual": "...",
-          "shap_values": {...},
-          "latency_ms": 12.4,
-          "ts": "2024-01-15T20:31:05Z"
-        }
-
-    SLA: < 200 ms per window (configurable via --max-latency-ms).
-    Alert gating: fire only after --min-alert-windows consecutive flagged windows.
-
-    Exits 4 on unrecoverable stream error.
-    Exits 2 if model checkpoint is missing.
     """
-    model_dir  = Path(args.model_dir)
+
+    model_dir = Path(args.model_dir)
     backbone_path = model_dir / "shared_backbone.pt"
 
     if not backbone_path.exists():
-        _exit(2, f"Model checkpoint not found: {backbone_path} — run train first")
+        _exit(
+            2, f"Model checkpoint not found: {backbone_path} — run train first"
+        )
 
-    logger.info("serve | model=%s  min_alert_windows=%d  max_latency_ms=%d",
-                model_dir, args.min_alert_windows, args.max_latency_ms)
+    logger.info(
+        "serve | model=%s  min_alert_windows=%d  max_latency_ms=%d",
+        model_dir,
+        args.min_alert_windows,
+        args.max_latency_ms,
+    )
 
-    # ── Load model ────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # Build pipeline
+    # ─────────────────────────────────────────────
     pipeline = _build_pipeline(model_dir)
 
     from analysis.anomaly_detection import SharedBackboneAutoencoder
+
     shared = SharedBackboneAutoencoder.load(backbone_path)
+
     if shared is None or not shared.is_trained:
         _exit(2, "Backbone checkpoint is present but model is not trained")
 
-    pipeline.pattern_engine._shared_model = shared
-    logger.info("Backbone loaded (v=%s  players=%d)",
-                shared.model_version, shared.n_players)
+    pipeline.pattern_engine.inference_engine._shared_model = shared
 
-    # Load per-player state from a persisted serve-state if available
+    logger.info(
+        "Backbone loaded (v=%s  players=%d)",
+        shared.model_version,
+        shared.n_players,
+    )
+
+    # ─────────────────────────────────────────────
+    # Restore serve state
+    # ─────────────────────────────────────────────
     serve_state_path = model_dir / "serve_state.json"
+
     if serve_state_path.exists():
-        _restore_serve_state(pipeline, serve_state_path)
-        logger.info("Serve state restored from %s", serve_state_path)
+
+        _restore_serve_state(
+            pipeline,
+            serve_state_path,
+        )
+
+        print(
+            "\nRESTORED PLAYERS:",
+            len(pipeline.registry._players),
+        )
+
+        # IMPORTANT:
+        # inject model AFTER restore
+        for player in pipeline.registry._players.values():
+            player["model"] = shared
+
+        logger.info(
+            "Serve state restored from %s",
+            serve_state_path,
+        )
+
     else:
+
         logger.warning(
-            "No serve_state.json found — player baselines and thresholds not loaded. "
+            "No serve_state.json found — "
+            "player baselines and thresholds not loaded. "
             "Run train first or provide serve_state.json."
         )
 
-    # ── Alert gate (per-player) ───────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # Alert gate
+    # ─────────────────────────────────────────────
     gate_counts: Dict[str, int] = defaultdict(int)
-    gate_last:   Dict[str, str] = {}
+    gate_last: Dict[str, str] = {}
 
     def _gate_fire(ext_id: str, rec_type: str) -> bool:
+
         if gate_last.get(ext_id) != rec_type:
+
             gate_counts[ext_id] = 1
-            gate_last[ext_id]   = rec_type
+            gate_last[ext_id] = rec_type
+
         else:
             gate_counts[ext_id] += 1
+
         return gate_counts[ext_id] >= args.min_alert_windows
 
     def _gate_reset(ext_id: str) -> None:
+
         gate_counts[ext_id] = 0
         gate_last.pop(ext_id, None)
 
-    # ── Enrichment helpers ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # Enrichment
+    # ─────────────────────────────────────────────
     def _enrich(event: dict) -> dict:
-        """Attach fatigue residual + speed drop to event dict."""
-        ext_id   = event.get("player_external_id", "")
-        player   = pipeline.registry.get_by_external_id(ext_id)
+
+        ext_id = event.get("player_external_id", "")
+
+        player = pipeline.registry.get_by_external_id(ext_id)
+
         baseline = player["baseline"] if player else None
+
         if baseline is None:
             return event
 
-        speed        = float(event.get("speed_ms") or 0.0)
-        elapsed_min  = float(event.get("elapsed_seconds", 0)) / 60.0
-        alpha        = baseline.fatigue_alpha or 0.005
-        beta         = baseline.fatigue_beta  or speed * 1.3
-        expected_spd = beta * np.exp(-alpha * elapsed_min)
-        # Estimate session start speed from baseline if not provided
-        start_speed = float(event.get("session_start_speed_ms") or
-                            (baseline.distance_mean / (90 * 60) * 1.3))
+        speed = float(event.get("speed_ms") or 0.0)
 
-        event["fatigue_decay_residual"] = round((speed - expected_spd) * 15.0, 2)
-        event["speed_drop_pct"]         = round(
-            (1.0 - speed / max(start_speed, 0.1)) * 100.0, 1
+        elapsed_min = float(event.get("elapsed_seconds", 0)) / 60.0
+
+        alpha = baseline.fatigue_alpha or 0.005
+
+        beta = baseline.fatigue_beta or speed * 1.3
+
+        expected_spd = beta * np.exp(-alpha * elapsed_min)
+
+        start_speed = float(
+            event.get("session_start_speed_ms")
+            or (baseline.distance_mean / (90 * 60) * 1.3)
         )
+
+        event["fatigue_decay_residual"] = round(
+            (speed - expected_spd) * 15.0,
+            2,
+        )
+
+        event["speed_drop_pct"] = round(
+            (1.0 - speed / max(start_speed, 0.1)) * 100.0,
+            1,
+        )
+
         return event
 
-    # ── Stream loop ───────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # Inference log
+    # ─────────────────────────────────────────────
+    inference_log_path = Path("logs") / "inference_log.jsonl"
+
+    inference_log_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    _inference_log_fh = open(
+        inference_log_path,
+        "a",
+        buffering=1,
+    )
+
+    logger.info(
+        "Inference log → %s",
+        inference_log_path,
+    )
+
+    # ─────────────────────────────────────────────
+    # Stream loop
+    # ─────────────────────────────────────────────
     n_events = 0
     n_alerts = 0
     sla_violations = 0
@@ -699,98 +832,236 @@ def cmd_serve(args: argparse.Namespace) -> None:
     logger.info("Serving — reading newline-delimited JSON from stdin")
 
     try:
+
         for raw_line in sys.stdin:
+
             raw_line = raw_line.strip()
+
             if not raw_line:
                 continue
 
             t_start = time.perf_counter()
+
             n_events += 1
 
             try:
                 event = json.loads(raw_line)
+
             except json.JSONDecodeError as exc:
-                logger.warning("Line %d: invalid JSON — %s", n_events, exc)
+
+                logger.warning(
+                    "Line %d: invalid JSON — %s",
+                    n_events,
+                    exc,
+                )
+
                 continue
 
-            ext_id = event.get("player_external_id", "")
+            ext_id = event.get(
+                "player_external_id",
+                "",
+            )
+
             if not ext_id:
-                logger.debug("Line %d: missing player_external_id — skipped", n_events)
+
+                logger.debug(
+                    "Line %d: missing player_external_id — skipped",
+                    n_events,
+                )
+
                 continue
 
             event = _enrich(event)
 
             try:
-                result = pipeline.process_live_event(event, segment_index=0)
+
+                result = pipeline.process_live_event(
+                    event,
+                    segment_index=0,
+                )
+
             except Exception as exc:
-                logger.warning("Inference error for %s: %s", ext_id, exc)
+
+                logger.warning(
+                    "Inference error for %s: %s",
+                    ext_id,
+                    exc,
+                )
+
                 continue
 
             latency_ms = (time.perf_counter() - t_start) * 1000
 
             if latency_ms > args.max_latency_ms:
+
                 sla_violations += 1
+
                 logger.warning(
-                    "SLA breach: player=%s  latency=%.1f ms > %d ms  (total=%d)",
-                    ext_id, latency_ms, args.max_latency_ms, sla_violations,
+                    "SLA breach: player=%s latency=%.1f ms > %d ms (total=%d)",
+                    ext_id,
+                    latency_ms,
+                    args.max_latency_ms,
+                    sla_violations,
+                )
+
+            # ─────────────────────────────
+            # Persist inference
+            # ─────────────────────────────
+            if result is not None:
+
+                _inference_log_fh.write(
+                    json.dumps(
+                        {
+                            "inference_id": n_events,
+                            "player_id": result.player_id,
+                            "external_id": ext_id,
+                            "session_id": event.get(
+                                "session_id",
+                                0,
+                            ),
+                            "recommendation_type": result.recommendation_type,
+                            "is_anomaly": result.recommendation_type
+                            is not None,
+                            "anomaly_score": round(
+                                float(result.anomaly_score or 0.0),
+                                6,
+                            ),
+                            "confidence": round(
+                                float(result.confidence or 0.0),
+                                4,
+                            ),
+                            "fatigue_flag": bool(result.fatigue_flag),
+                            "drift_flag": bool(result.positional_drift_flag),
+                            "workload_flag": bool(result.workload_flag),
+                            "nlg_summary": getattr(
+                                result,
+                                "nlg_summary",
+                                "",
+                            ),
+                            "ts": datetime.now(tz=timezone.utc).isoformat(),
+                        }
+                    )
+                    + "\n"
                 )
 
             if result is None or result.recommendation_type is None:
+
                 _gate_reset(ext_id)
+
                 continue
 
-            # Gate: only emit after N consecutive flagged windows
-            if not _gate_fire(ext_id, result.recommendation_type):
+            # ─────────────────────────────
+            # Consecutive alert gate
+            # ─────────────────────────────
+            if not _gate_fire(
+                ext_id,
+                result.recommendation_type,
+            ):
                 continue
 
             n_alerts += 1
 
             alert_payload = {
-                "player_id":           result.player_id,
-                "external_id":         result.external_id,
+                "player_id": result.player_id,
+                "external_id": result.external_id,
                 "recommendation_type": result.recommendation_type,
-                "confidence":          round(result.confidence, 4),
-                "anomaly_score":       round(result.anomaly_score, 6),
-                "fatigue_flag":        result.fatigue_flag,
-                "drift_flag":          result.positional_drift_flag,
-                "workload_flag":       result.workload_flag,
-                "workload_status":     result.workload_status,
-                "nlg_summary":         result.nlg_summary   if hasattr(result, "nlg_summary")   else "",
-                "counterfactual":      result.counterfactual if hasattr(result, "counterfactual") else "",
-                "shap_values":         result.shap_values   if hasattr(result, "shap_values")   else {},
-                "top_features":        [
+                "confidence": round(result.confidence, 4),
+                "anomaly_score": round(result.anomaly_score, 6),
+                "fatigue_flag": result.fatigue_flag,
+                "drift_flag": result.positional_drift_flag,
+                "workload_flag": result.workload_flag,
+                "workload_status": result.workload_status,
+                "nlg_summary": getattr(
+                    result,
+                    "nlg_summary",
+                    "",
+                ),
+                "counterfactual": getattr(
+                    result,
+                    "counterfactual",
+                    "",
+                ),
+                "shap_values": getattr(
+                    result,
+                    "shap_values",
+                    {},
+                ),
+                "top_features": [
                     {
                         "feature": c.feature_name,
-                        "shap":    round(c.shap_value, 6),
-                        "value":   round(c.feature_value, 4),
-                        "label":   c.human_label,
+                        "shap": round(
+                            c.shap_value,
+                            6,
+                        ),
+                        "value": round(
+                            c.feature_value,
+                            4,
+                        ),
+                        "label": c.human_label,
                     }
-                    for c in (result.top_contributions[:5]
-                              if hasattr(result, "top_contributions") else [])
+                    for c in (
+                        result.top_contributions[:5]
+                        if hasattr(
+                            result,
+                            "top_contributions",
+                        )
+                        else []
+                    )
                 ],
-                "latency_ms":          round(latency_ms, 2),
-                "ts":                  datetime.now(tz=timezone.utc).isoformat(),
-                "gate_windows":        gate_counts[ext_id],
+                "latency_ms": round(
+                    latency_ms,
+                    2,
+                ),
+                "ts": datetime.now(tz=timezone.utc).isoformat(),
+                "gate_windows": gate_counts[ext_id],
             }
 
-            print(json.dumps(alert_payload), flush=True)
+            print(
+                json.dumps(alert_payload),
+                flush=True,
+            )
+
             logger.info(
-                "ALERT  player=%-6s  type=%-20s  conf=%.2f  latency=%.1f ms",
-                ext_id, result.recommendation_type,
-                result.confidence, latency_ms,
+                "ALERT player=%-6s type=%-20s conf=%.2f latency=%.1f ms",
+                ext_id,
+                result.recommendation_type,
+                result.confidence,
+                latency_ms,
             )
 
     except KeyboardInterrupt:
+
         logger.info("SIGINT received — shutting down gracefully")
+
     except BrokenPipeError:
+
         logger.info("Pipe closed — exiting")
+
     except Exception as exc:
-        logger.exception("Unhandled stream error: %s", exc)
+
+        logger.exception(
+            "Unhandled stream error: %s",
+            exc,
+        )
+
+        _inference_log_fh.close()
+
         _exit(4, f"Serve exited with unhandled error: {exc}")
 
+    finally:
+
+        _inference_log_fh.close()
+
+        logger.info(
+            "Inference log closed → %s",
+            inference_log_path,
+        )
+
     logger.info(
-        "Serve complete | events=%d  alerts=%d  sla_violations=%d",
-        n_events, n_alerts, sla_violations,
+        "Serve complete | events=%d alerts=%d sla_violations=%d",
+        n_events,
+        n_alerts,
+        sla_violations,
     )
 
 
@@ -855,6 +1126,7 @@ def _restore_serve_state(pipeline, path: Path) -> None:
             p_reg = pipeline.registry.get(pid)
             if p_reg:
                 p_reg["baseline"] = baseline
+                p_reg["model"] = pipeline.pattern_engine._shared_model
 
         # Restore threshold tracker (best-effort)
         t = ps.get("threshold_tracker")
@@ -864,6 +1136,7 @@ def _restore_serve_state(pipeline, path: Path) -> None:
                     t, inner_tracker_cls=DynamicThresholdTracker
                 )
                 pipeline.pattern_engine._threshold_trackers[pid] = store
+                pipeline.pattern_engine.inference_engine._threshold_trackers[pid] = store
             except Exception as exc:
                 logger.debug("Could not restore threshold for player %d: %s", pid, exc)
 
@@ -881,7 +1154,8 @@ def _save_serve_state(pipeline, path: Path) -> None:
         state = {"players": {}}
 
         # Save state for all registered players
-        for pid, player_info in pipeline.registry.items():
+        for pid in pipeline.registry.all_player_ids():
+            player_info = pipeline.registry.get(pid)
             ps = {
                 "external_id": player_info["external_id"],
                 "name": player_info.get("name", ""),
@@ -913,10 +1187,13 @@ def _save_serve_state(pipeline, path: Path) -> None:
                 }
 
             # Save threshold tracker if available
-            tracker = pipeline.pattern_engine._threshold_trackers.get(pid)
+            # Must read from inference_engine — that is where InferenceEngine.train()
+            # writes calibrated thresholds. pattern_engine._threshold_trackers is
+            # never populated during training so it is always empty at save time.
+            tracker = pipeline.pattern_engine.inference_engine._threshold_trackers.get(pid)
             if tracker and isinstance(tracker, RegimeAwareThresholdStore):
                 try:
-                    ps["threshold_tracker"] = tracker.to_state_dict()
+                    ps["threshold_tracker"] = tracker.state_dict()
                 except Exception as exc:
                     logger.debug("Could not serialize threshold tracker for player %d: %s", pid, exc)
 

@@ -47,6 +47,9 @@ axis is a one-line change to WindowRegime and classify().
 """
 from __future__ import annotations
 
+
+from collections import defaultdict, deque
+from typing import Dict, List
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -156,7 +159,297 @@ class SessionRegimeClassifier:
 # ─────────────────────────────────────────────────────────────────────────────
 # Regime-aware threshold store
 # ─────────────────────────────────────────────────────────────────────────────
+
+
 class RegimeAwareThresholdStore:
+    """
+    Regime-aware adaptive threshold store.
+
+    Maintains:
+      • one global DynamicThresholdTracker
+      • one tracker per regime
+      • calibration loss distributions per regime
+
+    Operational guarantees:
+      • rare regimes fall back to global thresholds
+      • calibration distributions are persisted
+      • percentile-based operational thresholds supported
+      • deterministic replay consistency
+    """
+
+    def __init__(self, inner_tracker_cls=None, cfg=None):
+
+        # Deferred import avoids circular dependency
+        from config.settings import CONFIG
+
+        if inner_tracker_cls is None:
+            from analysis.anomaly_detection import (
+                DynamicThresholdTracker,
+            )
+            inner_tracker_cls = DynamicThresholdTracker
+
+        self._cls = inner_tracker_cls
+        self._cfg = cfg or CONFIG.scoring
+
+        # Global tracker
+        self._global = self._cls(self._cfg)
+
+        # Per-regime trackers
+        self._per_regime: Dict[str, object] = {}
+
+        # Persist calibration distributions
+        self._losses_by_regime = defaultdict(
+            lambda: deque(maxlen=5000)
+        )
+
+    # ─────────────────────────────────────────────
+    # Write path
+    # ─────────────────────────────────────────────
+    def update(
+        self,
+        loss: float,
+        regime_key: str,
+    ) -> None:
+        """
+        Record calibration loss.
+
+        Updates:
+          • global tracker
+          • regime tracker
+          • regime calibration distribution
+        """
+
+        loss = float(loss)
+
+        self._global.update(loss)
+
+        if regime_key not in self._per_regime:
+            self._per_regime[regime_key] = self._cls(
+                self._cfg
+            )
+
+        self._per_regime[regime_key].update(loss)
+
+        # Persist distribution for operational thresholds
+        self._losses_by_regime[
+            regime_key
+        ].append(loss)
+
+    # ─────────────────────────────────────────────
+    # Read path
+    # ─────────────────────────────────────────────
+    @property
+    def is_calibrated(self) -> bool:
+        """
+        True once global tracker calibrated.
+        """
+        return self._global.is_calibrated
+
+    def threshold_for(
+        self,
+        regime_key: str,
+    ) -> float:
+        """
+        Return threshold for regime.
+
+        Falls back to global threshold if regime
+        is under-calibrated.
+        """
+
+        tracker = self._per_regime.get(
+            regime_key
+        )
+
+        if (
+            tracker is not None
+            and tracker.is_calibrated
+        ):
+            return float(tracker.threshold)
+
+        return float(self._global.threshold)
+
+    def confidence_for(
+        self,
+        loss: float,
+        regime_key: str,
+    ) -> float:
+        """
+        Empirical confidence estimate.
+
+        Falls back to global tracker.
+        """
+
+        tracker = self._per_regime.get(
+            regime_key
+        )
+
+        if (
+            tracker is not None
+            and tracker.is_calibrated
+        ):
+            return float(
+                tracker.confidence(loss)
+            )
+
+        return float(
+            self._global.confidence(loss)
+        )
+
+    def get_regime_losses(
+        self,
+        regime_key: str,
+    ) -> List[float]:
+        """
+        Return calibration losses for regime.
+        """
+
+        return list(
+            self._losses_by_regime.get(
+                regime_key,
+                [],
+            )
+        )
+
+    # ─────────────────────────────────────────────
+    # Diagnostics
+    # ─────────────────────────────────────────────
+    def regime_coverage(self) -> Dict[str, int]:
+        """
+        Number of calibration windows per regime.
+        """
+
+        return {
+            key: len(vals)
+            for key, vals in self._losses_by_regime.items()
+        }
+
+    def uncalibrated_regimes(self) -> List[str]:
+        """
+        Regimes without stable calibration.
+        """
+
+        return [
+            key
+            for key, tracker
+            in self._per_regime.items()
+            if not tracker.is_calibrated
+        ]
+
+    def summary(self) -> str:
+        """
+        Human-readable summary.
+        """
+
+        lines = [
+            (
+                "RegimeAwareThresholdStore "
+                f"— global n={len(self._global._losses)}"
+            )
+        ]
+
+        for key, count in sorted(
+            self.regime_coverage().items(),
+            key=lambda x: -x[1],
+        ):
+
+            tracker = self._per_regime.get(key)
+
+            calibrated = (
+                tracker is not None
+                and tracker.is_calibrated
+            )
+
+            calib = (
+                "✓"
+                if calibrated
+                else "fallback"
+            )
+
+            thr = (
+                f"{tracker.threshold:.4f}"
+                if calibrated
+                else "–"
+            )
+
+            lines.append(
+                f"  {key:<30} "
+                f"n={count:<5} "
+                f"threshold={thr:<10} "
+                f"{calib}"
+            )
+
+        return "\n".join(lines)
+
+    # ─────────────────────────────────────────────
+    # Serialization
+    # ─────────────────────────────────────────────
+    def state_dict(self) -> dict:
+        """
+        Serialize full operational state.
+        """
+
+        return {
+            "global": self._global.state_dict(),
+
+            "per_regime": {
+                k: v.state_dict()
+                for k, v in self._per_regime.items()
+            },
+
+            "losses_by_regime": {
+                k: list(v)
+                for k, v in self._losses_by_regime.items()
+            },
+        }
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        d: dict,
+        inner_tracker_cls=None,
+        cfg=None,
+    ) -> "RegimeAwareThresholdStore":
+
+        from analysis.anomaly_detection import (
+            DynamicThresholdTracker,
+        )
+
+        inner_tracker_cls = (
+            inner_tracker_cls
+            or DynamicThresholdTracker
+        )
+
+        obj = cls(
+            inner_tracker_cls=inner_tracker_cls,
+            cfg=cfg,
+        )
+
+        obj._global = (
+            inner_tracker_cls.from_state_dict(
+                d["global"]
+            )
+        )
+
+        obj._per_regime = {
+            k: inner_tracker_cls.from_state_dict(v)
+            for k, v in d.get(
+                "per_regime",
+                {},
+            ).items()
+        }
+
+        obj._losses_by_regime = defaultdict(
+            lambda: deque(maxlen=5000)
+        )
+
+        for k, vals in d.get(
+            "losses_by_regime",
+            {},
+        ).items():
+
+            obj._losses_by_regime[k].extend(vals)
+
+        return obj
     """
     Drop-in replacement for a single DynamicThresholdTracker.
 
@@ -273,6 +566,27 @@ class RegimeAwareThresholdStore:
             "global":     self._global.state_dict(),
             "per_regime": {k: v.state_dict() for k, v in self._per_regime.items()},
         }
+    
+    def get_regime_losses(
+        self,
+        regime_key: str,
+    ) -> List[float]:
+        """
+        Return calibration losses for a regime.
+
+        Used for operational threshold estimation
+        during evaluation/inference.
+        """
+
+        if not hasattr(self, "_losses_by_regime"):
+            return []
+
+        return list(
+            self._losses_by_regime.get(
+                regime_key,
+                [],
+            )
+        )
 
     @classmethod
     def from_state_dict(cls, d: dict, inner_tracker_cls=None, cfg=None) -> "RegimeAwareThresholdStore":
