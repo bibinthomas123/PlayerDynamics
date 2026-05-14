@@ -1640,12 +1640,6 @@ class InferenceEngine:
         sequence: np.ndarray,
         mask: np.ndarray,
     ) -> Tuple[float, str]:
-        print("\nSCORE_WINDOW CALLED")
-        print("IS READY:", self.is_ready)
-        print("HAS MODEL:", self._shared_model is not None)
-
-        if self._shared_model is not None:
-            print("MODEL TRAINED:", self._shared_model.is_trained)
         if not self.is_ready:
             return 0.0, "none"
 
@@ -2687,10 +2681,6 @@ class SharedBackboneAutoencoder:
 
         if not self.is_trained:
             return 0.0, False, 0.0
-        
-        # print("MODEL TRAINED?", self.is_trained)
-        # print("PLAYER INDEX SIZE", len(self._player_index))
-        # print("PLAYER EXISTS?", player_id in self._player_index)
 
         idx = self._player_index.get(player_id)
         if idx is None:
@@ -4295,14 +4285,7 @@ class PatternAnalysisEngine:
         # Read back the alert state so AnomalyResult carries alert_level
         # and persistence_windows — used by the XAI gate in the orchestrator.
         anomaly_state = self.alert_manager.get_state(player_id, "anomaly")
-        print(
-            "\nDEBUG WINDOW",
-            "\nsequence shape:", sequence.shape,
-            "\nsequence mean :", float(sequence.mean()),
-            "\nsequence std  :", float(sequence.std()),
-            "\nmask sum      :", int(mask.sum()),
-            "\nlast row      :", sequence[-1],
-        )
+        
         return AnomalyResult(
             player_id=player_id,
             external_id=baseline.external_id,

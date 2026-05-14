@@ -19,6 +19,7 @@ from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
 from analysis.anomaly_detection import (
     PatternAnalysisEngine, AnomalyResult
 )
+from analysis.match_state import MatchStateManager, MatchState
 from utils.reliability.invariants import SystemInvariantGuard
 from analysis.baseline import BaselineBuilder, PlayerBaselineProfile
 from explainability.xai_layer import XAILayer, SHAPExplanation, FEATURE_NAMES as XAI_FEATURE_NAMES
@@ -117,9 +118,10 @@ class PlayersDataAnalysisPipeline:
         self._on_alert_callback: Optional[Callable] = None
         self._inference_id_counter = 0
 
-    # ──────────────────────────────────────────
-    # Registration & data loading
-    # ──────────────────────────────────────────
+        # ── Match state ───────────────────────────────────────────────────────
+        self._match_state = MatchStateManager()
+        self._active_match_id: Optional[str] = None
+
     def register_player(
         self, player_id: int, external_id: str, name: str,
         position: str, age: int, age_group: str = "Senior", nationality: str = "",
@@ -443,16 +445,29 @@ class PlayersDataAnalysisPipeline:
             )
             # run_xai = True  # FOR TESTING - BYPASS ALL GATES
 
-            print("\nXAI DEBUG")
-            print("shap_allowed:", shap_allowed)
-            print("sustained_alert:", sustained_alert)
-            print("sufficient_persistence:", sufficient_persistence)
-            print("cooldown_ok:", cooldown_ok)
-            print("run_xai:", run_xai)
+            # print("\nXAI DEBUG")
+            # print("shap_allowed:", shap_allowed)
+            # print("sustained_alert:", sustained_alert)
+            # print("sufficient_persistence:", sufficient_persistence)
+            # print("cooldown_ok:", cooldown_ok)
+            # print("run_xai:", run_xai)
 
             if run_xai:
 
                 xai_fv = self._build_xai_feature_vector(result)
+
+                # Get/create match state before explanation so context is current
+                match_state = self._match_state.get_or_create(
+                    player_id=pid,
+                    player_name=player["name"],
+                    position=player.get("position", ""),
+                    match_id=self._active_match_id,
+                )
+
+                match_state.record_telemetry(
+                    speed_ms=xai_fv.get("window_avg_speed_ms", 0.0),
+                    hr_bpm=xai_fv.get("heart_rate_bpm", 0.0),
+                )
 
                 explanation = self.xai_layer.explain_from_dict(
                     player_id=pid,
@@ -467,6 +482,16 @@ class PlayersDataAnalysisPipeline:
                     sequence=result.raw_sequence if hasattr(result, "raw_sequence") else None,
                     mask=result.raw_mask if hasattr(result, "raw_mask") else None,
                     sequence_background=player.get("sequence_background"),
+                    match_context=match_state.build_llm_context(),
+                )
+
+                # Record alert AFTER explanation so this alert appears
+                # in the NEXT call's context, not its own
+                match_state.record_alert(
+                    recommendation_type=result.recommendation_type,
+                    confidence=result.confidence,
+                    anomaly_score=result.anomaly_score,
+                    elapsed_seconds=int(xai_fv.get("elapsed_seconds", 0)),
                 )
 
                 self._last_xai_ts[pid] = now
@@ -559,6 +584,22 @@ class PlayersDataAnalysisPipeline:
 
     def set_alert_callback(self, cb: Callable) -> None:
         self._on_alert_callback = cb
+
+    # ──────────────────────────────────────────
+    # Match lifecycle  (Fix 2)
+    # ──────────────────────────────────────────
+    def start_match(self, match_id: str) -> None:
+        """Call at kickoff. Ties all subsequent state to this match_id."""
+        self._active_match_id = match_id
+        self._match_state.start_match(match_id)
+        logger.info("Match started: %s", match_id)
+
+    def end_match(self) -> None:
+        """Call at full time. Frees per-match memory and resets match identity."""
+        if self._active_match_id:
+            self._match_state.end_match(self._active_match_id)
+            logger.info("Match ended: %s", self._active_match_id)
+            self._active_match_id = None
 
     # ──────────────────────────────────────────
     # Coach feedback
@@ -662,7 +703,7 @@ class PlayersDataAnalysisPipeline:
             await asyncio.sleep(interval_s)
             logger.info("Scheduled recalibration triggered")
             self.recalibrate("weekly_cadence")
-            print(self.run_fairness_audit())
+            # print(self.run_fairness_audit())
 
     # ──────────────────────────────────────────
     # Inspection helpers
