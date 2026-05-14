@@ -149,11 +149,14 @@ To prevent false positives during tactical transitions, the system classifies ev
 
 ## References
 
-1. Rein & Memmert (2016) — Big data and tactical analysis in elite soccer
-2. Foteinakis et al. (2025) — Explainable ML for Basketball
+1. Rein & Memmert (2016) — Big data and tactical analysis in elite soccer; DOI: 10.1186/s40064-016-3108-2
+2. Foteinakis et al. (2025) — Explainable ML for Basketball; DOI: https://doi.org/10.3390/app152312401
 3. Odet et al. (2024) — ML and Explainability for Sports Outcome Prediction
-4. Pietraszewski et al. (2025) — AI in Sports Analytics systematic review
-5. Kranzinger et al. (2025) — Explainable AI in Sports Science
-6. Lundberg & Lee (2017) — SHAP: A Unified Approach to Interpreting Model Predictions
+4. Pietraszewski et al. (2025) — AI in Sports Analytics systematic review; DOI: https://doi.org/10.3390/app15137254
+5. Kranzinger et al. (2025) — Explainable AI in Sports Science; DOI: https://doi.org/10.48550/arXiv.1705.07874
+6. Lundberg & Lee (2017) — SHAP: A Unified Approach to Interpreting Model Predictions; DOI: https://doi.org/10.48550/arXiv.1705.07874
 7. Hochreiter & Schmidhuber (1997) — Long Short-Term Memory
-8. Bai et al. (2018) — An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling
+8. Bai et al. (2018) — An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling; DOI: https://doi.org/10.48550/arXiv.1803.01271
+9. Matthew Caron & Oliver Müller (2023) - TacticalGPT: Uncovering the Potential of LLMs for Predicting Tactical Decisions in Professional Football
+10. Emilio Ferrara (2024) - Large Language Models for Wearable Sensor-Based Human Activity Recognition, DOI: https://doi.org/10.3390/s24155045
+11. GuangLiang Yang (2024) - ChatPPG: Multi-Modal Alignment of Large Language Models for Time-Series Forecasting in Table Tennis 
