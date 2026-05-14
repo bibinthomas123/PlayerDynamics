@@ -149,7 +149,7 @@ To prevent false positives during tactical transitions, the system classifies ev
 
 ## References
 
-1. Rein & Memmert (2016) — Big data and tactical analysis in elite soccer; DOI: 10.1186/s40064-016-3108-2
+1. Rein & Memmert (2016) — Big data and tactical analysis in elite soccer; DOI: https://doi.org/10.1186/s40064-016-3108-2
 2. Foteinakis et al. (2025) — Explainable ML for Basketball; DOI: https://doi.org/10.3390/app152312401
 3. Odet et al. (2024) — ML and Explainability for Sports Outcome Prediction
 4. Pietraszewski et al. (2025) — AI in Sports Analytics systematic review; DOI: https://doi.org/10.3390/app15137254
