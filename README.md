@@ -164,3 +164,6 @@ To prevent false positives during tactical transitions, the system classifies ev
 13. Ziao Liu, Xiao Xie, Moqi He, Wenshuo Zhao, Yihong Wu, Liqi Cheng (2024) - Smartboard: Visual Exploration of Team Tactics with LLM Agent; DOI: https://doi.org/10.1109/TVCG.2024.3456200
 14. Mohammad Feli, Iman Azimi, Pasi Liljeberg, Amir M. Rahmani (2025) - An LLM-Powered Agent for Physiological Data Analysis: A Case Study on PPG-based Heart Rate Estimation; DOI: https://doi.org/10.1109/EMBC58623.2025.11254428
 15. Haotian Xia, Zhengbang Yang, Yuqing Wang, Rhys Tracy, Yun Zhao, Dongdong Huang, Zezhi Chen, Yan Zhu, Yuan-fang Wang, Weining Shen - SportQA: A Benchmark for Sports Understanding in Large Language Models (2024) ; DOI: https://doi.org/10.18653/v1/2024.naacl-long.283
+16. Konstantinos Apostolou, Christos Tjortjis (2019) - Sports Analytics algorithms for performance prediction; https://doi.org/10.1109/IISA.2019.8900754
+17. Vangelis Sarlis, Christos Tjortjis (2020) - Sports analytics — Evaluation of basketball players and team performance; DOI: https://doi.org/10.1016/j.is.2020.101562
+18. Indrajeet Ghosh, Sreenivasan Ramasamy Ramamurthy, Avijoy Chakma, Nirmalya Roy (2023) - Sports analytics review: Artificial intelligence applications, emerging technologies, and algorithmic perspective; DOI: https://doi.org/10.1002/widm.1496
