@@ -160,3 +160,7 @@ To prevent false positives during tactical transitions, the system classifies ev
 9. Matthew Caron & Oliver Müller (2023) - TacticalGPT: Uncovering the Potential of LLMs for Predicting Tactical Decisions in Professional Football
 10. Emilio Ferrara (2024) - Large Language Models for Wearable Sensor-Based Human Activity Recognition, DOI: https://doi.org/10.3390/s24155045
 11. GuangLiang Yang (2024) - ChatPPG: Multi-Modal Alignment of Large Language Models for Time-Series Forecasting in Table Tennis 
+12. Wenbo Tian, Ruting Lin, Hongxian Zheng, Yaodong Yang, Geng Wu, Zihao Zhang and Zhang Zhang (2025) - SportsGPT: An LLM-driven Framework for Interpretable Sports Motion Assessment and Training Guidance; DOI: https://doi.org/10.48550/arXiv.2512.14121
+13. Ziao Liu, Xiao Xie, Moqi He, Wenshuo Zhao, Yihong Wu, Liqi Cheng (2024) - Smartboard: Visual Exploration of Team Tactics with LLM Agent; DOI: https://doi.org/10.1109/TVCG.2024.3456200
+14. Mohammad Feli, Iman Azimi, Pasi Liljeberg, Amir M. Rahmani (2025) - An LLM-Powered Agent for Physiological Data Analysis: A Case Study on PPG-based Heart Rate Estimation; DOI: https://doi.org/10.1109/EMBC58623.2025.11254428
+15. Haotian Xia, Zhengbang Yang, Yuqing Wang, Rhys Tracy, Yun Zhao, Dongdong Huang, Zezhi Chen, Yan Zhu, Yuan-fang Wang, Weining Shen - SportQA: A Benchmark for Sports Understanding in Large Language Models (2024) ; DOI: https://doi.org/10.18653/v1/2024.naacl-long.283
