@@ -16,6 +16,13 @@ Architecture position:
     ↓
     List[SemanticFinding]
     ↓
+    Orchestrator                 ← calls match_state.record_finding() per finding
+    ↓
+    MatchState (longitudinal memory)
+        ├─ motif detection
+        ├─ trend reasoning
+        └─ build_semantic_summary()
+    ↓
     LLM narrative generation  (xai_layer.py — LLMNLGEngine)
 
 Design principles
@@ -23,8 +30,18 @@ Design principles
 • Thresholds and ontology are centralized here, never scattered in if-blocks elsewhere.
 • The LLM receives SemanticFinding objects — not raw SHAP values.
   It narrates; it does not reason physiologically.
-• Five finding types for v1. Extend via SEMANTIC_RULES (see below).
+• Five finding types for v1. Extend via the rule methods below.
 • All public interfaces are typed and dataclass-based so callers can serialize freely.
+
+Layer responsibility boundary
+──────────────────────────────
+  semantic_layer  : interprets CURRENT window state → List[SemanticFinding]
+  match_state     : interprets LONGITUDINAL evolution → motifs, trends, summary
+  orchestrator    : wires findings from semantic_layer into match_state
+  LLM             : communicates pre-reasoned output, never reasons itself
+
+DO NOT call match_state from inside this module.
+The orchestrator owns the wiring between these two layers.
 """
 from __future__ import annotations
 
@@ -226,13 +243,25 @@ class SemanticInterpreter:
     ) -> List[SemanticFinding]:
         """
         Run all interpretation rules and return a deduplicated, severity-sorted
-        list of SemanticFinding objects.
+        list of SemanticFinding objects for the CURRENT window.
 
         Parameters
         ----------
         shap_values        : {feature_name: shap_float} from XAILayer
         feature_values     : {feature_name: observed_float} from _build_xai_feature_vector
         persistence_windows: how many consecutive windows this alert has been active
+
+        Returns
+        -------
+        List[SemanticFinding] sorted by severity then confidence.
+
+        Handoff
+        -------
+        The caller (orchestrator) is responsible for calling
+        match_state.record_finding() on each returned finding.
+        This module must NOT access MatchState directly — it only
+        interprets the current window. Longitudinal reasoning lives
+        in match_state.py (motifs, trends, build_semantic_summary).
         """
         findings: List[SemanticFinding] = []
 

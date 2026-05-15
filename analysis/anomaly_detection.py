@@ -865,7 +865,8 @@ class SequenceWindowBuilder:
         cfg = CONFIG.window
         self.window_steps = cfg.window_steps
         self.event_interval_s = cfg.event_interval_s
-        self.stride = max(1, self.window_steps // 2)
+        self.stride = self.window_steps
+        self._tick_counters: Dict[str, int] = {}
 
     def add_event(
         self, event: dict
@@ -1026,7 +1027,7 @@ class SequenceWindowBuilder:
         )
 
         if stride is None:
-            stride = max(1, self.window_steps // 2)
+            stride = self.window_steps
 
         n = len(events_df)
 
@@ -1095,6 +1096,85 @@ class SequenceWindowBuilder:
                 msk,
             ))
         return results
+    
+
+    def build_live_window(
+        self,
+        events: List[dict],
+        prev_event: Optional[dict] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Convert a completed accumulator window into model inputs.
+    
+        Stateless: reads ``self.window_steps`` and calls ``self._extract()``,
+        but never touches ``self._buffers``, ``self._mask_buffers``, or
+        ``self._prev_events``.
+    
+        Parameters
+        ----------
+        events:
+            Ordered list of raw telemetry dicts emitted by
+            ``LiveWindowAccumulator.push()``.  Length should equal
+            ``self.window_steps``; longer lists are right-truncated, shorter
+            lists are left-padded with zero rows and False mask entries.
+        prev_event:
+            Optional: the last real event from the *previous* window, used
+            to compute delta features for ``events[0]`` across the window
+            boundary.  Pass ``None`` (default) to accept delta = 0.0 at the
+            boundary — which is the safe, stateless default.
+    
+        Returns
+        -------
+        seq : np.ndarray, shape (window_steps, N_SEQUENCE_FEATURES), float32
+            Feature matrix ready for the autoencoder forward pass.
+        mask : np.ndarray, shape (window_steps,), bool
+            True for real sensor ticks, False for zero-padded positions.
+        """
+        window_steps = self.window_steps  # number of timesteps (e.g. 24)
+    
+        # ── Normalise length ──────────────────────────────────────────────────────
+        if len(events) > window_steps:
+            events = events[-window_steps:]          # right-truncate
+        pad_count = window_steps - len(events)       # left-pad deficit
+    
+        feature_rows: List[np.ndarray] = []
+        mask_rows:    List[bool]        = []
+    
+        # ── Left-pad with zero rows (masked out) ──────────────────────────────────
+        for _ in range(pad_count):
+            feature_rows.append(np.zeros(N_SEQUENCE_FEATURES, dtype=np.float32))
+            mask_rows.append(False)
+    
+        # ── Extract features tick by tick ─────────────────────────────────────────
+        # prev_real tracks the last real event *within this call* so delta
+        # features are consistent inside the window.  It starts from prev_event
+        # (cross-boundary continuity) or None (delta = 0.0 at t=0).
+        prev_real: Optional[dict] = prev_event
+    
+        for event in events:
+            is_real = (
+                event.get("speed_ms")        is not None
+                and event.get("heart_rate_bpm") is not None
+            )
+            if is_real:
+                fv = self._extract(event, prev_real)   # (N_SEQUENCE_FEATURES,)
+                prev_real = event
+            else:
+                fv = np.zeros(N_SEQUENCE_FEATURES, dtype=np.float32)
+    
+            feature_rows.append(fv)
+            mask_rows.append(is_real)
+    
+        seq  = np.asarray(feature_rows, dtype=np.float32)   # (window_steps, N_SEQUENCE_FEATURES)
+        mask = np.asarray(mask_rows,    dtype=bool)          # (window_steps,)
+    
+        # Sanity check — catches future N_SEQUENCE_FEATURES drift early
+        assert seq.shape == (window_steps, N_SEQUENCE_FEATURES), (
+            f"build_live_window: expected shape ({window_steps}, {N_SEQUENCE_FEATURES}), "
+            f"got {seq.shape}.  Check N_SEQUENCE_FEATURES constant."
+        )
+    
+        return seq, mask
+    
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1639,6 +1719,7 @@ class InferenceEngine:
         player_id: int,
         sequence: np.ndarray,
         mask: np.ndarray,
+        
     ) -> Tuple[float, str]:
         if not self.is_ready:
             return 0.0, "none"
@@ -3789,47 +3870,6 @@ def evaluate_model_results(
     # ─────────────────────────────────────────────
     # Episode extraction
     # ─────────────────────────────────────────────
-    def extract_episodes(
-        arr: np.ndarray,
-    ) -> List[Tuple[int, int]]:
-
-        episodes = []
-
-        active = False
-        start = None
-        gap = 0
-
-        for i, val in enumerate(arr):
-
-            if val == 1:
-
-                if not active:
-                    start = i
-                    active = True
-
-                gap = 0
-
-            else:
-
-                if active:
-                    gap += 1
-
-                    if gap > gap_tolerance:
-                        episodes.append(
-                            (start, i - gap)
-                        )
-
-                        active = False
-                        start = None
-                        gap = 0
-
-        if active:
-            episodes.append(
-                (start, len(arr) - 1)
-            )
-
-        return episodes
-
     gt_episodes = extract_episodes(labs)
     pred_episodes = extract_episodes(preds)
 
@@ -4091,6 +4131,46 @@ class PatternAnalysisEngine:
         self.alert_manager = AlertManager()
         self._shared_model: Optional[SharedBackboneAutoencoder] = None
 
+    def reset_ema_state(
+    self,
+    player_id: int,
+) -> None:
+        """
+        Reset EMA smoothing state for one player.
+        Used after live stream/session discontinuities.
+        """
+
+        self._ema_smoothers.pop(player_id, None)
+        self._ema_scores.pop(player_id, None)
+
+        # logger.info(
+        #     "EMA RESET | player=%s",
+        #     player_id,
+        # )
+
+    def reset_player_runtime_state(
+    self,
+    player_id: int,
+) -> None:
+        """
+        Reset transient online inference state for a player.
+
+        Called when:
+        - session changes
+        - large temporal discontinuities occur
+        - live stream reconnects
+        """
+
+        self._ema_smoothers.pop(player_id, None)
+        self._ema_scores.pop(player_id, None)
+
+        self._position_buffers.pop(player_id, None)
+
+        logger.info(
+            "RUNTIME RESET | player=%s",
+            player_id,
+        )
+
     def register_player(
         self,
         player_id: int,
@@ -4139,99 +4219,108 @@ class PatternAnalysisEngine:
         sessions_df: pd.DataFrame,
     ) -> Optional[AnomalyResult]:
         """Process one live telemetry event and return an anomaly result.
-
-        This is the primary hot-path method called for every incoming sensor
-        tick during a live match or training session.
-
-        Processing Steps
-        ----------------
-        1. Append the event to the player's sliding window buffer via
-           ``SequenceWindowBuilder.add_event()``.  Returns ``None`` until
-           the buffer is full.
-        2. Run the shared backbone to get a reconstruction loss.
-        3. Apply EMA smoothing to the raw loss.
-        4. Compare the smoothed loss against the player's regime-specific
-           calibrated threshold.
-        5. Update the positional buffer and compute drift metrics.
-        6. Compute the ACWR workload flag from session history.
-        7. Evaluate the fatigue flag from speed/sprint ratios and match time.
-        8. Return a fully populated ``AnomalyResult``.
-
-        Fatigue Flag Logic
-        ------------------
-        The fatigue flag requires *all three* of:
-
-        * The model fires (``is_anomaly = True``).
-        * Speed or sprint rate is below 55 % of the player's personal average.
-        * The player is past the 45-minute mark (``elapsed_seconds > 2700``).
-
-        Using a personal speed baseline (derived from ``baseline.distance_mean``)
-        instead of an absolute threshold prevents false positives for
-        goalkeepers and defenders who legitimately operate at lower speeds.
-
-        EMA Smoothing
-        -------------
-        Raw per-window reconstruction losses are noisy due to natural variance
-        in telemetry.  An EMA with ``alpha = CONFIG.scoring.score_ema_alpha``
-        is applied to suppress transient spikes that would otherwise generate
-        spurious alerts.
-
-        Parameters
-        ----------
-        player_id:
-            Internal player ID.  Must have been registered via
-            ``register_player()``.  Returns ``None`` for unknown players.
-        live_event:
-            Telemetry event dictionary with at minimum: ``player_external_id``,
-            ``speed_ms``, ``heart_rate_bpm``, ``x_pitch``, ``y_pitch``,
-            ``elapsed_seconds``.  Optional enriched keys:
-            ``fatigue_decay_residual``, ``speed_drop_pct``,
-            ``coach_fatigue_severity``, ``coach_pre_match_status_encoded``.
-        sessions_df:
-            Historical session DataFrame for workload (ACWR) computation.
-            May be empty; workload flags default to ``False`` when empty.
-
-        Returns
-        -------
-        AnomalyResult or None
-            Fully populated result when a complete window is available,
-            ``None`` while the buffer is still filling.
+ 
+        Appends the event to the per-player sliding buffer.  Returns ``None``
+        while the buffer is still filling, then delegates to
+        ``analyze_window()`` once a complete window is available.
+ 
+        Old callers that use ``analyze()`` continue to work unchanged;
+        new live-serving callers should use ``process_window_direct()``
+        (which calls ``analyze_window()`` directly via ``build_live_window``).
         """
         baseline = self._baselines.get(player_id)
         if baseline is None:
             return None
-
+ 
         result = self.window_builder.add_event(live_event)
         if result is None:
             return None
         sequence, mask = result
-
+ 
+        return self.analyze_window(
+            player_id=player_id,
+            sequence=sequence,
+            mask=mask,
+            live_event=live_event,
+            sessions_df=sessions_df,
+        )
+    
+    def analyze_window(
+        self,
+        player_id:   int,
+        sequence:    np.ndarray,
+        mask:        np.ndarray,
+        live_event:  dict,
+        sessions_df: pd.DataFrame,
+    ) -> Optional[AnomalyResult]:
+        """Run the full ML + heuristic scoring pipeline on a completed window.
+ 
+        Called by ``analyze()`` (streaming path) and ``process_window_direct()``
+        (live-serving path via ``build_live_window``).  Stateless with respect
+        to the window buffer — ``sequence`` and ``mask`` must already be built
+        by the caller.
+ 
+        Parameters
+        ----------
+        player_id:
+            Internal player ID.
+        sequence:
+            ``(window_steps, N_SEQUENCE_FEATURES)`` float32 array.
+        mask:
+            ``(window_steps,)`` bool array — True for real sensor ticks.
+        live_event:
+            The most recent raw telemetry dict (used for positional buffer,
+            elapsed_seconds, enriched feature keys).
+        sessions_df:
+            Historical session DataFrame for ACWR workload computation.
+ 
+        Returns
+        -------
+        AnomalyResult or None
+            Fully populated result, or ``None`` when the player's baseline
+            is not registered.
+        """
+        baseline = self._baselines.get(player_id)
+        if baseline is None:
+            return None
+ 
         # Run the ML inference engine for raw scoring
         raw_loss, model_type = self.inference_engine.score_window(
             player_id, sequence, mask
         )
 
+        # logger.info(
+        #         "WINDOW INFERENCE | player=%s",
+        #         player_id,
+        #     )
+ 
         x = live_event.get("x_pitch")
         y = live_event.get("y_pitch")
-        if x is not None and y is not None:
+        # Gate position-buffer updates on TVL confidence, not field presence.
+        # A GPS dropout can zero speed while x/y are still present (stale/frozen).
+        # Only update when telemetry is trustworthy (confidence >= 0.8 = VALID).
+        _tvl_confidence = float(live_event.get("_tvl_confidence", 1.0))
+        _telemetry_valid = _tvl_confidence >= 0.8
+
+        if x is not None and y is not None and _telemetry_valid:
             buf = self._position_buffers.setdefault(player_id, [])
             buf.append((float(x), float(y)))
             if len(buf) > 60:
                 self._position_buffers[player_id] = buf[-60:]
-
+ 
         drift = self.drift_analyzer.analyze(
             self._position_buffers.get(player_id, []), baseline
         )
-
+ 
         acwr, workload_status = 1.0, "optimal"
         if not sessions_df.empty and "total_distance_m" in sessions_df.columns:
             w = self.workload_tracker.compute_load_ratios(0, sessions_df)
             acwr = w.get("acwr", 1.0)
             workload_status = w.get("workload_status", "optimal")
-
+ 
         workload_flag = acwr > 1.5 or acwr < 0.8
         elapsed = float(live_event.get("elapsed_seconds", 0))
-
+ 
         last = sequence[-1]
         fv = {SEQUENCE_FEATURE_NAMES[i]: float(last[i])
               for i in range(N_SEQUENCE_FEATURES)}
@@ -4241,51 +4330,100 @@ class PatternAnalysisEngine:
             "positional_drift_score":   float(drift["drift_score"]),
             "mask_completeness":        float(mask.mean()),
         })
-
+ 
         for _enriched_key in ("fatigue_decay_residual", "speed_drop_pct",
                               "coach_fatigue_severity",
                               "coach_pre_match_status_encoded"):
             if _enriched_key in live_event:
                 fv[_enriched_key] = float(live_event[_enriched_key])
-
-        # Apply EMA smoothing to raw loss
+ 
+        # Apply EMA smoothing to raw loss.
+        # Gate on TVL confidence: corrupted windows produce artificially low
+        # reconstruction loss (zero-filled features → easy reconstruction).
+        # Updating the EMA from such windows pulls thresholds down and suppresses
+        # future anomaly detection. Use the last known value during degradation.
         alpha_ema = CONFIG.scoring.score_ema_alpha
         smoother = self._ema_smoothers.setdefault(
             player_id, EMASmoother(alpha_ema))
-        smoothed_loss = smoother.update(raw_loss)
-        self._ema_scores[player_id] = smoothed_loss
+        if _telemetry_valid:
+            smoothed_loss = smoother.update(raw_loss)
+            self._ema_scores[player_id] = smoothed_loss
+        else:
+            # Hold: read last known EMA without updating.
+            # _tvl_confidence < 0.8 means DEGRADED; we don't know the true loss.
+            smoothed_loss = self._ema_scores.get(player_id, raw_loss)
+            logger.debug(
+                "EMA hold | player=%d tvl_confidence=%.2f smoothed=%.6f (not updated)",
+                player_id, _tvl_confidence, smoothed_loss,
+            )
 
         regime_key = _REGIME_CLASSIFIER.classify(sequence).key
         tracker = self.inference_engine.get_tracker(player_id)
+        logger.info(
+                "DEBUG SCORE | player=%s raw=%.6f smooth=%.6f regime=%s threshold=%.6f",
+                player_id,
+                raw_loss,
+                smoothed_loss,
+                regime_key,
+                tracker.threshold_for(regime_key) if tracker else -1.0,
+            )
+        
+        logger.info(
+                "TRACKER STATUS | player=%s calibrated=%s threshold=%s regime=%s",
+                player_id,
+                tracker.is_calibrated if tracker else None,
+                tracker.threshold_for(regime_key) if tracker and tracker.is_calibrated else None,
+                regime_key,
+            )
+        
+
         if tracker and tracker.is_calibrated:
             is_anomaly = smoothed_loss > tracker.threshold_for(regime_key)
             confidence = tracker.confidence_for(smoothed_loss, regime_key)
-
+        else:
+            is_anomaly, confidence = False, 0.0
+ 
         baseline_speed = (baseline.distance_mean / (90 * 60)
                           if baseline.distance_mean > 0 else 3.5)
         speed_ratio = fv.get("speed_ms", 999) / max(baseline_speed, 0.1)
         speed_low = speed_ratio < 0.55
         sprint_low = fv.get("sprint_flag", 1) == 0
-        hr_elevated = fv.get("heart_rate_bpm", 0) > (
-            baseline.distance_mean / 90 * 0.06 + 130
-        ) if hasattr(baseline, "distance_mean") else False
         late_in_game = elapsed > 2700
-        fatigue_flag = is_anomaly and (
-            speed_low or sprint_low) and late_in_game
+        fatigue_flag = is_anomaly and (speed_low or sprint_low) and late_in_game
+ 
+        _ACTIVE_LEVELS = (AlertLevel.WARNING, AlertLevel.SUSTAINED, AlertLevel.CRITICAL)
+ 
+        anomaly_state = self.alert_manager.process_signal(
+            player_id,
+            "anomaly",
+            is_anomaly,
+        )
 
-        is_anomaly_alert = self.alert_manager.process_signal(
-            player_id, "anomaly", is_anomaly)
-        fatigue_alert = self.alert_manager.process_signal(
-            player_id, "fatigue", fatigue_flag)
-        drift_alert = self.alert_manager.process_signal(
-            player_id, "drift", drift["is_flagged"])
-        workload_alert = self.alert_manager.process_signal(
-            player_id, "workload", workload_flag)
+        fatigue_state = self.alert_manager.process_signal(
+            player_id,
+            "fatigue",
+            fatigue_flag,
+        )
 
-        # Read back the alert state so AnomalyResult carries alert_level
-        # and persistence_windows — used by the XAI gate in the orchestrator.
-        anomaly_state = self.alert_manager.get_state(player_id, "anomaly")
-        
+        drift_state = self.alert_manager.process_signal(
+            player_id,
+            "drift",
+            drift["is_flagged"],
+        )
+
+        workload_state = self.alert_manager.process_signal(
+            player_id,
+            "workload",
+            workload_flag,
+        )
+
+        is_anomaly_alert = anomaly_state in _ACTIVE_LEVELS
+        fatigue_alert    = fatigue_state in _ACTIVE_LEVELS
+        drift_alert      = drift_state in _ACTIVE_LEVELS
+        workload_alert   = workload_state in _ACTIVE_LEVELS
+
+        # anomaly_state = self.alert_manager.get_state(player_id, "anomaly")
+ 
         return AnomalyResult(
             player_id=player_id,
             external_id=baseline.external_id,
@@ -4306,10 +4444,14 @@ class PatternAnalysisEngine:
                 drift_alert, workload_alert, confidence,
             ),
             model_type=model_type,
-            alert_level=is_anomaly_alert,
-            persistence_windows=anomaly_state.persistence_count,
+            alert_level=anomaly_state,
+            persistence_windows=getattr(
+                self.alert_manager.get_state(player_id, "anomaly"),
+                "persistence_count",
+                0,
+            ),
         )
-
+    
     def build_training_sequences(
         self,
         events_df: pd.DataFrame,

@@ -50,7 +50,13 @@ class TelemetryValidityLayer:
 
         # 1. Mask Completeness
         # Assume event has a set of expected keys
-        expected_keys = {"speed_ms", "heart_rate_bpm", "distance_delta_m", "sprint_flag"}
+
+        # Field names must match SequenceWindowBuilder._extract_features() output:
+        # - "is_sprint" (not "sprint_flag" — that's internal to the feature array)
+        # - "distance_delta_m" is what the data generator emits;
+        #    SequenceWindowBuilder computes "distance_delta" internally from x/y.
+        #    TVL operates on the raw event dict, so check the generator field name.
+        expected_keys = {"speed_ms", "heart_rate_bpm", "distance_delta_m", "is_sprint"}
         present_keys = {k for k in expected_keys if event.get(k) is not None}
         completeness = len(present_keys) / len(expected_keys)
 
@@ -67,7 +73,7 @@ class TelemetryValidityLayer:
         # 2. Physical Plausibility
         spd = event.get("speed_ms", 0.0)
         hr = event.get("heart_rate_bpm", 0.0)
-        accel = abs(event.get("accel_ms2", 0.0))
+        accel = abs(event.get("accel", 0.0))
 
         if accel > 12.0:
             issues.append(f"implausible_accel_{accel:.2f}")
@@ -87,18 +93,28 @@ class TelemetryValidityLayer:
             confidence = 0.0
 
         # 3. Temporal Monotonicity (if timestamp present)
-        ts = event.get("timestamp")
+        ts_raw = event.get("ts") or event.get("timestamp")
+        ts = None
+        if ts_raw is not None:
+            try:
+                import pandas as pd
+                ts = pd.to_datetime(ts_raw, utc=True)
+            except Exception:
+                pass  # unparseable timestamp — skip monotonicity check
 
-        if ts:
+        if ts is not None:
             prev_ts = self._get_prev_ts(player_id)
-            if prev_ts:
-                dt = (ts - prev_ts).total_seconds()
-                if dt <= 0:
-                    issues.append("non_monotonic_timestamp")
-                    confidence = 0.0
-                elif dt > 5.0:
-                    issues.append(f"timestamp_gap_{dt:.2f}s")
-                    confidence -= 0.3
+            if prev_ts is not None:
+                try:
+                    dt = (ts - prev_ts).total_seconds()
+                    if dt <= 0:
+                        issues.append("non_monotonic_timestamp")
+                        confidence = 0.0
+                    elif dt > 5.0:
+                        issues.append(f"timestamp_gap_{dt:.2f}s")
+                        confidence -= 0.3
+                except Exception:
+                    pass  # incompatible types — skip
             self._update_ts(player_id, ts)
 
         # Determine overall status

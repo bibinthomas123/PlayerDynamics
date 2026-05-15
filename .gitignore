@@ -8,11 +8,10 @@ venv/
 data/
 .DS_Store
 models/*.pt
-claude
-CLAUDE.md
 
 *.json
 *.jsonl
+.DS_Store
 
 # C extensions
 *.so

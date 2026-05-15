@@ -20,19 +20,21 @@ or Ollama is unavailable the template engine is used transparently so the
 
 Semantic Layer integration
 ────────────────────────────────
-SHAP values are now routed through SemanticInterpreter before reaching the LLM.
-The interpreter converts raw attributions into symbolic SemanticFinding objects.
-The LLM receives these findings and acts as narrator/communicator only —
-physiological reasoning lives in the symbolic layer, not in the prompt.
+SHAP values are routed through SemanticInterpreter OUTSIDE this layer — in the
+orchestrator — before reaching the LLM.  This file does not call
+SemanticInterpreter.interpret() from any public path.  The interpreter converts
+raw attributions into symbolic SemanticFinding objects in the orchestrator, which
+injects them into BaseExplanation.semantic_findings before passing to
+generate_explanation_from_base().  The LLM receives these findings and acts as
+narrator/communicator only — physiological reasoning lives in the symbolic layer,
+not in the prompt.
 
 Architecture:
-    Temporal SHAP attribution
+    build_base_explanation()          raw SHAP + attribution only
     ↓
-    SemanticInterpreter  (semantic_layer.py)
+    orchestrator: build_semantic_findings()   symbolic reasoning only
     ↓
-    List[SemanticFinding]
-    ↓
-    LLMNLGEngine  (verbalises findings, does not re-reason)
+    generate_explanation_from_base()  LLM narration only
     ↓
     SHAPExplanation.nlg_summary
 
@@ -54,7 +56,7 @@ from config.settings import CONFIG, SHAPConfig
 from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
 from explainability.shap_compat import SHAP_AVAILABLE, build_kmeans_background
 from explainability.shap_compat import compute_shap_values
-from explainability.semantic_layer import (
+from explainability.semantics_layer import (
     SemanticFinding,
     SemanticInterpreter,
     build_semantic_prompt_block,
@@ -223,6 +225,7 @@ class BaseExplanation:
     Contains everything except the NLG summary.
     Safe to pass across threads — holds no model references or tensors.
     """
+
     player_id:           int
     external_id:         str
     player_name:         str
@@ -230,17 +233,21 @@ class BaseExplanation:
     confidence:          float
     workload_status:     str
     computed_at:         datetime
+    # SHAP core outputs
     base_value:          float
     shap_values:         Dict[str, float]
     feature_values:      Dict[str, float]
-    top_contributions:   Tuple[FeatureContribution, ...]   # frozen-safe
+    # Structured explainability artifacts
+    top_contributions:   Tuple[FeatureContribution, ...]
     counterfactual:      str
-    waterfall_data:      Tuple[dict, ...]                  # frozen-safe
+    waterfall_data:      Tuple[dict, ...]
+    # Model uncertainty / anomaly metadata
     uncertainty:         float
-    anomaly_score:       float   # propagate real anomaly score to NLG worker
+    anomaly_score:       float
     shap_method:         str
-    semantic_findings:   Tuple[dict, ...] = ()             # serialized SemanticFinding dicts
-
+    # Symbolic reasoning outputs
+    # Filled AFTER build_semantic_findings() in orchestrator.
+    semantic_findings:   Tuple[dict, ...] = ()
 
 # ─────────────────────────────────────────────
 # Counterfactual generator
@@ -390,12 +397,15 @@ _LLM_SYSTEM_PROMPT = """
 You are a sports science communication engine.
 
 Your role:
-- Verbalize pre-computed semantic findings for coaching staff.
+- Verbalize pre-computed semantic findings and session trajectory context for coaching staff.
 - Do NOT perform physiological reasoning — the symbolic engine has already done this.
 - Do NOT speculate about injuries, tactics, or causes not stated in the findings.
-- Do NOT reference SHAP values, z-scores, or internal metrics by name.
-- Translate findings into clear, direct operational language.
+- Do NOT reference SHAP values, z-scores, anomaly scores, or internal metrics by name.
+- Translate findings and trajectory patterns into clear, direct operational language.
 - If a finding is marked CRITICAL or HIGH severity, lead with it.
+- If the session context describes a motif (e.g. sprint-collapse pattern, repeated overload),
+  communicate it as a confirmed behavioral pattern — not speculation.
+- If a trend is described as worsening, communicate urgency without hedging.
 - Maximum 3 sentences. Address the coaching staff directly.
 """
 
@@ -407,6 +417,111 @@ Workload status: {workload_status}
 
 {semantic_block}
 """
+
+
+def _build_context_block(match_context: str) -> str:
+    """
+    Wrap the semantic summary in a clearly labelled prompt section.
+    The label tells the LLM this is pre-reasoned trajectory data,
+    not raw telemetry it should interpret itself.
+    """
+    if not match_context:
+        return ""
+    return f"\n\nSession trajectory context (pre-computed by symbolic engine):\n{match_context}"
+
+
+def format_match_state_prompt(state) -> str:
+    """
+    Convert a SemanticMatchState into a prose prompt block for the LLM.
+
+    This is the ONLY place where structured symbolic state is converted to
+    natural language. The LLM receives this as pre-reasoned trajectory context
+    — it narrates, it does not re-reason.
+
+    Parameters
+    ----------
+    state : SemanticMatchState
+        Structured state returned by MatchState.build_semantic_state().
+
+    Returns
+    -------
+    str
+        Formatted prose block ready for LLM prompt injection.
+        Returns empty string if state carries no meaningful content.
+    """
+    if state is None:
+        return ""
+
+    if not state.motifs and not state.trends and not state.persistent_findings:
+        return ""
+
+    lines = [f"Session trajectory — escalation level: {state.escalation_level.upper()}"]
+
+    # ── Motif block ───────────────────────────────────────────────────────────
+    if state.motifs:
+        lines.append("  Behavioral patterns detected:")
+        for m in state.motifs:
+            conf_pct = int(m.get("confidence", 0.5) * 100)
+            lines.append(f"    • {m['description']} (confidence: {conf_pct}%)")
+
+    # ── Trend block ───────────────────────────────────────────────────────────
+    trend_lines = []
+    trend_labels = {
+        "anomaly":  "Anomaly trajectory",
+        "recovery": "Recovery efficiency",
+        "workload": "Locomotor output",
+    }
+    for key, label in trend_labels.items():
+        trend = state.trends.get(key, {})
+        direction  = trend.get("direction", "")
+        volatility = trend.get("volatility", "low")
+        if not direction or direction in ("stable", "insufficient data"):
+            continue
+        vol_note = f", volatility: {volatility}" if volatility != "low" else ""
+        trend_lines.append(f"    {label}: {direction}{vol_note}")
+
+    if trend_lines:
+        lines.append("  Progression analysis:")
+        lines.extend(trend_lines)
+
+
+    # ── Coupled physiological states ─────────────────────────────────────
+
+    if state.coupled_states:
+        lines.append("\nCoupled physiological states:")
+
+        for cs in state.coupled_states:
+            lines.append(
+                f"  - {cs.state_type} "
+                f"(severity={cs.severity}, "
+                f"confidence={cs.confidence:.2f})"
+            )
+
+            if cs.supporting_trends:
+                lines.append(
+                    f"    Supporting trends: {', '.join(cs.supporting_trends)}"
+                )
+
+            lines.append(
+                f"    {cs.description}"
+            )
+
+    # ── Persistent high/critical findings ─────────────────────────────────────
+    if state.persistent_findings:
+        lines.append("  Persistent high-severity findings:")
+        seen: set = set()
+        for f in state.persistent_findings[-5:]:  # cap at 5 most recent
+            ftype = f.get("type", "unknown")
+            if ftype in seen:
+                continue
+            seen.add(ftype)
+            minute = f.get("minute")
+            min_note = f" (min ~{minute})" if minute is not None else ""
+            lines.append(
+                f"    • {ftype.replace('_', ' ')} [{f.get('severity', 'high')}]{min_note}"
+            )
+
+    return "\n".join(lines)
 
 
 class LLMNLGEngine:
@@ -538,10 +653,7 @@ class LLMNLGEngine:
                     + (feature_lines or "  (no significant features)")
                 )
 
-            context_block = (
-                f"\n\nMatch history context:\n{match_context}"
-                if match_context else ""
-            )
+            context_block = _build_context_block(match_context)
 
             prompt = _LLM_PROMPT_TEMPLATE.format(
                 player_name=player_name,
@@ -622,11 +734,14 @@ class XAILayer:
     TemplateNLGEngine if Ollama is unavailable or the call exceeds the SLA.
     The engine used is recorded in SHAPExplanation.nlg_engine.
 
-    Semantic strategy (v1):
-    After SHAP values are computed, SemanticInterpreter converts raw attributions
-    into symbolic SemanticFinding objects. The LLM receives these findings rather
-    than raw feature lines. This separates physiological reasoning (symbolic layer)
-    from narrative generation (LLM).
+    Semantic strategy (v2 — decoupled):
+    Semantic interpretation is NOT performed inside this class on any direct
+    explain path.  The orchestrator calls build_semantic_findings() after
+    build_base_explanation() and injects findings into BaseExplanation before
+    calling generate_explanation_from_base().  This cleanly separates:
+        build_base_explanation()    → SHAP extraction only
+        build_semantic_findings()   → symbolic reasoning only
+        generate_explanation_from_base() → LLM narration only
     """
 
     def __init__(self, nlg_timeout_s: float = _NLG_TIMEOUT_S):
@@ -645,6 +760,41 @@ class XAILayer:
         """Register background data keyed directly by player_id."""
         self._cache.register(player_id, background_data, n_bg=self.cfg.n_background_samples)
 
+    def build_semantic_findings(
+        self,
+        shap_dict: Dict[str, float],
+        feature_values: Dict[str, float],
+        persistence_windows: int = 0,
+    ) -> List[SemanticFinding]:
+        """
+        Convert SHAP attributions into symbolic findings.
+
+        Pure symbolic reasoning stage.
+        No LLM.
+        No formatting.
+        """
+        return self._semantic_interp.interpret(
+            shap_values=shap_dict,
+            feature_values=feature_values,
+            persistence_windows=persistence_windows,
+        )
+
+    def generate_explanation_from_base(
+        self,
+        base: "BaseExplanation",
+        match_state=None,
+    ) -> "SHAPExplanation":
+        """
+        Final narrative generation stage.
+
+        Match state is injected AFTER symbolic findings
+        have already updated longitudinal memory.
+        """
+        return self.generate_nlg(
+            base=base,
+            match_context=match_state,
+        )
+
     def build_base_explanation(
         self,
         player_id: int,
@@ -662,8 +812,10 @@ class XAILayer:
         persistence_windows: int = 0,
     ) -> "BaseExplanation":
         """
-        Realtime path: SHAP + semantic interpretation + counterfactual + waterfall.
-        No LLM call. Returns immutable BaseExplanation safe to enqueue to the NLG worker.
+        Realtime path: SHAP extraction + attribution packaging + counterfactual + waterfall.
+        No LLM call. No semantic interpretation.
+        Returns immutable BaseExplanation (semantic_findings=[]) safe to enqueue to the NLG worker.
+        Orchestrator injects findings via build_semantic_findings() before calling generate_explanation_from_base().
         Target: <100 ms.
         """
         has_true_shap = (
@@ -702,18 +854,6 @@ class XAILayer:
             )
             shap_dict                  = {n: float(shap_array[i]) for i, n in enumerate(FEATURE_NAMES)}
             feature_values_for_display = feature_vector
-
-        # ── Semantic interpretation ───────────────────────────────────────────
-        semantic_findings = self._semantic_interp.interpret(
-            shap_values=shap_dict,
-            feature_values=feature_values_for_display,
-            persistence_windows=persistence_windows,
-        )
-        if semantic_findings:
-            logger.info(
-                "SemanticLayer (build_base): player=%d  findings=%s",
-                player_id, [f.finding_type for f in semantic_findings],
-            )
 
         contributions = sorted(
             [
@@ -755,13 +895,12 @@ class XAILayer:
             uncertainty=0.0,
             anomaly_score=anomaly_score,
             shap_method=shap_method,
-            semantic_findings=tuple(f.to_dict() for f in semantic_findings),
         )
 
     def generate_nlg(
         self,
         base: "BaseExplanation",
-        match_context: str = "",
+        match_context=None,  # Optional[SemanticMatchState]
     ) -> SHAPExplanation:
         """
         Async path: LLM narrative generation only.
@@ -769,7 +908,13 @@ class XAILayer:
         No SHAP recomputation. No model access. No forward passes.
         Deserializes semantic_findings from BaseExplanation for the NLG call.
         """
-        from explainability.semantic_layer import SemanticFinding as _SF
+        from explainability.semantics_layer import SemanticFinding as _SF
+
+        # Convert SemanticMatchState → prompt string. None → empty string.
+        try:
+            match_context_str = format_match_state_prompt(match_context) if match_context is not None else ""
+        except Exception:
+            match_context_str = ""
 
         # Reconstruct SemanticFinding objects from serialized dicts stored in BaseExplanation
         semantic_findings_objs: List[SemanticFinding] = []
@@ -798,7 +943,7 @@ class XAILayer:
             player_name=base.player_name,
             top_contributions=list(base.top_contributions),
             workload_status=base.workload_status,
-            match_context=match_context,
+            match_context=match_context_str,
             semantic_findings=semantic_findings_objs or None,
         )
 
@@ -835,7 +980,7 @@ class XAILayer:
         sequence: Optional[np.ndarray] = None,
         mask: Optional[np.ndarray] = None,
         sequence_background: Optional[np.ndarray] = None,
-        match_context: str = "",
+        match_context=None,   # Optional[SemanticMatchState]
         persistence_windows: int = 0,
     ) -> SHAPExplanation:
         """
@@ -904,17 +1049,9 @@ class XAILayer:
 
         base_value = base_value or 0.0
 
-        # ── Semantic interpretation ───────────────────────────────────────────
-        semantic_findings = self._semantic_interp.interpret(
-            shap_values=shap_dict,
-            feature_values=feature_values_for_display,
-            persistence_windows=persistence_windows,
-        )
-        if semantic_findings:
-            logger.info(
-                "SemanticLayer: player=%d  findings=%s",
-                player_id, [f.finding_type for f in semantic_findings],
-            )
+        # Semantic interpretation is NOT performed here.
+        # Findings are injected externally by the orchestrator via build_semantic_findings().
+        semantic_findings = []
 
         contributions = sorted(
             [
@@ -935,13 +1072,19 @@ class XAILayer:
         counterfactual = self._cf_gen.generate(shap_dict, feature_values_for_display)
 
         # ── NLG: pass semantic findings to LLM ───────────────────────────────
+        # Convert SemanticMatchState → prompt string. None → empty string.
+        try:
+            match_context_str = format_match_state_prompt(match_context) if match_context is not None else ""
+        except Exception:
+            match_context_str = ""
+
         nlg_summary, nlg_engine, uncertainty = self._llm_nlg.generate(
             recommendation_type=recommendation_type,
             confidence=confidence,
             player_name=player_name,
             top_contributions=contributions[:self.cfg.max_display_features],
             workload_status=workload_status,
-            match_context=match_context,
+            match_context=match_context_str,
             semantic_findings=semantic_findings if semantic_findings else None,
         )
 
@@ -1130,18 +1273,9 @@ class XAILayer:
         shap_dict  = {n: float(shap_array[i]) for i, n in enumerate(FEATURE_NAMES)}
         base_value = base_value or 0.0
 
-        # ── Semantic interpretation ───────────────────────────────────────────
-        persistence = getattr(result, "persistence_windows", 0)
-        semantic_findings = self._semantic_interp.interpret(
-            shap_values=shap_dict,
-            feature_values=result.feature_vector,
-            persistence_windows=persistence,
-        )
-        if semantic_findings:
-            logger.info(
-                "SemanticLayer (explain): player=%d  findings=%s",
-                model.player_id, [f.finding_type for f in semantic_findings],
-            )
+        # Semantic interpretation is NOT performed here.
+        # Findings are injected externally by the orchestrator via build_semantic_findings().
+        semantic_findings = []
 
         contributions = sorted(
             [

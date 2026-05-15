@@ -120,13 +120,20 @@ class SessionRegimeClassifier:
         Parameters
         ----------
         sequence : np.ndarray, shape (T, N_SEQUENCE_FEATURES)
-            Normalised feature matrix for one window.
+            RAW (un-normalised) feature matrix for one window.
+            x_pitch must be in [0, 100] pitch units.
+            sprint_flag must be binary {0, 1}.
+            This method MUST be called before any Z-score normalisation
+            (i.e. before PerPlayerNormaliser.transform()).
             Columns must match SEQUENCE_FEATURE_NAMES order in settings.py.
 
-        Returns
-        -------
-        WindowRegime
+        IMPORTANT
+        ---------
+        SharedBackboneAutoencoder.predict() applies Z-score normalisation
+        internally. Always pass the raw sequence here, never the output of
+        normaliser.transform().
         """
+
         if sequence.ndim != 2 or sequence.shape[1] <= max(_IDX_SPRINT_FLAG, _IDX_X_PITCH):
             logger.warning(
                 "SessionRegimeClassifier: unexpected sequence shape %s — returning midfield/medium",
@@ -136,6 +143,18 @@ class SessionRegimeClassifier:
 
         mean_x       = float(np.nanmean(sequence[:, _IDX_X_PITCH]))
         sprint_frac  = float(np.nanmean(sequence[:, _IDX_SPRINT_FLAG]))
+
+        # Guard: if x_pitch has been Z-scored it will be near 0 with negative
+        # values — the territory thresholds 33/67 would be meaningless.
+        # Log a loud warning so this is caught immediately during development.
+        if mean_x < -2.0 or mean_x > 110.0:
+            logger.error(
+                "SessionRegimeClassifier: mean_x=%.3f is outside [0, 110] — "
+                "sequence appears to have been Z-score normalised before classify(). "
+                "Regime classification will be invalid. "
+                "Pass the RAW sequence, not normaliser.transform() output.",
+                mean_x,
+            )
 
         # Territory
         if mean_x < _TERRITORY_DEFENSIVE_MAX:
@@ -565,6 +584,9 @@ class RegimeAwareThresholdStore:
         return {
             "global":     self._global.state_dict(),
             "per_regime": {k: v.state_dict() for k, v in self._per_regime.items()},
+            "losses_by_regime": {
+                k: list(v._losses) for k, v in self._per_regime.items()
+            },
         }
     
     def get_regime_losses(
@@ -599,4 +621,12 @@ class RegimeAwareThresholdStore:
             k: inner_tracker_cls.from_state_dict(v)
             for k, v in d.get("per_regime", {}).items()
         }
+        # Restore losses_by_regime so get_regime_losses() works after deserialisation.
+        # Without this, operational threshold percentile checks in evaluate_player()
+        # and any caller using get_regime_losses() always see an empty list.
+        if not hasattr(obj, "_losses_by_regime"):
+            from collections import defaultdict, deque
+            obj._losses_by_regime = defaultdict(lambda: deque(maxlen=5000))
+        for k, vals in d.get("losses_by_regime", {}).items():
+            obj._losses_by_regime[k].extend(vals)
         return obj

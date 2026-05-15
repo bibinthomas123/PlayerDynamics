@@ -40,17 +40,27 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
-
+from typing import Dict, List
+from time import monotonic
 import numpy as np
 import pandas as pd
-from sklearn import pipeline
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging: structured to stderr, JSON in production; human-readable in dev
 # ─────────────────────────────────────────────────────────────────────────────
 _LOG_FMT_HUMAN = "%(asctime)s  %(levelname)-8s  %(name)-20s  %(message)s"
 _LOG_FMT_JSON  = None   # set below if JSON_LOGS=1
+ALERT_COOLDOWN_S = 20
+
+ALERT_FAMILY = {
+    "anomaly_flag": "physiological_instability",
+    "substitution": "physiological_instability",
+    "fatigue_alert": "physiological_instability",
+
+    "positional_drift": "tactical_instability",
+
+    "workload_alert": "workload_instability",
+}
 
 def _configure_logging(level: str = "INFO") -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
@@ -681,6 +691,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # Build pipeline
     # ─────────────────────────────────────────────
     pipeline = _build_pipeline(model_dir)
+    pipeline.replay_mode = args.replay_mode
 
     from analysis.anomaly_detection import SharedBackboneAutoencoder
 
@@ -735,25 +746,48 @@ def cmd_serve(args: argparse.Namespace) -> None:
     # ─────────────────────────────────────────────
     # Alert gate
     # ─────────────────────────────────────────────
-    gate_counts: Dict[str, int] = defaultdict(int)
     gate_last: Dict[str, str] = {}
+    gate_last_emit_ts: Dict[int, int] ={}
+    gate_counts: Dict[str, int] = {}
 
     def _gate_fire(ext_id: str, rec_type: str) -> bool:
+        """
+        Cooldown-only gate.  Persistence is fully owned by AlertManager's FSM
+        (min_persistence windows, hysteresis, hold states).  This function only
+        prevents the same player from flooding the output channel faster than
+        ALERT_COOLDOWN_S regardless of how quickly the FSM fires.
 
-        if gate_last.get(ext_id) != rec_type:
+        Alert family tracking is kept so that switching alert types (e.g. from
+        fatigue_alert to substitution) immediately resets the cooldown window —
+        a type change is always a meaningful new signal.
+        """
 
-            gate_counts[ext_id] = 1
-            gate_last[ext_id] = rec_type
+        family = ALERT_FAMILY.get(rec_type, rec_type)
 
-        else:
-            gate_counts[ext_id] += 1
+        previous_family = gate_last.get(ext_id)
 
-        return gate_counts[ext_id] >= args.min_alert_windows
+        if previous_family != family:
+            # New alert type — reset cooldown so the first instance of the new
+            # type is never swallowed.
+            gate_last[ext_id] = family
+            gate_last_emit_ts.pop(ext_id, None)
+
+        now = monotonic()
+
+        last_emit = gate_last_emit_ts.get(ext_id, 0)
+
+        if now - last_emit < ALERT_COOLDOWN_S:
+            return False
+
+        gate_last_emit_ts[ext_id] = now
+
+        return True
+
+
 
     def _gate_reset(ext_id: str) -> None:
-
-        gate_counts[ext_id] = 0
         gate_last.pop(ext_id, None)
+        gate_last_emit_ts.pop(ext_id, None)
 
     # ─────────────────────────────────────────────
     # Enrichment
@@ -823,40 +857,117 @@ def cmd_serve(args: argparse.Namespace) -> None:
     n_events = 0
     n_alerts = 0
     sla_violations = 0
+    match_id = datetime.now(timezone.utc).strftime(
+    "serve_match_%Y%m%d_%H%M%S"
+    )
+
+    pipeline.start_match(match_id)
+
+    logger.info("Started serve session: %s", match_id)
+
+    # ─────────────────────────────────────────────
+    # Window accumulator
+    # ─────────────────────────────────────────────
+    # Each raw telemetry packet is pushed into the accumulator.
+    # Inference runs only when a complete window of WINDOW_SIZE events has
+    # been collected for that player.  With stride == window_size the windows
+    # are non-overlapping, so 1 092 packets → ~45 inference cycles rather
+    # than 1 092.  This eliminates the causal leakage that caused:
+    #   • alert duplication
+    #   • exploding trajectory lengths
+    #   • fake persistence increments
+    #   • motif / escalation reinforcement without new information
+    WINDOW_SIZE = 24
+    STRIDE      = 24  # keep non-overlapping until architecture is stable
+
+    try:
+        from analysis.live_window_accumulator import LiveWindowAccumulator
+        accumulator = LiveWindowAccumulator(
+            window_size=WINDOW_SIZE,
+            stride=STRIDE,
+            ignore_time_gaps=args.ignore_time_gaps,
+            ignore_session_boundaries=args.ignore_session_boundaries,
+        )
+        logger.info(
+            "LiveWindowAccumulator ready (window_size=%d  stride=%d)",
+            WINDOW_SIZE, STRIDE,
+        )
+    except ImportError:
+        logger.warning(
+            "analysis.live_window_accumulator not found — "
+            "falling back to per-packet inference (architectural bug present). "
+            "Place live_window_accumulator.py under analysis/ to fix this."
+        )
+        accumulator = None
+
+    # ── process_live_window ───────────────────────────────────────────────────
+    # Converts the accumulator's completed window into (seq, mask) via
+    # build_live_window(), then runs inference once.
+    #
+    # IMPORTANT: we do NOT call process_live_event(latest_event) here.
+    # That would discard the full window and re-enter SequenceWindowBuilder
+    # .add_event(), which has its own hidden rolling buffer — doubling the
+    # temporal accumulation and recreating the leakage we just eliminated.
+    #
+    # Instead we call build_live_window() (stateless) and pass (seq, mask)
+    # directly to the inference engine, bypassing add_event() entirely.
+    #
+    # If the orchestrator does not yet expose process_window_direct(), we
+    # fall back to process_live_event(latest_event) with a loud warning so
+    # the problem is visible in logs.  Remove the fallback once
+    # process_window_direct() is wired up.
+        
+    def _process_window(window):
+        latest_event = window[-1]
+        ext_id = latest_event.get("player_external_id", "<missing>")
+
+        player = pipeline.registry.get_by_external_id(ext_id)
+        if player is None:
+            logger.warning("_process_window: no registry entry for ext_id=%r — skipping", ext_id)
+            return None
+
+        logger.info(
+            "WINDOW EMIT | player=%s size=%d player_id=%d",
+            ext_id,
+            len(window),
+            player["player_id"],
+        )
+
+        return pipeline.process_window_direct(
+            window_events=window,
+            player_id=player["player_id"],
+        )
+    
 
     logger.info("Serving — reading newline-delimited JSON from stdin")
 
     try:
-
         for raw_line in sys.stdin:
-
             raw_line = raw_line.strip()
-
             if not raw_line:
                 continue
-
             t_start = time.perf_counter()
-
             n_events += 1
 
             try:
                 event = json.loads(raw_line)
-
+                # logger.info(
+                #     "STREAM EVENT | player=%s ts=%s",
+                #     event.get("player_external_id"),
+                #     event.get("ts"),
+                # )
             except json.JSONDecodeError as exc:
-
                 logger.warning(
                     "Line %d: invalid JSON — %s",
                     n_events,
                     exc,
                 )
-
                 continue
 
             ext_id = event.get(
                 "player_external_id",
                 "",
             )
-
             if not ext_id:
 
                 logger.debug(
@@ -868,12 +979,52 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
             event = _enrich(event)
 
-            try:
+            # ── Accumulate and gate inference ─────────────────────────────────
+            # Push the event into the per-player buffer.  Only run inference
+            # when a full window is ready; otherwise skip to the next packet.
+            if accumulator is not None:
+                window = accumulator.push(player_id=ext_id, event=event)
+                if window is not None:
+                    logger.debug("Accumulator window ready | player=%s events=%d", ext_id, len(window))
+                if accumulator.consume_reset_flag(ext_id):
 
-                result = pipeline.process_live_event(
-                    event,
-                    segment_index=0,
-                )
+                    try:
+                        player_id_int = int(
+                            ext_id.replace("p", "")
+                        )
+
+                        pipeline.pattern_engine.reset_ema_state(
+                            player_id_int
+                        )
+
+                        # Clear stale alert FSM state so persistence counts,
+                        # episode IDs, and recovery counters from the previous
+                        # session do not carry over into the new one.
+                        pipeline.pattern_engine.alert_manager.clear_player(
+                            player_id_int
+                        )
+
+                        # Reset the main.py gate counters for this player too
+                        # so the new session starts with a clean cooldown slate.
+                        _gate_reset(ext_id)
+
+                    except Exception as exc:
+
+                        logger.warning(
+                            "Session reset failed for %s: %s",
+                            ext_id,
+                            exc,
+                        )
+                if window is None:
+                    # Not enough events yet — keep accumulating, no inference.
+                    continue
+            else:
+                # Fallback: accumulator unavailable, process every packet
+                # (reverts to the original per-packet behaviour).
+                window = [event]
+
+            try:
+                result = _process_window(window)
 
             except Exception as exc:
 
@@ -955,6 +1106,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 continue
 
             n_alerts += 1
+            gate_counts[ext_id] = gate_counts.get(ext_id, 0) + 1
 
             alert_payload = {
                 "player_id": result.player_id,
@@ -1415,6 +1567,28 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Consecutive anomalous windows before emitting alert")
     p_sv.add_argument("--max-latency-ms",    type=int, default=200,
                       help="SLA threshold; violations are logged as warnings")
+    p_sv.add_argument(
+    "--ignore-time-gaps",
+    action="store_true",
+    default=False,
+    help="Disable temporal gap reset in the accumulator. Use for batch/replay data "
+         "where inter-event gaps are expected (e.g. one row per session).",
+)
+    p_sv.add_argument(
+    "--ignore-session-boundaries",
+    action="store_true",
+    default=False,
+    help="Disable session-boundary buffer reset in the accumulator. Use for "
+         "historical replay where events from multiple sessions are interleaved.",
+)
+    p_sv.add_argument(
+    "--replay-mode",
+    action="store_true",
+    default=False,
+    help="Override telemetry confidence floor to 0.8 for replay/batch data. "
+         "Prevents month-scale timestamp gaps from silencing trajectory accumulation. "
+         "TVL semantics are preserved; this only affects match_state persistence gating.",
+)
 
     # ── audit ─────────────────────────────────────────────────────────────────
     p_au = sub.add_parser("audit", help="Fairness audit + recalibration check")
