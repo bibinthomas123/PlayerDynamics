@@ -787,21 +787,21 @@ Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_
 
 ## References
 
-1. Rein & Memmert (2016) — Big data and tactical analysis in elite soccer. DOI: [10.1186/s40064-016-3108-2](https://doi.org/10.1186/s40064-016-3108-2)
-2. Foteinakis et al. (2025) — Explainable ML for Basketball. DOI: [10.3390/app152312401](https://doi.org/10.3390/app152312401)
-3. Odet et al. (2024) — ML and Explainability for Sports Outcome Prediction.
-4. Pietraszewski et al. (2025) — AI in Sports Analytics systematic review. DOI: [10.3390/app15137254](https://doi.org/10.3390/app15137254)
-5. Kranzinger et al. (2025) — Explainable AI in Sports Science. DOI: [10.48550/arXiv.1705.07874](https://doi.org/10.48550/arXiv.1705.07874)
-6. Lundberg & Lee (2017) — SHAP: A Unified Approach to Interpreting Model Predictions. DOI: [10.48550/arXiv.1705.07874](https://doi.org/10.48550/arXiv.1705.07874)
-7. Hochreiter & Schmidhuber (1997) — Long Short-Term Memory.
-8. Bai et al. (2018) — An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling. DOI: [10.48550/arXiv.1803.01271](https://doi.org/10.48550/arXiv.1803.01271)
-9. Caron & Muller (2023) — TacticalGPT: Uncovering the Potential of LLMs for Predicting Tactical Decisions in Professional Football.
-10. Ferrara (2024) — Large Language Models for Wearable Sensor-Based Human Activity Recognition. DOI: [10.3390/s24155045](https://doi.org/10.3390/s24155045)
-11. Yang (2024) — ChatPPG: Multi-Modal Alignment of Large Language Models for Time-Series Forecasting in Table Tennis.
-12. Tian et al. (2025) — SportsGPT: An LLM-driven Framework for Interpretable Sports Motion Assessment and Training Guidance. DOI: [10.48550/arXiv.2512.14121](https://doi.org/10.48550/arXiv.2512.14121)
-13. Liu et al. (2024) — Smartboard: Visual Exploration of Team Tactics with LLM Agent. DOI: [10.1109/TVCG.2024.3456200](https://doi.org/10.1109/TVCG.2024.3456200)
-14. Feli et al. (2025) — An LLM-Powered Agent for Physiological Data Analysis. DOI: [10.1109/EMBC58623.2025.11254428](https://doi.org/10.1109/EMBC58623.2025.11254428)
-15. Xia et al. (2024) — SportQA: A Benchmark for Sports Understanding in Large Language Models. DOI: [10.18653/v1/2024.naacl-long.283](https://doi.org/10.18653/v1/2024.naacl-long.283)
-16. Apostolou & Tjortjis (2019) — Sports Analytics algorithms for performance prediction. DOI: [10.1109/IISA.2019.8900754](https://doi.org/10.1109/IISA.2019.8900754)
-17. Sarlis & Tjortjis (2020) — Sports analytics — Evaluation of basketball players and team performance. DOI: [10.1016/j.is.2020.101562](https://doi.org/10.1016/j.is.2020.101562)
-18. Ghosh et al. (2023) — Sports analytics review: Artificial intelligence applications, emerging technologies, and algorithmic perspective. DOI: [10.1002/widm.1496](https://doi.org/10.1002/widm.1496)
+1. Rein & Memmert (2016) — Big data and tactical analysis in elite soccer; DOI: https://doi.org/10.1186/s40064-016-3108-2
+2. Foteinakis et al. (2025) — Explainable ML for Basketball; DOI: https://doi.org/10.3390/app152312401
+3. Odet et al. (2024) — ML and Explainability for Sports Outcome Prediction
+4. Pietraszewski et al. (2025) — AI in Sports Analytics systematic review; DOI: https://doi.org/10.3390/app15137254
+5. Kranzinger et al. (2025) — Explainable AI in Sports Science; DOI: https://doi.org/10.48550/arXiv.1705.07874
+6. Lundberg & Lee (2017) — SHAP: A Unified Approach to Interpreting Model Predictions; DOI: https://doi.org/10.48550/arXiv.1705.07874
+7. Hochreiter & Schmidhuber (1997) — Long Short-Term Memory
+8. Bai et al. (2018) — An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling; DOI: https://doi.org/10.48550/arXiv.1803.01271
+9. Matthew Caron & Oliver Müller (2023) - TacticalGPT: Uncovering the Potential of LLMs for Predicting Tactical Decisions in Professional Football
+10. Emilio Ferrara (2024) - Large Language Models for Wearable Sensor-Based Human Activity Recognition, DOI: https://doi.org/10.3390/s24155045
+11. GuangLiang Yang (2024) - ChatPPG: Multi-Modal Alignment of Large Language Models for Time-Series Forecasting in Table Tennis 
+12. Wenbo Tian, Ruting Lin, Hongxian Zheng, Yaodong Yang, Geng Wu, Zihao Zhang and Zhang Zhang (2025) - SportsGPT: An LLM-driven Framework for Interpretable Sports Motion Assessment and Training Guidance; DOI: https://doi.org/10.48550/arXiv.2512.14121
+13. Ziao Liu, Xiao Xie, Moqi He, Wenshuo Zhao, Yihong Wu, Liqi Cheng (2024) - Smartboard: Visual Exploration of Team Tactics with LLM Agent; DOI: https://doi.org/10.1109/TVCG.2024.3456200
+14. Mohammad Feli, Iman Azimi, Pasi Liljeberg, Amir M. Rahmani (2025) - An LLM-Powered Agent for Physiological Data Analysis: A Case Study on PPG-based Heart Rate Estimation; DOI: https://doi.org/10.1109/EMBC58623.2025.11254428
+15. Haotian Xia, Zhengbang Yang, Yuqing Wang, Rhys Tracy, Yun Zhao, Dongdong Huang, Zezhi Chen, Yan Zhu, Yuan-fang Wang, Weining Shen - SportQA: A Benchmark for Sports Understanding in Large Language Models (2024) ; DOI: https://doi.org/10.18653/v1/2024.naacl-long.283
+16. Konstantinos Apostolou, Christos Tjortjis (2019) - Sports Analytics algorithms for performance prediction; https://doi.org/10.1109/IISA.2019.8900754
+17. Vangelis Sarlis, Christos Tjortjis (2020) - Sports analytics — Evaluation of basketball players and team performance; DOI: https://doi.org/10.1016/j.is.2020.101562
+18. Indrajeet Ghosh, Sreenivasan Ramasamy Ramamurthy, Avijoy Chakma, Nirmalya Roy (2023) - Sports analytics review: Artificial intelligence applications, emerging technologies, and algorithmic perspective; DOI: https://doi.org/10.1002/widm.1496
