@@ -154,7 +154,8 @@ class SemanticFinding:
     finding_type: str
     """
     One of:
-      cardiovascular_overload
+      cardiovascular_overload          — sustained high HR with impaired recovery (Path A: active exertion)
+      elevated_cardiovascular_response — anomalous HR recovery pattern at low activity (Path B: resting)
       locomotor_overload
       recovery_degradation
       tactical_instability
@@ -162,7 +163,7 @@ class SemanticFinding:
     """
 
     severity: str
-    """'low' | 'moderate' | 'high' | 'critical'"""
+    """'low' | 'medium' | 'high' | 'critical'"""
 
     confidence: float
     """0.0–1.0  — derived from SHAP magnitudes and threshold margins"""
@@ -268,6 +269,20 @@ class SemanticInterpreter:
         fv = feature_values   # short alias for readability
         sv = shap_values
 
+        # ── Global window quality gate ────────────────────────────────────────
+        # Assess telemetry coherence ONCE before any rule runs.
+        # Rules are suppressed for incoherent feature combinations so that a
+        # stale accumulator or sensor dropout does not produce findings across
+        # multiple domains simultaneously.
+        quality = self._assess_window_quality(fv)
+        if quality["degraded"]:
+            logger.warning(
+                "SemanticInterpreter: window quality degraded — "
+                "suppressing all semantic findings. Reasons: %s",
+                "; ".join(quality["reasons"]),
+            )
+            return []
+
         # Run each rule — each appends at most one finding
         finding = self._rule_cardiovascular_overload(fv, sv, persistence_windows)
         if finding:
@@ -289,8 +304,12 @@ class SemanticInterpreter:
         if finding:
             findings.append(finding)
 
-        # Sort: critical → high → moderate → low; then by confidence descending
-        _sev_order = {"critical": 0, "high": 1, "moderate": 2, "low": 3}
+        finding = self._rule_locomotor_suppression(fv, sv, persistence_windows)
+        if finding:
+            findings.append(finding)
+
+        # Sort: critical → high → medium → low; then by confidence descending
+        _sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
         findings.sort(key=lambda f: (_sev_order.get(f.severity, 9), -f.confidence))
 
         if findings:
@@ -311,11 +330,85 @@ class SemanticInterpreter:
     def _shap_strongly_supports(self, feature: str, shap_values: Dict[str, float]) -> bool:
         return abs(shap_values.get(feature, 0.0)) >= self._t["shap_strong"]
 
+    def _assess_window_quality(self, fv: Dict[str, float]) -> Dict:
+        """
+        Assess telemetry coherence for the entire window before any rule runs.
+
+        Returns a dict:
+            {"degraded": bool, "reasons": List[str]}
+
+        Rules
+        ─────
+        A window is degraded if any of the following hold:
+
+        1. Speed/distance incoherence
+           speed == 0 (or near-zero) but distance >> plausible maximum.
+           A 30-second window at threshold speed covers ~90 m; more implies
+           a stale accumulator from a different telemetry epoch.
+
+        2. HR/speed incoherence
+           HR is reported as 0 bpm while speed is > 0.
+           Zero HR is biologically impossible during movement — sensor dropout.
+
+        3. Negative distance
+           Physical distance cannot be negative; indicates a corrupt window.
+
+        4. HR physiologically implausible
+           HR below resting floor (< 30 bpm) or above physiological maximum
+           (> 220 bpm) while speed is non-zero.
+
+        These checks are intentionally conservative — only clear physical
+        impossibilities are flagged. Borderline values pass through to the
+        individual rules, which apply domain-specific thresholds.
+        """
+        reasons: List[str] = []
+
+        speed    = fv.get("window_avg_speed_ms", 0.0)
+        distance = fv.get("window_distance_m", 0.0)
+        hr       = fv.get("heart_rate_bpm", 0.0)
+
+        # 1. Speed/distance incoherence
+        _max_plausible_distance = (self._t["speed_ms_low"] + 0.5) * 30  # ~90 m
+        if speed <= 0.1 and distance > _max_plausible_distance:
+            reasons.append(
+                f"speed={speed:.2f} m/s but distance={distance:.0f} m "
+                f"(max plausible={_max_plausible_distance:.0f} m — stale accumulator suspected)"
+            )
+
+        # 2. HR dropout during movement
+        if hr == 0.0 and speed > 0.5:
+            reasons.append(
+                f"HR=0 bpm while speed={speed:.1f} m/s — HR sensor dropout during movement"
+            )
+
+        # 3. Negative distance
+        if distance < 0.0:
+            reasons.append(f"distance={distance:.1f} m — negative distance is physically impossible")
+
+        # 4. Implausible HR during movement
+        if speed > 0.5 and hr > 0.0 and (hr < 30.0 or hr > 220.0):
+            reasons.append(
+                f"HR={hr:.0f} bpm during movement — outside physiological range [30, 220]"
+            )
+
+        return {"degraded": bool(reasons), "reasons": reasons}
+
     def _persistence_trend(self, persistence_windows: int) -> str:
+        """
+        Return the correct trend label for a finding based solely on persistence count.
+
+        IMPORTANT: This reflects how long a condition has been present, NOT whether
+        the underlying signal is numerically deteriorating. Use 'persistent' rather
+        than 'worsening' here. Numerical slope-based worsening is determined by
+        match_state.py (_compute_trend_signal) from the longitudinal deques.
+
+        'worsening' should only be set by callers that have confirmed a deteriorating
+        slope from match_state — not inferred from persistence count alone.
+        """
         if persistence_windows >= self._t["persistence_severe"]:
-            return "worsening"
+            return "persistent"      # ≥6 windows: chronic, not necessarily worsening
         if persistence_windows >= self._t["persistence_confirmed"]:
-            return "stable"
+            return "persistent"      # ≥3 windows: confirmed recurrence
         return "stable"
 
     def _confidence_from_shap(
@@ -345,48 +438,91 @@ class SemanticInterpreter:
         """
         Fires when: sustained high HR AND recovery dynamics are impaired.
 
-        Requires:
-          • heart_rate_bpm  > hr_high threshold
-          • hr_recovery_time_s (fractional rate) > hr_recovery_flat
-            (positive = HR still rising or not dropping — recovery impaired)
-          • at least one of the two features has meaningful SHAP attribution
+        Two paths:
+          Path A — High-intensity overload:
+            • heart_rate_bpm  > hr_high threshold (175 bpm)
+            • hr_recovery_time_s > hr_recovery_flat (HR not dropping)
+            • SHAP attribution on either feature
+
+          Path B — Resting non-recovery (low HR but recovery still impaired):
+            • hr_recovery_time_s > hr_recovery_flat
+            • window_avg_speed_ms near zero (player has stopped / is walking)
+            • SHAP on hr_recovery_time_s is strongly driving the anomaly
+            This catches the pattern where a player stops moving but HR
+            recovery is anomalous relative to their personal baseline — a
+            situation where hr_high (175 bpm) would never fire but the
+            recovery signal is the dominant SHAP driver.
         """
         hr    = fv.get("heart_rate_bpm", 0.0)
         rec   = fv.get("hr_recovery_time_s", 0.0)
+        speed = fv.get("window_avg_speed_ms", 0.0)
 
-        hr_elevated = hr >= self._t["hr_high"]
-        recovery_impaired = rec >= self._t["hr_recovery_flat"]  # HR not dropping
+        recovery_impaired = rec >= self._t["hr_recovery_flat"]
 
-        if not (hr_elevated and recovery_impaired):
+        # Path A: classic high-intensity overload
+        path_a = (
+            hr >= self._t["hr_high"]
+            and recovery_impaired
+            and (
+                self._shap_supports("heart_rate_bpm", sv)
+                or self._shap_supports("hr_recovery_time_s", sv)
+            )
+        )
+
+        # Path B: anomalous non-recovery at low activity
+        # hr_recovery_time_s SHAP must be POSITIVE (anomaly-increasing) and strong.
+        # _shap_strongly_supports uses abs() — intentionally, for other rules — but
+        # Path B requires sign-aware gating: a negative SHAP means this feature is
+        # SUPPRESSING the anomaly score, which is the opposite of what Path B requires.
+        # The autoencoder may assign negative SHAP to hr_recovery_time_s when the model
+        # has learned chronic abnormality — that is NOT an HR recovery anomaly signal.
+        path_b = (
+            recovery_impaired
+            and speed <= self._t["speed_ms_low"]
+            and sv.get("hr_recovery_time_s", 0.0) >= self._t["shap_strong"]
+        )
+
+        if not (path_a or path_b):
             return None
-        if not (self._shap_supports("heart_rate_bpm", sv) or
-                self._shap_supports("hr_recovery_time_s", sv)):
-            return None
 
-        # Severity escalation
-        if hr >= self._t["hr_critical"] and persistence_windows >= self._t["persistence_confirmed"]:
-            severity = "critical"
-        elif hr >= self._t["hr_critical"]:
-            severity = "high"
+        # Severity: path_a escalates with persistence; path_b is medium by default
+        if path_a:
+            if hr >= self._t["hr_critical"] and persistence_windows >= self._t["persistence_confirmed"]:
+                severity = "critical"
+            elif hr >= self._t["hr_critical"]:
+                severity = "high"
+            else:
+                severity = "medium"
         else:
-            severity = "moderate"
+            # Path B: non-recovery at rest — unusual but not critical without persistence
+            severity = "high" if persistence_windows >= self._t["persistence_confirmed"] else "medium"
 
         confidence = self._confidence_from_shap(
             ["heart_rate_bpm", "hr_recovery_time_s"], sv, base=0.75
         )
 
         trend = self._persistence_trend(persistence_windows)
-        if persistence_windows >= self._t["persistence_confirmed"] and rec > self._t["hr_recovery_flat"]:
-            trend = "worsening"
+        # Do not upgrade to 'worsening' purely from persistence count.
+        # Slope-confirmed deterioration comes from match_state longitudinal analysis.
+        # Persistence with continued impairment is 'persistent', not proven 'worsening'.
+
+        summary = (
+            f"Sustained cardiovascular strain detected: HR {int(hr)} bpm with impaired "
+            f"recovery dynamics (rate: {rec:+.3f})."
+            if path_a
+            else
+            f"Elevated HR persistence observed during low movement: {int(hr)} bpm with "
+            f"slow recovery dynamics (rate: {rec:+.3f}) at near-zero movement ({speed:.1f} m/s). "
+            f"Anomalous relative to this player's personal baseline — not necessarily effort-driven."
+        )
 
         return SemanticFinding(
-            finding_type="cardiovascular_overload",
+            # Path A = active exertion overload; Path B = anomalous recovery pattern.
+            # Distinct types prevent downstream components from treating both identically.
+            finding_type="cardiovascular_overload" if path_a else "elevated_cardiovascular_response",
             severity=severity,
             confidence=confidence,
-            summary=(
-                f"Sustained cardiovascular strain detected: HR {int(hr)} bpm with impaired "
-                f"recovery dynamics (rate: {rec:+.3f})."
-            ),
+            summary=summary,
             supporting_features=["heart_rate_bpm", "hr_recovery_time_s"],
             evidence={"heart_rate_bpm": hr, "hr_recovery_time_s": rec},
             shap_evidence={
@@ -445,7 +581,7 @@ class SemanticInterpreter:
         if max_z >= self._t["z_score_very_high"]:
             severity = "high"
         else:
-            severity = "moderate"
+            severity = "medium"
 
         confidence = self._confidence_from_shap(active_features, sv, base=0.72)
 
@@ -516,32 +652,36 @@ class SemanticInterpreter:
         if not any(self._shap_supports(f, sv) for f in active):
             return None
 
-        severity = "high" if len(active) >= 3 else "moderate"
+        severity = "high" if len(active) >= 3 else "medium"
 
         confidence = self._confidence_from_shap(active, sv, base=0.68)
+
+        # Map feature names to short human labels for the summary line.
+        # Only active features are listed — candidates that did NOT cross threshold
+        # are excluded. Previously all four candidate names appeared in the summary
+        # string regardless of which ones were actually active, causing the LLM to
+        # narrate all four while the count said only 2 or 3 were flagged.
+        _feature_labels = {
+            "hr_recovery_time_s":    "HR recovery",
+            "speed_drop_pct":        "speed decline",
+            "fatigue_decay_residual": "fatigue curve",
+            "acwr":                  "workload ratio",
+        }
+        active_labels = [_feature_labels[f] for f in active if f in _feature_labels]
 
         return SemanticFinding(
             finding_type="recovery_degradation",
             severity=severity,
             confidence=confidence,
             summary=(
-                f"Recovery capacity appears compromised: {len(active)} markers active "
-                f"(HR recovery, speed decline, fatigue curve, workload ratio)."
+                f"Recovery-related markers exceeded configured thresholds {len(active)} of 4 markers active "
+                f"({', '.join(active_labels)})."
             ),
             supporting_features=active,
-            evidence={
-                "hr_recovery_time_s":    rec,
-                "speed_drop_pct":        drop,
-                "fatigue_decay_residual": fat,
-                "acwr":                  acwr,
-            },
+            evidence={f: fv.get(f, 0.0) for f in active},
             shap_evidence={f: sv.get(f, 0.0) for f in active},
             persistence_windows=persistence_windows,
-            trend=(
-                "worsening"
-                if persistence_windows >= self._t["persistence_confirmed"] and len(active) >= 3
-                else self._persistence_trend(persistence_windows)
-            ),
+            trend=self._persistence_trend(persistence_windows),
             domain="workload_balance",
         )
 
@@ -639,7 +779,7 @@ class SemanticInterpreter:
         if persistence_windows >= self._t["persistence_confirmed"]:
             severity = "high"
         else:
-            severity = "moderate"
+            severity = "medium"
 
         # Also check for locomotor suppression (low sprint despite expectation)
         locomotor_suppressed = (
@@ -676,17 +816,94 @@ class SemanticInterpreter:
             },
             shap_evidence={f: sv.get(f, 0.0) for f in active},
             persistence_windows=persistence_windows,
-            trend=(
-                "worsening"
-                if persistence_windows >= self._t["persistence_confirmed"]
-                else "stable"
-            ),
+            trend=self._persistence_trend(persistence_windows),
             domain="workload_balance",
         )
 
+    # ── Rule: locomotor suppression ───────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-#     LLM prompt builder
+    def _rule_locomotor_suppression(
+        self,
+        fv: Dict[str, float],
+        sv: Dict[str, float],
+        persistence_windows: int,
+    ) -> Optional[SemanticFinding]:
+        """
+        Fires when a player's movement output has effectively ceased and SHAP
+        attributes the anomaly primarily to speed/distance suppression.
+
+        This is distinct from locomotor_overload (which fires on high z-scores).
+        Suppression fires on the opposite pattern: near-zero movement that is
+        anomalous relative to the player's personal baseline — the model flags
+        it because the player *should* be moving but isn't.
+
+        Requires:
+          • window_avg_speed_ms <= speed_ms_low (walking pace or stopped)
+          • SHAP on window_avg_speed_ms or window_distance_m is anomaly-driving
+            (positive SHAP = driving the anomaly flag)
+          • The combined positive SHAP from locomotor features exceeds shap_strong
+            to ensure the movement suppression is the primary driver, not incidental
+
+        Does NOT require z-scores — the player may be new or have limited
+        baseline history. The SHAP signal alone is sufficient when strong.
+        """
+        speed    = fv.get("window_avg_speed_ms", 0.0)
+        distance = fv.get("window_distance_m", 0.0)
+
+        # Must be genuinely stopped / walking
+        if speed > self._t["speed_ms_low"]:
+            return None
+
+        # SHAP must be driving the anomaly via the speed/distance channel
+        speed_shap    = sv.get("window_avg_speed_ms", 0.0)
+        distance_shap = sv.get("window_distance_m", 0.0)
+
+        # Positive SHAP = this feature is pushing the anomaly score up
+        if speed_shap <= 0.0 and distance_shap <= 0.0:
+            return None
+
+        combined_locomotor_shap = max(speed_shap, 0.0) + max(distance_shap, 0.0)
+        if combined_locomotor_shap < self._t["shap_strong"]:
+            return None
+
+        severity = (
+            "high"
+            if persistence_windows >= self._t["persistence_confirmed"]
+            else "medium"
+        )
+
+        confidence = self._confidence_from_shap(
+            ["window_avg_speed_ms", "window_distance_m"], sv, base=0.72
+        )
+
+        supporting = ["window_avg_speed_ms", "window_distance_m"]
+        # Include positional drift if it's also driving the anomaly
+        if sv.get("positional_drift_score", 0.0) > self._t["shap_relevant"]:
+            supporting.append("positional_drift_score")
+
+        return SemanticFinding(
+            finding_type="locomotor_suppression",
+            severity=severity,
+            confidence=confidence,
+            summary=(
+                f"Movement output has effectively ceased: speed {speed:.1f} m/s "
+                f"(distance {distance:.0f} m this window). "
+                f"This suppression is the primary anomaly driver relative to "
+                f"this player's personal baseline."
+            ),
+            supporting_features=supporting,
+            evidence={
+                "window_avg_speed_ms": speed,
+                "window_distance_m":   distance,
+                "window_sprint_count": fv.get("window_sprint_count", 0.0),
+            },
+            shap_evidence={f: sv.get(f, 0.0) for f in supporting},
+            persistence_windows=persistence_windows,
+            trend=self._persistence_trend(persistence_windows),
+            domain="locomotor_load",
+        )
+
+
 #     Converts List[SemanticFinding] → structured prompt block for the NLG engine.
 #     Import this in xai_layer.py and replace the raw SHAP feature_lines block.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -710,8 +927,20 @@ def build_semantic_prompt_block(findings: List[SemanticFinding]) -> str:
             f"{f.finding_type.replace('_', ' ').title()}"
         )
         lines.append(f"     {f.summary}")
-        if f.trend != "stable":
-            lines.append(f"     Trend: {f.trend} over {f.persistence_windows} windows.")
+        if f.trend not in ("stable", ""):
+            if f.trend == "worsening":
+                # 'worsening' is only set when match_state confirms a deteriorating slope.
+                lines.append(
+                    f"     Trend: numerically deteriorating over {f.persistence_windows} windows "
+                    f"(slope-confirmed — signal is getting worse, not merely recurring)."
+                )
+            elif f.trend == "persistent":
+                lines.append(
+                    f"     Persistence: condition has been active for {f.persistence_windows} "
+                    f"consecutive windows (recurring, trajectory not yet slope-confirmed)."
+                )
+            else:
+                lines.append(f"     Trend: {f.trend} over {f.persistence_windows} windows.")
         if f.evidence:
             evidence_str = ", ".join(
                 f"{k}={v:.2f}" for k, v in list(f.evidence.items())[:4]
@@ -720,10 +949,16 @@ def build_semantic_prompt_block(findings: List[SemanticFinding]) -> str:
 
     lines.append("")
     lines.append(
-        "Generate a concise operational sports report. "
-        "Do not add physiological reasoning beyond what is stated above. "
-        "Address the coaching staff directly. Maximum 3 sentences."
-    )
+            "Render ONLY the findings explicitly stated above.\n"
+            "Do NOT infer physiology, fatigue, injury risk, recovery quality, "
+            "or coaching recommendations.\n"
+            "Do NOT escalate severity beyond the provided labels.\n"
+            "Use ONLY these sections:\n"
+            "OBSERVED CONDITION:\n"
+            "PERSISTENCE:\n"
+            "MATCH CONTEXT:\n"
+            "Maximum 3 short sentences total."
+        )
 
     return "\n".join(lines)
 

@@ -20,7 +20,7 @@ from analysis.anomaly_detection import (
     PatternAnalysisEngine, AnomalyResult
 )
 from dataclasses import replace
-from analysis.match_state import MatchStateManager, MatchState
+from analysis.match_state import MatchStateManager, MatchState, JsonFileCheckpointStore
 from utils.reliability.invariants import SystemInvariantGuard
 from analysis.baseline import BaselineBuilder, PlayerBaselineProfile
 from explainability.xai_layer import XAILayer, SHAPExplanation, FEATURE_NAMES as XAI_FEATURE_NAMES
@@ -121,7 +121,12 @@ class PlayersDataAnalysisPipeline:
         self._inference_id_counter = 0
 
         # ── Match state ───────────────────────────────────────────────────────
-        self._match_state = MatchStateManager()
+        self._match_state = MatchStateManager(
+            store=JsonFileCheckpointStore("session"),
+            checkpoint_interval_s=5.0,
+            checkpoint_every_n=2,
+            checkpoint_on_alert=True,
+        )
         self._active_match_id: Optional[str] = None
 
     def register_player(
@@ -526,6 +531,8 @@ class PlayersDataAnalysisPipeline:
                         elapsed_seconds=elapsed_s,
                     )
 
+
+
                 # Record alert AFTER findings so motif/trend/escalation
                 # reasoning sees current findings before this alert is stored.
                 match_state.record_alert(
@@ -548,13 +555,36 @@ class PlayersDataAnalysisPipeline:
                         len(match_state.recent_findings),
                     )
 
-                # ─────────────────────────────────────────────
-                # Stage 4 — final narrative generation
-                # ─────────────────────────────────────────────
 
+                # ── Stage 3b — episodic memory update + compressed context ───────────────
+                current_min = elapsed_s // 60 if elapsed_s else None
+
+                match_state.refresh_episodes(
+                    current_minute=current_min,
+                    current_escalation=semantic_state.escalation_level,
+                )
+
+                current_finding_types = [
+                    fd.get("finding_type") or fd.get("type", "unknown")
+                    for fd in base_explanation.semantic_findings
+                ]
+
+                if base_explanation.semantic_findings:
+                    compressed_context = match_state.build_compressed_context(
+                        current_finding_types=current_finding_types,
+                        current_minute=current_min,
+                    )
+                else:
+                    compressed_context = None
+
+                # result.compressed_context = compressed_context
+                result._xai_kwargs["compressed_context"] = compressed_context
+                
+                # ── Stage 4 — final narrative generation (with episodic context) ─────────
                 explanation = self.xai_layer.generate_explanation_from_base(
                     base=base_explanation,
                     match_state=semantic_state,
+                    compressed_context=compressed_context, 
                 )
 
                 self._last_xai_ts[pid] = now
@@ -593,6 +623,10 @@ class PlayersDataAnalysisPipeline:
             result.shap_values = explanation.shap_values
             result.top_contributions = explanation.top_contributions
 
+        is_alert = result is not None and result.alert_level in (
+            AlertLevel.WARNING, AlertLevel.CRITICAL
+        )
+        self._match_state.mark_dirty(is_alert=is_alert)
         return result
     
     def _effective_confidence(
@@ -728,15 +762,21 @@ class PlayersDataAnalysisPipeline:
 
             now = time.time()
 
-            # IMPORTANT FIX:
-            # synchronous mode MUST always run SHAP
+            # Require at least 2 consecutive alert windows before running XAI.
+            # At window 1 the match-state deques are empty: no findings history,
+            # no trends, no motifs — the LLM would receive a bare SHAP block with
+            # no trajectory context and produce a shallow snapshot paraphrase.
+            # By window 2+ record_finding / record_alert have already run once,
+            # so semantic_state carries real trends and persistent findings.
+            # (process_live_event uses >= 3; we use >= 2 here because
+            #  process_window_direct is called on every stride window, not only
+            #  on sustained AlertLevel.WARNING/CRITICAL events.)
+            sufficient_persistence = result.persistence_windows >= 2
+
             run_xai = (
                 shap_allowed
                 and active_alert
-                and (
-                    not nlg_async
-                    or True
-                )
+                and sufficient_persistence
             )
 
             if run_xai:
@@ -779,13 +819,14 @@ class PlayersDataAnalysisPipeline:
             )
 
             # ─────────────────────────────────────────
-            # ALWAYS attach semantic/XAI state
-            # THIS FIXES missing_base_explanation
+            # Stash XAI kwargs for async callers.
+            # NOTE: match_state is intentionally NOT snapshotted here.
+            # build_semantic_state() must run AFTER record_finding() and
+            # record_alert() have updated the deques, otherwise motifs,
+            # trends and persistent_findings are all empty (window-1 state).
+            # The correct snapshot is taken inside the run_xai block below,
+            # after both record calls complete.
             # ─────────────────────────────────────────
-            result.semantic_state = (
-                match_state.build_semantic_state()
-            )
-
             result._xai_kwargs = dict(
                 player_id=player_id,
                 external_id=player["external_id"],
@@ -802,7 +843,6 @@ class PlayersDataAnalysisPipeline:
                     "sequence_background"
                 ),
                 persistence_windows=result.persistence_windows,
-                match_state=result.semantic_state,
                 elapsed_s=int(
                     xai_fv.get(
                         "elapsed_seconds",
@@ -815,25 +855,6 @@ class PlayersDataAnalysisPipeline:
             # SHAP + NLG
             # ─────────────────────────────────────────
             if run_xai:
-
-                if nlg_async:
-
-                    # async path
-                    result.nlg_summary = (
-                        self.xai_layer._template_nlg.generate(
-                            recommendation_type=result.recommendation_type,
-                            confidence=result.confidence,
-                            player_name=player["name"],
-                            top_contributions=[],
-                            workload_status=result.workload_status,
-                            semantic_findings=None,
-                        )
-                    )
-
-                    result.base_explanation = None
-
-                else:
-
                     # synchronous SHAP
                     base_explanation = (
                         self.xai_layer.build_base_explanation(
@@ -875,26 +896,16 @@ class PlayersDataAnalysisPipeline:
                         ),
                     )
 
-                    result.base_explanation = (
-                        base_explanation
-                    )
+                    result.base_explanation = base_explanation
 
-                    elapsed_s = int(
-                        xai_fv.get(
-                            "elapsed_seconds",
-                            0,
-                        )
-                    )
+                    elapsed_s = int(xai_fv.get("elapsed_seconds", 0))
 
-                    for finding_dict in (
-                        base_explanation.semantic_findings
-                    ):
-
+                    for finding_dict in base_explanation.semantic_findings:
                         match_state.record_finding(
                             finding=finding_dict,
                             elapsed_seconds=elapsed_s,
                         )
-
+                    
                     match_state.record_alert(
                         recommendation_type=result.recommendation_type,
                         confidence=result.confidence,
@@ -902,43 +913,49 @@ class PlayersDataAnalysisPipeline:
                         elapsed_seconds=elapsed_s,
                     )
 
-                    semantic_state = (
-                        match_state.build_semantic_state()
+                    # Snapshot AFTER findings + alert are recorded so motifs,
+                    # trends, and persistent_findings are populated.
+                    # main.py's "FORCE synchronous LLM generation" block reads
+                    # result.semantic_state and passes it to generate_nlg() —
+                    # that is the single LLM call for this alert.
+                    # Do NOT call generate_explanation_from_base() here; doing
+                    # so causes a second Ollama call whose output is overwritten
+                    # by main.py's call ~10 seconds later, doubling latency.
+                    semantic_state = match_state.build_semantic_state()
+
+                    current_min = elapsed_s // 60 if elapsed_s else None
+
+                    match_state.refresh_episodes(
+                        current_minute=current_min,
+                        current_escalation=semantic_state.escalation_level,
                     )
 
-                    explanation = (
-                        self.xai_layer.generate_explanation_from_base(
-                            base=base_explanation,
-                            match_state=semantic_state,
-                        )
+                    current_finding_types = [
+                        fd.get("finding_type") or fd.get("type", "unknown")
+                        for fd in base_explanation.semantic_findings
+                    ]
+
+                    # Always build compressed context from accumulated match state history.
+                    # Even when the current window has no semantic findings (quality gate
+                    # suppressed them), prior windows may have populated episodes, transitions,
+                    # and recurring patterns that are still valid context for the LLM.
+                    # is_empty() inside format_episodic_context() will suppress the block
+                    # if there is genuinely nothing to report.
+                    compressed_context = match_state.build_compressed_context(
+                        current_finding_types=current_finding_types,
+                        current_minute=current_min,
                     )
 
-                    if explanation is not None:
+                    result.compressed_context = compressed_context
+                    result._xai_kwargs["compressed_context"] = compressed_context
 
-                        result.nlg_summary = (
-                            explanation.nlg_summary
-                        )
-
-                        result.counterfactual = (
-                            explanation.counterfactual
-                        )
-
-                        result.shap_values = (
-                            explanation.shap_values
-                        )
-
-                        result.top_contributions = (
-                            explanation.top_contributions
-                        )
-
-                        result.nlg_engine = getattr(
-                            explanation,
-                            "nlg_engine",
-                            "llm_unknown",
-                        )
+                    result.semantic_state = semantic_state
+                    result._xai_kwargs["semantic_state"] = semantic_state
 
                     self._last_xai_ts[player_id] = now
 
+        is_alert = result is not None and result.recommendation_type is not None
+        self._match_state.mark_dirty(is_alert=is_alert)
         return result
 
     def _build_xai_feature_vector(self, result: AnomalyResult) -> dict:
@@ -949,6 +966,10 @@ class PlayersDataAnalysisPipeline:
         • window_distance_m = distance_delta_m * window_steps (not * 8 hardcoded)
         • reconstruction_loss excluded — not in FEATURE_NAMES, was silently dropped
         • z-scores computed from real baseline, not fabricated
+        • elapsed_seconds preserved so record_finding / record_alert receive the
+          real match clock value and can populate minute labels in the LLM prompt.
+          Previously defaulted to 0 for every window because it was never copied
+          from the raw feature vector, making all "min ~X" annotations disappear.
         """
         sfv          = result.feature_vector
         window_steps = CONFIG.window.window_steps   # 24 at 5 s/tick
@@ -973,6 +994,10 @@ class PlayersDataAnalysisPipeline:
         xai["coach_fatigue_severity"]  = sfv.get("coach_fatigue_severity", 0.0)
         xai["coach_pre_match_status_encoded"] = sfv.get("coach_pre_match_status_encoded", 0.0)
 
+        # Preserve match clock so finding/alert records carry real minute labels.
+        # elapsed_seconds is injected by _enrich() in main.py from the raw event.
+        xai["elapsed_seconds"] = sfv.get("elapsed_seconds", 0)
+
         player   = self.registry.get_by_external_id(result.external_id)
         baseline = player["baseline"] if player else None
         if baseline is not None:
@@ -995,18 +1020,22 @@ class PlayersDataAnalysisPipeline:
         self._on_alert_callback = cb
 
     # ──────────────────────────────────────────
-    # Match lifecycle  (Fix 2)
+    # Match lifecycle 
     # ──────────────────────────────────────────
     def start_match(self, match_id: str) -> None:
         """Call at kickoff. Ties all subsequent state to this match_id."""
         self._active_match_id = match_id
         self._match_state.start_match(match_id)
-        logger.info("Match started: %s", match_id)
+        restored = self._match_state.restore_if_active(match_id)
+        if restored:
+            logger.info("Match started: %s — resumed %d player state(s) from checkpoint", match_id, restored)
+        else:
+            logger.info("Match started: %s", match_id)
 
     def end_match(self) -> None:
         """Call at full time. Frees per-match memory and resets match identity."""
         if self._active_match_id:
-            self._match_state.end_match(self._active_match_id)
+            self._match_state.end_match_and_wipe(self._active_match_id)
             logger.info("Match ended: %s", self._active_match_id)
             self._active_match_id = None
 
@@ -1049,6 +1078,24 @@ class PlayersDataAnalysisPipeline:
             nationality=player.get("nationality"),
         )
         self.feedback_store.log_override(record)
+
+        if self._active_match_id:
+            try:
+                ms = self._match_state.get_or_create(
+                    player_id=player_id,
+                    player_name=player.get("name", ""),
+                    position=player.get("position", ""),
+                    match_id=self._active_match_id,
+                )
+                intervention_desc = (
+                    f"{decision} by coach {coach_id} at inference #{inference_id}"
+                    + (f": {coach_note}" if coach_note else "")
+                )
+                ms.log_intervention(intervention_desc)
+            except Exception as exc:
+                logger.warning("Could not log intervention to match state: %s", exc)
+
+
         logger.info("Coach decision logged: player=%d decision=%s coach=%s",
                     player_id, decision, coach_id)
 

@@ -2579,7 +2579,7 @@ class SharedBackboneAutoencoder:
 
             player_idx = pid_tensor.item()
 
-            # FIX: convert embedding index -> real player ID
+            # convert embedding index -> real player ID
             pid = self._index_to_player_id[player_idx]
 
             mask = self._calib_player_ids == pid_tensor

@@ -29,6 +29,7 @@ Exit codes
     5   audit found bias (non-zero biased groups)
 
 """
+
 from __future__ import annotations
 
 import argparse
@@ -50,18 +51,17 @@ import pandas as pd
 # Logging: structured to stderr, JSON in production; human-readable in dev
 # ─────────────────────────────────────────────────────────────────────────────
 _LOG_FMT_HUMAN = "%(asctime)s  %(levelname)-8s  %(name)-20s  %(message)s"
-_LOG_FMT_JSON  = None   # set below if JSON_LOGS=1
+_LOG_FMT_JSON = None  # set below if JSON_LOGS=1
 ALERT_COOLDOWN_S = 20
 
 ALERT_FAMILY = {
     "anomaly_flag": "physiological_instability",
     "substitution": "physiological_instability",
     "fatigue_alert": "physiological_instability",
-
     "positional_drift": "tactical_instability",
-
     "workload_alert": "workload_instability",
 }
+
 
 def _configure_logging(level: str = "INFO") -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
@@ -70,14 +70,19 @@ def _configure_logging(level: str = "INFO") -> None:
 
         class _JsonFormatter(logging.Formatter):
             def format(self, record: logging.LogRecord) -> str:
-                return _json.dumps({
-                    "ts":      datetime.utcnow().isoformat() + "Z",
-                    "level":   record.levelname,
-                    "logger":  record.name,
-                    "message": record.getMessage(),
-                    **({"exc": self.formatException(record.exc_info)}
-                       if record.exc_info else {}),
-                })
+                return _json.dumps(
+                    {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "message": record.getMessage(),
+                        **(
+                            {"exc": self.formatException(record.exc_info)}
+                            if record.exc_info
+                            else {}
+                        ),
+                    }
+                )
 
         handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(_JsonFormatter())
@@ -90,6 +95,7 @@ def _configure_logging(level: str = "INFO") -> None:
     logging.root.addHandler(handler)
     logging.getLogger("shap").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
 
 logger = logging.getLogger("players_data.main")
 
@@ -134,6 +140,7 @@ def _build_pipeline(model_dir: Path, replay_mode: bool = False):
 
     # Override model store so the pipeline loads/saves from the right place
     import analysis.anomaly_detection as _ad
+
     _ad.MODEL_STORE = model_dir
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -148,17 +155,22 @@ def _aggregate_session_features(events_df: pd.DataFrame) -> pd.DataFrame:
     from scipy.integrate import trapezoid
 
     if events_df.empty:
-        return pd.DataFrame(columns=["session_id", "window_distance_m",
-                                     "window_avg_speed_ms", "window_sprint_count",
-                                     "heart_rate_bpm"])
+        return pd.DataFrame(
+            columns=[
+                "session_id",
+                "window_distance_m",
+                "window_avg_speed_ms",
+                "window_sprint_count",
+                "heart_rate_bpm",
+            ]
+        )
     return (
-        events_df
-        .groupby("session_id")
+        events_df.groupby("session_id")
         .agg(
-            window_distance_m   =("speed_ms",       lambda x: trapezoid(x, dx=15)),
-            window_avg_speed_ms =("speed_ms",        "mean"),
-            window_sprint_count =("is_sprint",       "sum"),
-            heart_rate_bpm      =("heart_rate_bpm",  "mean"),
+            window_distance_m=("speed_ms", lambda x: trapezoid(x, dx=15)),
+            window_avg_speed_ms=("speed_ms", "mean"),
+            window_sprint_count=("is_sprint", "sum"),
+            heart_rate_bpm=("heart_rate_bpm", "mean"),
         )
         .reset_index()
     )
@@ -178,7 +190,10 @@ def cmd_generate(args: argparse.Namespace) -> None:
     """
     logger.info(
         "generate | seasons=%d  matchdays=%d  anomaly_rate=%.3f  out=%s",
-        args.seasons, args.matchdays, args.anomaly_rate, args.data_dir,
+        args.seasons,
+        args.matchdays,
+        args.anomaly_rate,
+        args.data_dir,
     )
 
     # Import here to keep other subcommands fast when data already exists
@@ -202,14 +217,20 @@ def cmd_generate(args: argparse.Namespace) -> None:
         _exit(1, "Validation failed: no anomalies seeded — check anomaly_rate")
 
     sessions = pd.DataFrame(data["sessions"])
-    events   = pd.DataFrame(data["events"])
+    events = pd.DataFrame(data["events"])
 
     if events.empty:
         _exit(1, "Validation failed: events table is empty")
 
     # Ensure required feature columns are present
-    required_cols = {"speed_ms", "heart_rate_bpm", "x_pitch", "y_pitch",
-                     "is_sprint", "elapsed_seconds"}
+    required_cols = {
+        "speed_ms",
+        "heart_rate_bpm",
+        "x_pitch",
+        "y_pitch",
+        "is_sprint",
+        "elapsed_seconds",
+    }
     missing = required_cols - set(events.columns)
     if missing:
         _exit(1, f"Validation failed: events missing columns {missing}")
@@ -226,21 +247,29 @@ def cmd_generate(args: argparse.Namespace) -> None:
     anomaly_pct = float(gt["is_anomaly"].mean()) * 100
     logger.info(
         "Saved to %s | sessions=%d  events=%d  anomalies=%d (%.1f%%)",
-        data_dir, len(sessions), len(events), n_anomalies, anomaly_pct,
+        data_dir,
+        len(sessions),
+        len(events),
+        n_anomalies,
+        anomaly_pct,
     )
 
     if not args.quiet:
         dg.print_dataset_report(data)
 
-    print(json.dumps({
-        "status":         "ok",
-        "data_dir":       str(data_dir.resolve()),
-        "sessions":       len(sessions),
-        "events":         len(events),
-        "anomaly_count":  n_anomalies,
-        "anomaly_pct":    round(anomaly_pct, 2),
-        "elapsed_s":      round(elapsed, 2),
-    }))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "data_dir": str(data_dir.resolve()),
+                "sessions": len(sessions),
+                "events": len(events),
+                "anomaly_count": n_anomalies,
+                "anomaly_pct": round(anomaly_pct, 2),
+                "elapsed_s": round(elapsed, 2),
+            }
+        )
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,38 +288,48 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     Exits 2 if training fails or produces a degenerate model.
     """
-    data_dir  = Path(args.data_dir)
+    data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
 
-    logger.info("train | data=%s  model=%s  sessions_per_player=%d",
-                data_dir, model_dir, args.sessions_per_player)
+    logger.info(
+        "train | data=%s  model=%s  sessions_per_player=%d",
+        data_dir,
+        model_dir,
+        args.sessions_per_player,
+    )
 
-    frames   = _load_csvs(data_dir)
+    frames = _load_csvs(data_dir)
     pipeline = _build_pipeline(model_dir)
 
-    players_df  = frames["players"]
+    players_df = frames["players"]
     sessions_df = frames["sessions"]
-    events_df   = frames["events"]
-    annot_df    = frames["annotations"]
+    events_df = frames["events"]
+    annot_df = frames["annotations"]
 
     # ── Register all players ──────────────────────────────────────────────────
     for _, row in players_df.iterrows():
         pipeline.register_player(
-            player_id   = int(row["player_id"]),
-            external_id = str(row["external_id"]),
-            name        = str(row.get("full_name", row.get("name", f"Player {row['player_id']}"))),
-            position    = str(row["position"]),
-            age         = int(row.get("age", 25)),
-            age_group   = str(row.get("age_group", "Senior")),
-            nationality = str(row.get("nationality", "")),
+            player_id=int(row["player_id"]),
+            external_id=str(row["external_id"]),
+            name=str(
+                row.get("full_name", row.get("name", f"Player {row['player_id']}"))
+            ),
+            position=str(row["position"]),
+            age=int(row.get("age", 25)),
+            age_group=str(row.get("age_group", "Senior")),
+            nationality=str(row.get("nationality", "")),
         )
     logger.info("Registered %d players", len(players_df))
 
     # ── Load data per player ──────────────────────────────────────────────────
     features_df = _aggregate_session_features(events_df)
     sessions_with_features = sessions_df.merge(features_df, on="session_id", how="left")
-    for col, fill in [("window_distance_m", 0), ("window_avg_speed_ms", 0),
-                      ("window_sprint_count", 0), ("heart_rate_bpm", 120)]:
+    for col, fill in [
+        ("window_distance_m", 0),
+        ("window_avg_speed_ms", 0),
+        ("window_sprint_count", 0),
+        ("heart_rate_bpm", 120),
+    ]:
         sessions_with_features[col] = sessions_with_features[col].fillna(fill)
 
     n_loaded = 0
@@ -304,12 +343,12 @@ def cmd_train(args: argparse.Namespace) -> None:
             logger.warning("Player %d: no sessions — skipping", pid)
             continue
         pevents = events_df[events_df["session_id"].isin(psessions["session_id"])]
-        pannot  = annot_df[annot_df["session_id"].isin(psessions["session_id"])]
+        pannot = annot_df[annot_df["session_id"].isin(psessions["session_id"])]
         pipeline.load_historical_data(
-            player_id      = pid,
-            sessions_df    = psessions,
-            events_df      = pevents,
-            annotations_df = pannot,
+            player_id=pid,
+            sessions_df=psessions,
+            events_df=pevents,
+            annotations_df=pannot,
         )
         n_loaded += 1
 
@@ -323,14 +362,19 @@ def cmd_train(args: argparse.Namespace) -> None:
     logger.info("Baselines computed for %d players", len(baselines))
 
     if len(baselines) == 0:
-        _exit(1, "All baselines failed — check data quality / min_sessions_for_baseline")
+        _exit(
+            1, "All baselines failed — check data quality / min_sessions_for_baseline"
+        )
 
     # Log a concise baseline table
     for pid, b in sorted(baselines.items()):
         logger.debug(
             "  p%03d  dist=%.0f±%.0f m  sprints=%.1f  fatigue_r2=%.3f",
-            pid, b.distance_mean, b.distance_std,
-            b.sprint_count_mean, b.fatigue_r_squared or 0,
+            pid,
+            b.distance_mean,
+            b.distance_std,
+            b.sprint_count_mean,
+            b.fatigue_r_squared or 0,
         )
 
     # ── Train shared backbone ─────────────────────────────────────────────────
@@ -338,20 +382,26 @@ def cmd_train(args: argparse.Namespace) -> None:
     t0 = time.perf_counter()
     result = pipeline.train_all_models()
     elapsed = time.perf_counter() - t0
-    logger.info("Training complete in %.1f s | status=%s", elapsed, result.get("status"))
+    logger.info(
+        "Training complete in %.1f s | status=%s", elapsed, result.get("status")
+    )
 
     # Orchestrator returns {"status": "success", "shared_model": {...}, "players": {...}}.
     # Accept any non-error status string so this doesn't break if the orchestrator
     # changes "success" → "ok" or "trained" in future.
     top_status = result.get("status", "")
-    if not top_status or top_status.startswith("error") or top_status.startswith("fail"):
+    if (
+        not top_status
+        or top_status.startswith("error")
+        or top_status.startswith("fail")
+    ):
         _exit(2, f"Training returned error status: {result}")
 
     # n_windows lives under result["shared_model"]["n_windows"], not at the top level.
     shared_info = result.get("shared_model", {})
-    n_windows   = shared_info.get("n_windows", 0)
+    n_windows = shared_info.get("n_windows", 0)
     n_players_trained = shared_info.get("n_players", n_loaded)
-    model_version     = shared_info.get("model_version", "unknown")
+    model_version = shared_info.get("model_version", "unknown")
 
     if n_windows == 0:
         _exit(2, "Training produced 0 sequence windows — model is empty")
@@ -363,15 +413,15 @@ def cmd_train(args: argparse.Namespace) -> None:
 
     # ── Write training summary ────────────────────────────────────────────────
     summary = {
-        "status":          "ok",
-        "trained_at":      datetime.now(tz=timezone.utc).isoformat(),
-        "model_dir":       str(model_dir.resolve()),
-        "n_players":       n_players_trained,
-        "n_windows":       n_windows,
-        "n_baselines":     len(baselines),
-        "elapsed_s":       round(elapsed, 2),
-        "backbone_path":   str(backbone_path),
-        "model_version":   model_version,
+        "status": "ok",
+        "trained_at": datetime.now(tz=timezone.utc).isoformat(),
+        "model_dir": str(model_dir.resolve()),
+        "n_players": n_players_trained,
+        "n_windows": n_windows,
+        "n_baselines": len(baselines),
+        "elapsed_s": round(elapsed, 2),
+        "backbone_path": str(backbone_path),
+        "model_version": model_version,
     }
     summary_path = model_dir / "train_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
@@ -407,15 +457,18 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     # ── Progress-bar helper (graceful tqdm fallback) ──────────────────────────
     try:
         from tqdm import tqdm as _tqdm
+
         def _progress(it, **kw):
             return _tqdm(it, dynamic_ncols=True, **kw)
+
     except ImportError:
+
         def _progress(it, desc="", **kw):  # type: ignore[misc]
             if desc:
                 logger.info("%s …", desc)
             return it
 
-    data_dir  = Path(args.data_dir)
+    data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
 
     logger.info("evaluate | data=%s  model=%s", data_dir, model_dir)
@@ -424,14 +477,14 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     if not backbone_path.exists():
         _exit(2, f"Model checkpoint not found at {backbone_path} — run train first")
 
-    frames   = _load_csvs(data_dir)
+    frames = _load_csvs(data_dir)
     pipeline = _build_pipeline(model_dir)
 
-    players_df  = frames["players"]
+    players_df = frames["players"]
     sessions_df = frames["sessions"]
-    events_df   = frames["events"]
-    annot_df    = frames["annotations"]
-    gt_df       = frames["ground_truth_labels"]
+    events_df = frames["events"]
+    annot_df = frames["annotations"]
+    gt_df = frames["ground_truth_labels"]
 
     # ── Pre-group for O(1) lookup — avoids O(n) DataFrame filter per player/session ──
     logger.info("Pre-grouping events and sessions …")
@@ -441,31 +494,41 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     player_sessions_map: Dict[int, pd.DataFrame] = {
         int(pid): grp for pid, grp in sessions_df.groupby("player_id")
     }
-    player_annot_map: Dict[int, pd.DataFrame] = {
-        int(pid): grp
-        for pid, grp in annot_df.groupby(
-            annot_df["session_id"].map(
-                sessions_df.set_index("session_id")["player_id"]
+    player_annot_map: Dict[int, pd.DataFrame] = (
+        {
+            int(pid): grp
+            for pid, grp in annot_df.groupby(
+                annot_df["session_id"].map(
+                    sessions_df.set_index("session_id")["player_id"]
+                )
             )
-        )
-    } if not annot_df.empty and "session_id" in annot_df.columns else {}
+        }
+        if not annot_df.empty and "session_id" in annot_df.columns
+        else {}
+    )
 
     # ── Load backbone ─────────────────────────────────────────────────────────
     from analysis.anomaly_detection import SharedBackboneAutoencoder
+
     shared = SharedBackboneAutoencoder.load(backbone_path)
     if shared is None or not shared.is_trained:
         _exit(2, "Could not load trained backbone from checkpoint")
 
     pipeline.pattern_engine._shared_model = shared
     pipeline.pattern_engine.inference_engine._shared_model = shared
-    logger.info("Loaded backbone v=%s  players=%d",
-                shared.model_version, shared.n_players)
+    logger.info(
+        "Loaded backbone v=%s  players=%d", shared.model_version, shared.n_players
+    )
 
     # ── Register players + baselines ─────────────────────────────────────────
     features_df = _aggregate_session_features(events_df)
     sessions_with_features = sessions_df.merge(features_df, on="session_id", how="left")
-    for col, fill in [("window_distance_m", 0), ("window_avg_speed_ms", 0),
-                      ("window_sprint_count", 0), ("heart_rate_bpm", 120)]:
+    for col, fill in [
+        ("window_distance_m", 0),
+        ("window_avg_speed_ms", 0),
+        ("window_sprint_count", 0),
+        ("heart_rate_bpm", 120),
+    ]:
         sessions_with_features[col] = sessions_with_features[col].fillna(fill)
 
     swf_by_player: Dict[int, pd.DataFrame] = {
@@ -474,25 +537,30 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     for _, row in players_df.iterrows():
         pipeline.register_player(
-            player_id   = int(row["player_id"]),
-            external_id = str(row["external_id"]),
-            name        = str(row.get("full_name", row.get("name", ""))),
-            position    = str(row["position"]),
-            age         = int(row.get("age", 25)),
-            age_group   = str(row.get("age_group", "Senior")),
+            player_id=int(row["player_id"]),
+            external_id=str(row["external_id"]),
+            name=str(row.get("full_name", row.get("name", ""))),
+            position=str(row["position"]),
+            age=int(row.get("age", 25)),
+            age_group=str(row.get("age_group", "Senior")),
         )
 
     baselines = {}
-    for pid in _progress(players_df["player_id"].tolist(),
-                         desc="Loading player histories", unit="player"):
+    for pid in _progress(
+        players_df["player_id"].tolist(), desc="Loading player histories", unit="player"
+    ):
         psessions = swf_by_player.get(pid, pd.DataFrame())
         if psessions.empty:
             continue
-        sids      = set(psessions["session_id"])
-        pevents   = pd.concat(
-            [session_events_map[sid] for sid in sids if sid in session_events_map],
-            ignore_index=True,
-        ) if sids else pd.DataFrame()
+        sids = set(psessions["session_id"])
+        pevents = (
+            pd.concat(
+                [session_events_map[sid] for sid in sids if sid in session_events_map],
+                ignore_index=True,
+            )
+            if sids
+            else pd.DataFrame()
+        )
         pannot = player_annot_map.get(pid, pd.DataFrame())
         pipeline.load_historical_data(pid, psessions, pevents, pannot)
 
@@ -501,41 +569,45 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
     # ── Rebuild threshold trackers — batched predict for speed ────────────────
     from analysis.regime import RegimeAwareThresholdStore, SessionRegimeClassifier
-    from analysis.anomaly_detection import EMASmoother  # re-export via anomaly_detection
+    from analysis.anomaly_detection import (
+        EMASmoother,
+    )  # re-export via anomaly_detection
     from config.settings import CONFIG
-    classifier = SessionRegimeClassifier()
-    alpha      = CONFIG.scoring.score_ema_alpha
 
-    for pid in _progress(sorted(baselines.keys()),
-                         desc="Calibrating thresholds", unit="player"):
+    classifier = SessionRegimeClassifier()
+    alpha = CONFIG.scoring.score_ema_alpha
+
+    for pid in _progress(
+        sorted(baselines.keys()), desc="Calibrating thresholds", unit="player"
+    ):
         psessions = player_sessions_map.get(pid, pd.DataFrame())
         if psessions.empty:
             continue
         psessions = psessions.sort_values("started_at")
-        sids    = set(psessions["session_id"])
-        pevents = pd.concat(
-            [session_events_map[sid] for sid in sids if sid in session_events_map],
-            ignore_index=True,
-        ) if sids else pd.DataFrame()
+        sids = set(psessions["session_id"])
+        pevents = (
+            pd.concat(
+                [session_events_map[sid] for sid in sids if sid in session_events_map],
+                ignore_index=True,
+            )
+            if sids
+            else pd.DataFrame()
+        )
 
         windows = pipeline.pattern_engine.build_training_sequences(pevents, psessions)
         if not windows:
             continue
         split = max(1, int(len(windows) * 0.8))
         calib = windows[split:]  # use held-out windows for calibration
-        if len(calib) < 5:        
+        if len(calib) < 5:
             calib = windows
         if not calib:
             continue
 
         # ── Batch predict — ONE forward pass for all calib windows ────────────
-        seqs_arr = np.stack(
-            [s for s, _, _ in calib]
-        ).astype(np.float32)
+        seqs_arr = np.stack([s for s, _, _ in calib]).astype(np.float32)
 
-        masks_arr = np.stack(
-            [m for _, m, _ in calib]
-        ).astype(bool)
+        masks_arr = np.stack([m for _, m, _ in calib]).astype(bool)
 
         pids_arr = np.full(
             len(calib),
@@ -552,8 +624,8 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
             masks=masks_arr,
             normalised=True,
         )
-        
-        store   = RegimeAwareThresholdStore()
+
+        store = RegimeAwareThresholdStore()
         smoother = EMASmoother(alpha)
         for loss, (seq, _, _) in zip(losses, calib):
             ema_val = smoother.update(float(loss))
@@ -563,14 +635,16 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         pipeline.pattern_engine._threshold_trackers[pid] = store
 
     # ── Build labeled window set ──────────────────────────────────────────────
-    gt_map = dict(zip(gt_df["session_id"].astype(int),
-                      gt_df["is_anomaly"].astype(bool)))
+    gt_map = dict(
+        zip(gt_df["session_id"].astype(int), gt_df["is_anomaly"].astype(bool))
+    )
 
     all_player_metrics: List[dict] = []
     total_tp = total_fp = total_fn = total_tn = 0
 
-    for pid in _progress(sorted(baselines.keys()),
-                         desc="Evaluating players", unit="player"):
+    for pid in _progress(
+        sorted(baselines.keys()), desc="Evaluating players", unit="player"
+    ):
         psessions = player_sessions_map.get(pid, pd.DataFrame())
         if psessions.empty:
             continue
@@ -585,19 +659,25 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
             sess_evs = session_events_map.get(sid, pd.DataFrame())
             if sess_evs.empty:
                 continue
-            for seq, mask in pipeline.pattern_engine.window_builder.build_from_session(sess_evs):
+            for seq, mask in pipeline.pattern_engine.window_builder.build_from_session(
+                sess_evs
+            ):
                 labeled.append((seq, mask, label))
 
         if not labeled:
             logger.warning("Player %d: 0 labeled windows — skipping", pid)
             continue
 
-        n_anom   = sum(1 for _, _, l in labeled if l)
+        n_anom = sum(1 for _, _, l in labeled if l)
         n_normal = sum(1 for _, _, l in labeled if not l)
 
         if n_anom == 0 or n_normal == 0:
-            logger.info("Player %d: only one class present (anom=%d norm=%d) — skipping",
-                        pid, n_anom, n_normal)
+            logger.info(
+                "Player %d: only one class present (anom=%d norm=%d) — skipping",
+                pid,
+                n_anom,
+                n_normal,
+            )
             continue
 
         metrics = pipeline.pattern_engine.evaluate_player(pid, labeled)
@@ -617,15 +697,20 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
             "p%03d | auc=%.3f  pr=%.3f  p@k=%.3f  fp/90=%.2f  tp=%d fp=%d fn=%d",
             pid,
             metrics.get("roc_auc", float("nan")),
-            metrics.get("pr_auc",  float("nan")),
+            metrics.get("pr_auc", float("nan")),
             metrics.get("precision_at_k", float("nan")),
-            metrics.get("fp_per_90_min",  float("nan")),
-            metrics.get("tp", 0), metrics.get("fp", 0), metrics.get("fn", 0),
+            metrics.get("fp_per_90_min", float("nan")),
+            metrics.get("tp", 0),
+            metrics.get("fp", 0),
+            metrics.get("fn", 0),
         )
 
     if not all_player_metrics:
-        _exit(3, "No players produced evaluable labeled windows "
-                 "— check ground_truth_labels.csv and data split")
+        _exit(
+            3,
+            "No players produced evaluable labeled windows "
+            "— check ground_truth_labels.csv and data split",
+        )
 
     # ── Aggregate ─────────────────────────────────────────────────────────────
     def _nanmean(key: str) -> float:
@@ -633,23 +718,23 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         return float(np.nanmean(vals)) if vals else float("nan")
 
     prec_global = total_tp / max(total_tp + total_fp, 1)
-    rec_global  = total_tp / max(total_tp + total_fn, 1)
+    rec_global = total_tp / max(total_tp + total_fn, 1)
 
     aggregate = {
-        "status":             "ok",
-        "evaluated_at":       datetime.now(tz=timezone.utc).isoformat(),
-        "n_players_evaluated":len(all_player_metrics),
-        "mean_roc_auc":       round(_nanmean("roc_auc"), 4),
-        "mean_pr_auc":        round(_nanmean("pr_auc"),  4),
-        "mean_precision_at_k":round(_nanmean("precision_at_k"), 4),
-        "mean_fp_per_90_min": round(_nanmean("fp_per_90_min"),  4),
-        "global_precision":   round(prec_global, 4),
-        "global_recall":      round(rec_global,  4),
-        "global_tp":          total_tp,
-        "global_fp":          total_fp,
-        "global_fn":          total_fn,
-        "global_tn":          total_tn,
-        "per_player":         all_player_metrics,
+        "status": "ok",
+        "evaluated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "n_players_evaluated": len(all_player_metrics),
+        "mean_roc_auc": round(_nanmean("roc_auc"), 4),
+        "mean_pr_auc": round(_nanmean("pr_auc"), 4),
+        "mean_precision_at_k": round(_nanmean("precision_at_k"), 4),
+        "mean_fp_per_90_min": round(_nanmean("fp_per_90_min"), 4),
+        "global_precision": round(prec_global, 4),
+        "global_recall": round(rec_global, 4),
+        "global_tp": total_tp,
+        "global_fp": total_fp,
+        "global_fn": total_fn,
+        "global_tn": total_tn,
+        "per_player": all_player_metrics,
     }
 
     out_path = Path(args.out)
@@ -657,12 +742,15 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     out_path.write_text(json.dumps(aggregate, indent=2))
     logger.info("Metrics written → %s", out_path)
 
-    print(json.dumps({k: v for k, v in aggregate.items() if k != "per_player"},
-                     indent=2))
+    print(
+        json.dumps({k: v for k, v in aggregate.items() if k != "per_player"}, indent=2)
+    )
 
     # Fail-fast gate: exit non-zero if mean AUC is below minimum
     if aggregate["mean_roc_auc"] < args.min_auc:
-        _exit(3, f"ROC-AUC {aggregate['mean_roc_auc']:.3f} < required {args.min_auc:.3f}")
+        _exit(
+            3, f"ROC-AUC {aggregate['mean_roc_auc']:.3f} < required {args.min_auc:.3f}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -677,9 +765,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     backbone_path = model_dir / "shared_backbone.pt"
 
     if not backbone_path.exists():
-        _exit(
-            2, f"Model checkpoint not found: {backbone_path} — run train first"
-        )
+        _exit(2, f"Model checkpoint not found: {backbone_path} — run train first")
 
     logger.info(
         "serve | model=%s  min_alert_windows=%d  max_latency_ms=%d",
@@ -744,8 +830,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     else:
 
         logger.warning(
-            "No serve_state.json found — "
-            "player baselines and thresholds not loaded."
+            "No serve_state.json found — " "player baselines and thresholds not loaded."
         )
 
     # ─────────────────────────────────────────────
@@ -992,9 +1077,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
                     pipeline.pattern_engine.reset_ema_state(player_id_int)
 
-                    pipeline.pattern_engine.alert_manager.clear_player(
-                        player_id_int
-                    )
+                    pipeline.pattern_engine.alert_manager.clear_player(player_id_int)
 
                     pipeline.tvl.reset_player(player_id_int)
 
@@ -1027,21 +1110,27 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
                 continue
 
-            latency_ms = (time.perf_counter() - t_start) * 1000
+            # Inference latency: model forward pass + SHAP + symbolic reasoning.
+            # This is the SLA-gated path — NLG is excluded intentionally because
+            # LLM generation can take 8–11 s and must never block the alert decision.
+            inference_latency_ms = (time.perf_counter() - t_start) * 1000
+            nlg_latency_ms = 0.0
 
-            if latency_ms > args.max_latency_ms:
+            if inference_latency_ms > args.max_latency_ms:
 
                 sla_violations += 1
 
                 logger.warning(
-                    "SLA breach: player=%s latency=%.1f ms > %d ms",
+                    "SLA breach: player=%s inference_latency=%.1f ms > %d ms",
                     ext_id,
-                    latency_ms,
+                    inference_latency_ms,
                     args.max_latency_ms,
                 )
 
             # ─────────────────────────────────────────────
             # FORCE synchronous LLM generation
+            # Timed separately — NLG latency is tracked but
+            # does NOT count against the inference SLA.
             # ─────────────────────────────────────────────
             if result is not None:
 
@@ -1053,11 +1142,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
                         None,
                     )
 
-                    _sem_state = getattr(
-                        result,
-                        "semantic_state",
-                        None,
-                    )
+                    _sem_state = getattr(result, "semantic_state", None)
+                    _compressed_ctx = getattr(result, "compressed_context", None)
 
                     if _base_expl is not None:
 
@@ -1066,10 +1152,24 @@ def cmd_serve(args: argparse.Namespace) -> None:
                             ext_id,
                         )
 
+                        t_nlg_start = time.perf_counter()
+
+
+                        logger.warning(
+            "RESULT DEBUG | has_ctx=%s ctx=%r",
+            hasattr(result, "compressed_context"),
+            getattr(result, "compressed_context", None),
+        )
+                                
+
                         expl = pipeline.xai_layer.generate_nlg(
                             base=_base_expl,
-                            match_context=_sem_state
+                            match_context=_sem_state,
+                            compressed_context=_compressed_ctx,
                         )
+
+                    
+                        nlg_latency_ms = (time.perf_counter() - t_nlg_start) * 1000
 
                         result.nlg_summary = expl.nlg_summary
 
@@ -1084,10 +1184,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
                             result.top_contributions = expl.top_contributions
 
                         logger.info(
-                            "LLM success | player=%s engine=%s len=%d",
+                            "LLM success | player=%s engine=%s len=%d nlg_ms=%.0f",
                             ext_id,
                             expl.nlg_engine,
                             len(expl.nlg_summary or ""),
+                            nlg_latency_ms,
                         )
 
                 except Exception as exc:
@@ -1181,8 +1282,13 @@ def cmd_serve(args: argparse.Namespace) -> None:
                     )
                 ],
                 "latency_ms": round(
-                    latency_ms,
+                    inference_latency_ms,
                     2,
+                ),
+                "inference_latency_ms": round(inference_latency_ms, 2),
+                "nlg_latency_ms": round(nlg_latency_ms, 2),
+                "end_to_end_latency_ms": round(
+                    inference_latency_ms + nlg_latency_ms, 2
                 ),
                 "ts": datetime.now(tz=timezone.utc).isoformat(),
                 "gate_windows": gate_counts[ext_id],
@@ -1196,11 +1302,12 @@ def cmd_serve(args: argparse.Namespace) -> None:
             _inference_log_fh.write(json.dumps(alert_payload) + "\n")
 
             logger.info(
-                "ALERT player=%-6s type=%-20s conf=%.2f latency=%.1f ms engine=%s",
+                "ALERT player=%-6s type=%-20s conf=%.2f infer=%.1f ms nlg=%.0f ms engine=%s",
                 ext_id,
                 result.recommendation_type,
                 result.confidence,
-                latency_ms,
+                inference_latency_ms,
+                nlg_latency_ms,
                 getattr(
                     result,
                     "nlg_engine",
@@ -1254,36 +1361,36 @@ def _restore_serve_state(pipeline, path: Path) -> None:
         pid = int(pid_str)
         # Re-register player
         pipeline.register_player(
-            player_id   = pid,
-            external_id = ps["external_id"],
-            name        = ps.get("name", ""),
-            position    = ps.get("position", "CM"),
-            age         = ps.get("age", 25),
-            age_group   = ps.get("age_group", "Senior"),
+            player_id=pid,
+            external_id=ps["external_id"],
+            name=ps.get("name", ""),
+            position=ps.get("position", "CM"),
+            age=ps.get("age", 25),
+            age_group=ps.get("age_group", "Senior"),
         )
         # Restore baseline
         b = ps.get("baseline")
         if b:
             baseline = PlayerBaselineProfile(
-                player_id           = pid,
-                external_id         = ps["external_id"],
-                window_days         = b.get("window_days", 28),
-                computed_at         = datetime.now(tz=_tz.utc),
-                n_sessions          = b.get("n_sessions", 0),
-                distance_mean       = b.get("distance_mean", 0.0),
-                distance_std        = b.get("distance_std", 1.0),
-                sprint_count_mean   = b.get("sprint_count_mean", 0.0),
-                sprint_count_std    = b.get("sprint_count_std", 1.0),
-                top_speed_mean      = b.get("top_speed_mean", 0.0),
-                top_speed_std       = b.get("top_speed_std", 1.0),
-                high_speed_dist_mean= b.get("high_speed_dist_mean", 0.0),
-                high_speed_dist_std = b.get("high_speed_dist_std", 1.0),
-                fatigue_alpha       = b.get("fatigue_alpha"),
-                fatigue_beta        = b.get("fatigue_beta"),
-                fatigue_r_squared   = b.get("fatigue_r_squared"),
-                avg_x               = b.get("avg_x"),
-                avg_y               = b.get("avg_y"),
-                position_std_radius = b.get("position_std_radius"),
+                player_id=pid,
+                external_id=ps["external_id"],
+                window_days=b.get("window_days", 28),
+                computed_at=datetime.now(tz=_tz.utc),
+                n_sessions=b.get("n_sessions", 0),
+                distance_mean=b.get("distance_mean", 0.0),
+                distance_std=b.get("distance_std", 1.0),
+                sprint_count_mean=b.get("sprint_count_mean", 0.0),
+                sprint_count_std=b.get("sprint_count_std", 1.0),
+                top_speed_mean=b.get("top_speed_mean", 0.0),
+                top_speed_std=b.get("top_speed_std", 1.0),
+                high_speed_dist_mean=b.get("high_speed_dist_mean", 0.0),
+                high_speed_dist_std=b.get("high_speed_dist_std", 1.0),
+                fatigue_alpha=b.get("fatigue_alpha"),
+                fatigue_beta=b.get("fatigue_beta"),
+                fatigue_r_squared=b.get("fatigue_r_squared"),
+                avg_x=b.get("avg_x"),
+                avg_y=b.get("avg_y"),
+                position_std_radius=b.get("position_std_radius"),
             )
             pipeline.pattern_engine._baselines[pid] = baseline
             pipeline.pattern_engine._position_buffers[pid] = []
@@ -1308,7 +1415,9 @@ def _restore_serve_state(pipeline, path: Path) -> None:
                     t, inner_tracker_cls=DynamicThresholdTracker
                 )
                 pipeline.pattern_engine._threshold_trackers[pid] = store
-                pipeline.pattern_engine.inference_engine._threshold_trackers[pid] = store
+                pipeline.pattern_engine.inference_engine._threshold_trackers[pid] = (
+                    store
+                )
             except Exception as exc:
                 logger.debug("Could not restore threshold for player %d: %s", pid, exc)
 
@@ -1362,18 +1471,18 @@ def _save_serve_state(pipeline, path: Path) -> None:
             # Must read from inference_engine — that is where InferenceEngine.train()
             # writes calibrated thresholds. pattern_engine._threshold_trackers is
             # never populated during training so it is always empty at save time.
-            tracker = pipeline.pattern_engine.inference_engine._threshold_trackers.get(pid)
-
+            tracker = pipeline.pattern_engine.inference_engine._threshold_trackers.get(
+                pid
+            )
 
             # Save SHAP background windows for AE explainability
             seq_bg = player_info.get("sequence_background")
 
             if seq_bg is not None:
                 try:
-                    ps["sequence_background"] = (
-                        np.asarray(seq_bg, dtype=np.float32)[:50]
-                        .tolist()
-                    )
+                    ps["sequence_background"] = np.asarray(seq_bg, dtype=np.float32)[
+                        :50
+                    ].tolist()
                 except Exception as exc:
                     logger.debug(
                         "Could not serialize sequence background for player %d: %s",
@@ -1381,12 +1490,15 @@ def _save_serve_state(pipeline, path: Path) -> None:
                         exc,
                     )
 
-
             if tracker and isinstance(tracker, RegimeAwareThresholdStore):
                 try:
                     ps["threshold_tracker"] = tracker.state_dict()
                 except Exception as exc:
-                    logger.debug("Could not serialize threshold tracker for player %d: %s", pid, exc)
+                    logger.debug(
+                        "Could not serialize threshold tracker for player %d: %s",
+                        pid,
+                        exc,
+                    )
 
             state["players"][str(pid)] = ps
 
@@ -1432,7 +1544,10 @@ def cmd_audit(args: argparse.Namespace) -> None:
     logger.info("Inference log loaded: %d records", len(inference_df))
 
     # Required columns for fairness audit
-    if "is_anomaly" not in inference_df.columns and "recommendation_type" in inference_df.columns:
+    if (
+        "is_anomaly" not in inference_df.columns
+        and "recommendation_type" in inference_df.columns
+    ):
         # Derive is_anomaly from recommendation_type (any non-null = anomaly)
         inference_df["is_anomaly"] = inference_df["recommendation_type"].notna()
 
@@ -1450,12 +1565,16 @@ def cmd_audit(args: argparse.Namespace) -> None:
     if "full_name" in players_df.columns and "name" not in players_df.columns:
         players_df = players_df.rename(columns={"full_name": "name"})
 
-    from feedback.recalibration import FairnessMonitor, FeedbackStore, RecalibrationPipeline
+    from feedback.recalibration import (
+        FairnessMonitor,
+        FeedbackStore,
+        RecalibrationPipeline,
+    )
     from config.settings import CONFIG
 
     monitor = FairnessMonitor()
     audit_results = monitor.audit(inference_df, players_df)
-    report_text   = monitor.generate_audit_report(audit_results)
+    report_text = monitor.generate_audit_report(audit_results)
 
     print(report_text)
 
@@ -1467,28 +1586,32 @@ def cmd_audit(args: argparse.Namespace) -> None:
     override_count = 0
     if "decision" in inference_df.columns:
         from feedback.recalibration import OverrideRecord
+
         for _, row in inference_df[inference_df["decision"] == "override"].iterrows():
             from datetime import timezone as _tz
+
             record = OverrideRecord(
-                inference_id         = int(row.get("inference_id", 0)),
-                player_id            = int(row["player_id"]),
-                player_external_id   = str(row.get("external_id", "")),
-                session_id           = int(row.get("session_id", 0)),
-                recommendation_type  = str(row.get("recommendation_type", "")),
-                decision             = "override",
-                coach_id             = str(row.get("coach_id", "unknown")),
-                coach_note           = str(row.get("coach_note", "")),
-                overridden_at        = datetime.now(tz=_tz.utc),
-                context_snapshot     = row.get("feature_values", {}),
-                position             = str(row.get("position", "")),
-                age_group            = str(row.get("age_group", "")),
+                inference_id=int(row.get("inference_id", 0)),
+                player_id=int(row["player_id"]),
+                player_external_id=str(row.get("external_id", "")),
+                session_id=int(row.get("session_id", 0)),
+                recommendation_type=str(row.get("recommendation_type", "")),
+                decision="override",
+                coach_id=str(row.get("coach_id", "unknown")),
+                coach_note=str(row.get("coach_note", "")),
+                overridden_at=datetime.now(tz=_tz.utc),
+                context_snapshot=row.get("feature_values", {}),
+                position=str(row.get("position", "")),
+                age_group=str(row.get("age_group", "")),
             )
             feedback.log_override(record)
             override_count += 1
 
     logger.info("Override records in log: %d", override_count)
 
-    recal_results = recal_pipeline.run(feedback, player_models={}, trigger_reason="audit")
+    recal_results = recal_pipeline.run(
+        feedback, player_models={}, trigger_reason="audit"
+    )
     if recal_results:
         logger.info("Recalibration recommended:")
         for r in recal_results:
@@ -1498,29 +1621,29 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
     # Build structured output
     audit_output = {
-        "audited_at":       datetime.now(tz=timezone.utc).isoformat(),
-        "n_inferences":     len(inference_df),
-        "n_overrides":      override_count,
+        "audited_at": datetime.now(tz=timezone.utc).isoformat(),
+        "n_inferences": len(inference_df),
+        "n_overrides": override_count,
         "recalibration_needed": len(recal_results) > 0,
-        "bias_detected":    any(r.is_biased for r in audit_results),
-        "biased_groups":    [g for r in audit_results for g in r.biased_groups],
-        "audit_results":    [
+        "bias_detected": any(r.is_biased for r in audit_results),
+        "biased_groups": [g for r in audit_results for g in r.biased_groups],
+        "audit_results": [
             {
-                "attribute":          r.attribute,
-                "is_biased":          r.is_biased,
+                "attribute": r.attribute,
+                "is_biased": r.is_biased,
                 "squad_avg_flag_rate": r.squad_avg_flag_rate,
-                "biased_groups":      r.biased_groups,
-                "group_results":      r.group_results,
+                "biased_groups": r.biased_groups,
+                "group_results": r.group_results,
                 "action_recommended": r.action_recommended,
             }
             for r in audit_results
         ],
         "recalibration_results": [
             {
-                "player_id":   r.player_id,
-                "reason":      r.trigger_reason,
+                "player_id": r.player_id,
+                "reason": r.trigger_reason,
                 "adjustments": r.adjustments,
-                "notes":       r.notes,
+                "notes": r.notes,
             }
             for r in recal_results
         ],
@@ -1545,95 +1668,129 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Players Data — IBM CIC Germany production ML pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Logging verbosity (stderr)")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity (stderr)",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── generate ──────────────────────────────────────────────────────────────
     p_gen = sub.add_parser("generate", help="Synthesise training data")
-    p_gen.add_argument("--data-dir",    default="data",   help="Output directory for CSVs")
-    p_gen.add_argument("--seasons",     type=int,   default=2)
-    p_gen.add_argument("--matchdays",   type=int,   default=38)
-    p_gen.add_argument("--anomaly-rate",type=float, default=0.05)
-    p_gen.add_argument("--no-corruption", action="store_true",
-                       help="Skip sensor corruption layer (faster, cleaner data)")
-    p_gen.add_argument("--quiet", action="store_true",
-                       help="Suppress per-position stats table")
+    p_gen.add_argument("--data-dir", default="data", help="Output directory for CSVs")
+    p_gen.add_argument("--seasons", type=int, default=2)
+    p_gen.add_argument("--matchdays", type=int, default=38)
+    p_gen.add_argument("--anomaly-rate", type=float, default=0.05)
+    p_gen.add_argument(
+        "--no-corruption",
+        action="store_true",
+        help="Skip sensor corruption layer (faster, cleaner data)",
+    )
+    p_gen.add_argument(
+        "--quiet", action="store_true", help="Suppress per-position stats table"
+    )
 
     # ── train ─────────────────────────────────────────────────────────────────
     p_tr = sub.add_parser("train", help="Train model and save checkpoint")
-    p_tr.add_argument("--data-dir",            default="data",   help="CSV source directory")
-    p_tr.add_argument("--model-dir",           default="models", help="Checkpoint output directory")
-    p_tr.add_argument("--sessions-per-player", type=int, default=60,
-                      help="Max sessions per player loaded for training")
-    p_tr.add_argument("--save-serve-state",    action="store_true",
-                      help="Save serve state (baselines, thresholds) for faster serving")
+    p_tr.add_argument("--data-dir", default="data", help="CSV source directory")
+    p_tr.add_argument(
+        "--model-dir", default="models", help="Checkpoint output directory"
+    )
+    p_tr.add_argument(
+        "--sessions-per-player",
+        type=int,
+        default=60,
+        help="Max sessions per player loaded for training",
+    )
+    p_tr.add_argument(
+        "--save-serve-state",
+        action="store_true",
+        help="Save serve state (baselines, thresholds) for faster serving",
+    )
 
     # ── evaluate ──────────────────────────────────────────────────────────────
     p_ev = sub.add_parser("evaluate", help="Score model against ground truth")
-    p_ev.add_argument("--data-dir",  default="data",              help="CSV source directory")
-    p_ev.add_argument("--model-dir", default="models",            help="Checkpoint directory")
-    p_ev.add_argument("--out",       default="metrics/eval.json", help="Metrics output file")
-    p_ev.add_argument("--min-auc",   type=float, default=0.60,
-                      help="Minimum acceptable mean ROC-AUC (exit 3 if below)")
+    p_ev.add_argument("--data-dir", default="data", help="CSV source directory")
+    p_ev.add_argument("--model-dir", default="models", help="Checkpoint directory")
+    p_ev.add_argument("--out", default="metrics/eval.json", help="Metrics output file")
+    p_ev.add_argument(
+        "--min-auc",
+        type=float,
+        default=0.60,
+        help="Minimum acceptable mean ROC-AUC (exit 3 if below)",
+    )
 
     # ── serve ─────────────────────────────────────────────────────────────────
-    p_sv = sub.add_parser("serve",
-                          help="Stream inference: stdin→events, stdout→alerts (NDJSON)")
-    p_sv.add_argument("--model-dir",         default="models", help="Checkpoint directory")
-    p_sv.add_argument("--min-alert-windows", type=int, default=3,
-                      help="Consecutive anomalous windows before emitting alert")
-    p_sv.add_argument("--max-latency-ms",    type=int, default=200,
-                      help="SLA threshold; violations are logged as warnings")
+    p_sv = sub.add_parser(
+        "serve", help="Stream inference: stdin→events, stdout→alerts (NDJSON)"
+    )
+    p_sv.add_argument("--model-dir", default="models", help="Checkpoint directory")
     p_sv.add_argument(
-    "--ignore-time-gaps",
-    action="store_true",
-    default=False,
-    help="Disable temporal gap reset in the accumulator. Use for batch/replay data "
-         "where inter-event gaps are expected (e.g. one row per session).",
-)
+        "--min-alert-windows",
+        type=int,
+        default=3,
+        help="Consecutive anomalous windows before emitting alert",
+    )
     p_sv.add_argument(
-    "--ignore-session-boundaries",
-    action="store_true",
-    default=False,
-    help="Disable session-boundary buffer reset in the accumulator. Use for "
-         "historical replay where events from multiple sessions are interleaved.",
-)
+        "--max-latency-ms",
+        type=int,
+        default=200,
+        help="SLA threshold; violations are logged as warnings",
+    )
     p_sv.add_argument(
-    "--replay-mode",
-    action="store_true",
-    default=False,
-    help="Replay-safe mode. Implies --ignore-time-gaps and --ignore-session-boundaries. "
-         "Historical replay streams frequently interleave events from distinct source "
-         "sessions; raw session_id transitions in these streams do not represent live "
-         "continuity boundaries and must not trigger accumulator resets.",
-)
+        "--ignore-time-gaps",
+        action="store_true",
+        default=False,
+        help="Disable temporal gap reset in the accumulator. Use for batch/replay data "
+        "where inter-event gaps are expected (e.g. one row per session).",
+    )
+    p_sv.add_argument(
+        "--ignore-session-boundaries",
+        action="store_true",
+        default=False,
+        help="Disable session-boundary buffer reset in the accumulator. Use for "
+        "historical replay where events from multiple sessions are interleaved.",
+    )
+    p_sv.add_argument(
+        "--replay-mode",
+        action="store_true",
+        default=False,
+        help="Replay-safe mode. Implies --ignore-time-gaps and --ignore-session-boundaries. "
+        "Historical replay streams frequently interleave events from distinct source "
+        "sessions; raw session_id transitions in these streams do not represent live "
+        "continuity boundaries and must not trigger accumulator resets.",
+    )
 
     # ── audit ─────────────────────────────────────────────────────────────────
     p_au = sub.add_parser("audit", help="Fairness audit + recalibration check")
-    p_au.add_argument("--log",      default="logs/inference_log.jsonl",
-                      help="Path to inference log (NDJSON or JSON array)")
-    p_au.add_argument("--data-dir", default="data",             help="CSV directory for player metadata")
-    p_au.add_argument("--out",      default="metrics/audit.json", help="Audit report output")
+    p_au.add_argument(
+        "--log",
+        default="logs/inference_log.jsonl",
+        help="Path to inference log (NDJSON or JSON array)",
+    )
+    p_au.add_argument(
+        "--data-dir", default="data", help="CSV directory for player metadata"
+    )
+    p_au.add_argument("--out", default="metrics/audit.json", help="Audit report output")
 
     return parser
 
 
 def main() -> None:
-    parser  = _build_parser()
-    args    = parser.parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
 
     _configure_logging(args.log_level)
     logger.info("Players Data pipeline | command=%s", args.command)
 
     dispatch = {
         "generate": cmd_generate,
-        "train":    cmd_train,
+        "train": cmd_train,
         "evaluate": cmd_evaluate,
-        "serve":    cmd_serve,
-        "audit":    cmd_audit,
+        "serve": cmd_serve,
+        "audit": cmd_audit,
     }
 
     try:

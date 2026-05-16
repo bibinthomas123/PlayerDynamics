@@ -60,8 +60,8 @@ from explainability.semantics_layer import (
     SemanticFinding,
     SemanticInterpreter,
     build_semantic_prompt_block,
-    interpret_explanation,
 )
+from analysis.episodic_context import CompressedTemporalContext
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +248,7 @@ class BaseExplanation:
     # Symbolic reasoning outputs
     # Filled AFTER build_semantic_findings() in orchestrator.
     semantic_findings:   Tuple[dict, ...] = ()
+    compressed_context: Optional[CompressedTemporalContext] = None
 
 # ─────────────────────────────────────────────
 # Counterfactual generator
@@ -365,22 +366,20 @@ class TemplateNLGEngine:
         action  = labels.get(recommendation_type, f"Performance anomaly — {player_name}")
         summary = f"{action} (confidence: {conf_pct}%). "
 
-        top_pos = sorted([c for c in top_contributions if c.shap_value > 0], key=lambda c: c.shap_value, reverse=True)[:3]
+        # SHAP sign = contribution to anomaly score, not physiological direction.
+        # Positive SHAP = raises anomaly likelihood; negative = lowers it.
+        # Do NOT label these "stabilizing" or "risk factors" — that conflates
+        # model-internal attribution with clinical interpretation.
+        anomaly_increasing = [c for c in top_contributions[:5] if c.shap_value > 0]
+        anomaly_decreasing = [c for c in top_contributions[:5] if c.shap_value < 0]
 
-        risk_factors      = [c for c in top_contributions[:5] if c.shap_value > 0]
-        protective_factors = [c for c in top_contributions[:5] if c.shap_value < 0]
+        if anomaly_increasing:
+            parts = [f"{c.human_label} ({c.formatted_value})" for c in anomaly_increasing[:3]]
+            summary += "Primary anomaly contributors: " + "; ".join(parts) + ". "
 
-        if risk_factors:
-            parts = [f"{c.human_label} ({c.formatted_value})" for c in risk_factors[:3]]
-            summary += "Primary anomaly drivers: " + "; ".join(parts) + ". "
-
-        if protective_factors:
-            parts = [f"{c.human_label} ({c.formatted_value})" for c in protective_factors[:2]]
-            summary += "Stabilizing signals: " + "; ".join(parts) + ". "
-        if top_pos:
-            parts = [f"{c.human_label} ({c.formatted_value})" for c in top_pos]
-            summary += "Primary factors: " + "; ".join(parts) + ". "
-
+        if anomaly_decreasing:
+            parts = [f"{c.human_label} ({c.formatted_value})" for c in anomaly_decreasing[:2]]
+            summary += "Anomaly-dampening signals: " + "; ".join(parts) + ". "
         if workload_status == "high_risk":
             summary += "Acute workload significantly exceeds chronic baseline — elevated injury risk. "
         elif workload_status == "low_readiness":
@@ -524,6 +523,47 @@ def format_match_state_prompt(state) -> str:
     return "\n".join(lines)
 
 
+def format_episodic_context(compressed_context) -> str:
+    """
+    Convert a CompressedTemporalContext into a prompt block for the LLM.
+ 
+    This supplements format_match_state_prompt() when episodic context is
+    available. Both can coexist in the same prompt:
+ 
+        semantic_block   = build_semantic_prompt_block(semantic_findings)
+        state_block      = format_match_state_prompt(semantic_state)
+        episodic_block   = format_episodic_context(compressed_context)
+ 
+        full_prompt = semantic_block + "\\n\\n" + state_block + "\\n\\n" + episodic_block
+ 
+    The episodic block communicates match evolution — what happened earlier,
+    how it evolved, and which prior episodes are relevant to now. The LLM
+    receives this as pre-computed symbolic context; it does NOT re-reason.
+ 
+    Returns empty string if context is None or empty.
+    """
+    if compressed_context is None or compressed_context.is_empty():
+        return ""
+    try:
+        block = compressed_context.to_prompt_block()
+
+        logger.warning(
+        "TO_PROMPT_BLOCK OUTPUT:\n%s",
+        compressed_context.to_prompt_block(),
+    )
+        
+
+        if not block:
+            return ""
+        return (
+            "\nMatch history context "
+            "(pre-computed by symbolic engine — narrate only, do not re-reason):\n"
+            + block
+        )
+    except Exception:
+        return ""
+ 
+ 
 _NLG_CIRCUIT_BREAKER_S = float(os.getenv("NLG_CIRCUIT_BREAKER_SECONDS", "30"))
 
 
@@ -664,15 +704,17 @@ class LLMNLGEngine:
         # ── Main generate ─────────────────────────────────────────────────────────
 
     def generate(
-            self,
-            recommendation_type: str,
-            confidence: float,
-            player_name: str,
-            top_contributions: List[FeatureContribution],
-            workload_status: str = "optimal",
-            match_context: str = "",
-            semantic_findings: Optional[List[SemanticFinding]] = None,
-        ) -> Tuple[str, str, float]:
+        self,
+        recommendation_type: str,
+        confidence: float,
+        player_name: str,
+        top_contributions,           # List[FeatureContribution]
+        workload_status: str = "optimal",
+        match_context: str = "",
+        semantic_findings: Optional[List[SemanticFinding]] = None,
+        compressed_context: Optional[CompressedTemporalContext] = None
+    ):
+            
             """
             Returns (summary_text, engine_name, uncertainty).
 
@@ -706,34 +748,76 @@ class LLMNLGEngine:
                 return _template_response("ollama_unavailable")
 
             # ── Build prompt block ────────────────────────────────────────────
+            # Always compose both layers when available.
+            # Prior code was an exclusive if/else: when semantic_findings were
+            # present the SHAP lines were dropped entirely, so the LLM had no
+            # signal-level grounding. When findings were absent (window 1, before
+            # persistence threshold) only raw SHAP appeared, producing shallow
+            # paraphrases. Now both are merged so the LLM always has evidence.
+            prompt_parts: list[str] = []
+
             if semantic_findings:
-                # New semantic path: LLM receives symbolic findings, not raw SHAP
-                semantic_block = build_semantic_prompt_block(semantic_findings)
-            else:
-                # Legacy path: raw SHAP feature lines (backward compat)
+                # Primary layer: symbolic findings (pre-reasoned by semantic engine)
+                prompt_parts.append(build_semantic_prompt_block(semantic_findings))
+
+            # Fallback layer: when the quality gate suppressed symbolic findings,
+            # show observed values only. Attribution directions are intentionally
+            # stripped — they caused the LLM to infer clinical states from SHAP sign.
+            if not semantic_findings:
+                # Degraded-window fallback: telemetry quality gate suppressed symbolic findings.
+                # We show observed feature values only — NOT attribution directions.
+                # Giving the LLM "decreases anomaly likelihood" in this context causes it to
+                # infer clinical improvement (e.g. "improved HR response") despite the disclaimer.
+                # The safest fallback is to describe what the model flagged without giving the
+                # LLM any directional signal it can map to physiology.
                 feature_lines = "\n".join(
-                    (
-                        f"• Feature: {FEATURE_SEMANTICS.get(c.feature_name, c.human_label)} | "
-                        f"Observed: {c.formatted_value} | "
-                        f"Attribution: {'anomaly-driving' if c.shap_value > 0 else 'stabilizing'} | "
-                        f"Effect size: {c.shap_value:+.3f}"
-                    )
+                    f"• {FEATURE_SEMANTICS.get(c.feature_name, c.human_label)}: {c.formatted_value}"
                     for c in top_contributions[:5]
                 )
-                semantic_block = (
-                    "Contributing signals (raw attribution):\n"
-                    + (feature_lines or "  (no significant features)")
-                )
+                if feature_lines:
+                    prompt_parts.append(
+                        "Observed signals at time of anomaly flag "
+                        "(symbolic interpretation unavailable — telemetry quality degraded):\n"
+                        + feature_lines
+                        + "\n\nNote: Report only what was observed. "
+                        "Do not infer physiological direction or clinical meaning from these values."
+                    )
+
+            semantic_block = (
+                "\n\n".join(prompt_parts)
+                if prompt_parts
+                else "  (no significant features)"
+            )
 
             context_block = _build_context_block(match_context)
 
-            prompt = _LLM_PROMPT_TEMPLATE.format(
-                player_name=player_name,
-                recommendation_type=recommendation_type,
-                conf_pct=int(confidence * 100),
-                workload_status=workload_status,
-                semantic_block=semantic_block,
-            ) + context_block
+            # ── Episodic context block ────────────────────────────────────────────────
+            episodic_block = ""
+            if compressed_context and not compressed_context.is_empty():
+                try:
+                    episodic_block = format_episodic_context(compressed_context)
+                except Exception as e:
+                    logger.exception(
+                        "Failed to format episodic context: %s",
+                        e,
+                    )
+                    episodic_block = ""
+            logger.warning(
+                    "EPISODIC BLOCK:\n%s",
+                    episodic_block,
+                )
+            prompt = (
+                _LLM_PROMPT_TEMPLATE.format(
+                    player_name=player_name,
+                    recommendation_type=recommendation_type,
+                    conf_pct=int(confidence * 100),
+                    workload_status=workload_status,
+                    semantic_block=semantic_block,
+                )
+                + context_block
+                + episodic_block
+            )
+
 
             t0 = time.perf_counter()
             try:
@@ -744,6 +828,10 @@ class LLMNLGEngine:
                     temperature=0.15,
                     timeout_s=self._timeout_s,
                     use_cache=True,
+                )
+                logger.warning(
+                    "LLM PROMPT:\n%s",
+                    prompt,
                 )
                 elapsed_ms = (time.perf_counter() - t0) * 1000
                 text = resp.text.strip()
@@ -880,17 +968,25 @@ class XAILayer:
         self,
         base: "BaseExplanation",
         match_state=None,
+        compressed_context: Optional[CompressedTemporalContext] = None
     ) -> "SHAPExplanation":
         """
         Final narrative generation stage.
-
-        Match state is injected AFTER symbolic findings
-        have already updated longitudinal memory.
+ 
+        Match state and compressed episodic context are both injected AFTER
+        symbolic findings have updated longitudinal memory.
+ 
+        compressed_context, when provided, is a CompressedTemporalContext built
+        by MatchState.build_compressed_context(). It is appended to the LLM
+        prompt as a pre-reasoned match history block. The LLM narrates it;
+        it does not re-reason from it.
         """
         return self.generate_nlg(
             base=base,
             match_context=match_state,
+            compressed_context=compressed_context
         )
+
 
     def build_base_explanation(
         self,
@@ -997,7 +1093,8 @@ class XAILayer:
     def generate_nlg(
         self,
         base: "BaseExplanation",
-        match_context=None,  # Optional[SemanticMatchState]
+        match_context=None,          # Optional[SemanticMatchState]
+        compressed_context=None,     # Optional[CompressedTemporalContext]  ← NEW
     ) -> SHAPExplanation:
         """
         Async path: LLM narrative generation only.
@@ -1006,15 +1103,15 @@ class XAILayer:
         Deserializes semantic_findings from BaseExplanation for the NLG call.
         """
         from explainability.semantics_layer import SemanticFinding as _SF
-
+ 
         # Convert SemanticMatchState → prompt string. None → empty string.
         try:
             match_context_str = format_match_state_prompt(match_context) if match_context is not None else ""
         except Exception:
             match_context_str = ""
-
+ 
         # Reconstruct SemanticFinding objects from serialized dicts stored in BaseExplanation
-        semantic_findings_objs: List[SemanticFinding] = []
+        semantic_findings_objs = []
         for fd in base.semantic_findings:
             try:
                 semantic_findings_objs.append(
@@ -1033,7 +1130,7 @@ class XAILayer:
                 )
             except Exception as exc:
                 logger.warning("Failed to deserialize SemanticFinding: %s", exc)
-
+ 
         nlg_summary, nlg_engine, uncertainty = self._llm_nlg.generate(
             recommendation_type=base.recommendation_type,
             confidence=base.confidence,
@@ -1042,8 +1139,9 @@ class XAILayer:
             workload_status=base.workload_status,
             match_context=match_context_str,
             semantic_findings=semantic_findings_objs or None,
+            compressed_context=compressed_context,   # ← NEW
         )
-
+ 
         return SHAPExplanation(
             player_id=base.player_id,
             external_id=base.external_id,

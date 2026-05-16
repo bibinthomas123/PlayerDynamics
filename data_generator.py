@@ -1575,7 +1575,7 @@ def _make_annotation(player, sid, dur_min, date, is_anomaly,
     if not (is_anomaly or r.random() < 0.20):
         return None
     if is_anomaly and anomaly_type == "fatigue":
-        sev = float(r.uniform(0.45, 0.75)); val = "moderate" if sev > 0.6 else "mild"
+        sev = float(r.uniform(0.45, 0.75)); val = "medium" if sev > 0.6 else "mild"
         ann = "fatigue_flag"
     elif is_congested and fatigue.level > 0.4:
         sev = float(r.uniform(0.25, 0.55)); val = "mild"; ann = "fatigue_flag"
