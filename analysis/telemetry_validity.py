@@ -31,9 +31,10 @@ class TelemetryValidityLayer:
     Analyzes raw event streams for physical plausibility and sensor health.
     Prevents corrupted data from poisoning adaptive calibration.
     """
-    def __init__(self):
+    def __init__(self, replay_mode: bool = False):
         # Per-player health tracking
         self._player_health: Dict[int, Dict[str, Any]] = {}
+        self.replay_mode = replay_mode
 
         # Physical constants for plausibility checks
         self.MAX_SPEED_MS = 13.5        # ~48 km/h - elite sprint peak (Mbappe-class burst)
@@ -108,11 +109,29 @@ class TelemetryValidityLayer:
                 try:
                     dt = (ts - prev_ts).total_seconds()
                     if dt <= 0:
-                        issues.append("non_monotonic_timestamp")
-                        confidence = 0.0
+                        if self.replay_mode:
+                            # Timestamp reversals are expected in replay streams
+                            # (interleaved sessions replayed at CPU speed).
+                            # Degrade rather than invalidate so inference is not
+                            # silently dropped. Use a distinct issue marker so
+                            # audit/evaluation can distinguish replay disorder
+                            # from genuine live sensor corruption.
+                            issues.append("replay_non_monotonic_timestamp")
+                            confidence = min(confidence, 0.7)
+                        else:
+                            issues.append("non_monotonic_timestamp")
+                            confidence = 0.0
                     elif dt > 5.0:
-                        issues.append(f"timestamp_gap_{dt:.2f}s")
-                        confidence -= 0.3
+                        if self.replay_mode:
+                            # Large forward gaps are expected in replay streams
+                            # (consecutive events may be days/seasons apart).
+                            # No confidence penalty — this is stream ordering,
+                            # not a sensor failure. Distinct marker preserves
+                            # audit separability from live gap events.
+                            issues.append(f"replay_timestamp_gap_{dt:.2f}s")
+                        else:
+                            issues.append(f"timestamp_gap_{dt:.2f}s")
+                            confidence -= 0.3
                 except Exception:
                     pass  # incompatible types — skip
             self._update_ts(player_id, ts)
@@ -126,14 +145,21 @@ class TelemetryValidityLayer:
             status = TelemetryStatus.VALID
  
         if status != TelemetryStatus.VALID:
-            logger.warning(
-                "Telemetry degraded | player=%d | status=%s | issues=%s",
-                player_id,
-                status.name,
-                issues,
-            )
-
-    
+            # Separate genuine live issues from expected replay noise.
+            # Only live issues warrant a WARNING — replay gaps and timestamp
+            # reversals are structural properties of the replay stream, not
+            # sensor failures, and must not pollute the operator warning channel.
+            live_issues = [i for i in issues if not i.startswith("replay_")]
+            if live_issues:
+                logger.warning(
+                    "Telemetry degraded | player=%d | status=%s | issues=%s",
+                    player_id, status.name, live_issues,
+                )
+            else:
+                logger.debug(
+                    "Telemetry degraded | player=%d | status=%s | issues=%s",
+                    player_id, status.name, issues,
+                )
         
         return ValidityMetrics(
             status=status,
@@ -143,6 +169,17 @@ class TelemetryValidityLayer:
             plausibility_score=confidence,
             issues=issues
         )
+
+    def reset_player(self, player_id: int) -> None:
+        """Clear all per-player temporal state (call on session boundary reset).
+
+        _player_health[player_id] is the single dict that holds all mutable
+        per-player tracking — currently only "last_ts". Dropping the whole
+        entry is safe and future-proof: if new keys are added to the dict
+        later they are cleared automatically rather than silently carrying
+        stale values into the next session.
+        """
+        self._player_health.pop(player_id, None)
 
     def _get_prev_ts(self, player_id: int) -> Optional[float]:
         return self._player_health.get(player_id, {}).get("last_ts")

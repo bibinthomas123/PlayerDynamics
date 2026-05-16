@@ -127,10 +127,10 @@ class LiveWindowAccumulator:
         # Per-player state init
         # ─────────────────────────────────────────────
         if player_id not in self._buffers:
-            logger.info(
-                "ACCUMULATOR INIT | player=%s",
-                player_id,
-            )
+            # logger.info(
+            #     "ACCUMULATOR INIT | player=%s",
+            #     player_id,
+            # )
 
             self._buffers[player_id] = deque(maxlen=self.window_size)
             self._events_seen[player_id] = 0
@@ -248,14 +248,14 @@ class LiveWindowAccumulator:
         self._events_seen[player_id] += 1
 
         # Debug visibility
-        if len(buf) in (1, 5, 10, 15, 20, self.window_size):
-            logger.info(
-                "BUFFER STATUS | player=%s size=%d/%d session=%s",
-                player_id,
-                len(buf),
-                self.window_size,
-                incoming_session,
-            )
+        # if len(buf) in (1, 5, 10, 15, 20, self.window_size):
+            # logger.info(
+            #     "BUFFER STATUS | player=%s size=%d/%d session=%s",
+            #     player_id,
+            #     len(buf),
+            #     self.window_size,
+            #     incoming_session,
+            # )
 
         # Not enough events yet
         if len(buf) < self.window_size:
@@ -281,13 +281,13 @@ class LiveWindowAccumulator:
 
         self._windows_emitted[player_id] += 1
 
-        logger.info(
-            "WINDOW EMIT | player=%s size=%d " "total_windows=%d total_events=%d",
-            player_id,
-            len(window),
-            self._windows_emitted[player_id],
-            self._events_seen[player_id],
-        )
+        # logger.info(
+        #     "WINDOW EMIT | player=%s size=%d " "total_windows=%d total_events=%d",
+        #     player_id,
+        #     len(window),
+        #     self._windows_emitted[player_id],
+        #     self._events_seen[player_id],
+        # )
 
         return window
 

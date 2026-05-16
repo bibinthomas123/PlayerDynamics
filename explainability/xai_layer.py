@@ -65,7 +65,7 @@ from explainability.semantics_layer import (
 
 logger = logging.getLogger(__name__)
 
-_NLG_TIMEOUT_S = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", 0.1))
+_NLG_TIMEOUT_S = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", "60.0"))
 
 # ─────────────────────────────────────────────
 # Feature registry
@@ -524,6 +524,9 @@ def format_match_state_prompt(state) -> str:
     return "\n".join(lines)
 
 
+_NLG_CIRCUIT_BREAKER_S = float(os.getenv("NLG_CIRCUIT_BREAKER_SECONDS", "30"))
+
+
 class LLMNLGEngine:
     """
     NLG engine backed by qwen2.5:14b running on local Ollama.
@@ -534,6 +537,21 @@ class LLMNLGEngine:
     When semantic_findings are provided, the prompt is built from symbolic
     findings (SemanticFinding objects) rather than raw SHAP feature lines.
     The LLM acts as narrator/communicator only — reasoning lives in semantic_layer.py.
+
+    Circuit breaker
+    ───────────────
+    After a timeout the engine enters degraded mode for NLG_CIRCUIT_BREAKER_SECONDS
+    (default 30 s).  During that window all NLG calls are served immediately by
+    TemplateNLGEngine without touching Ollama.  This prevents cancellation storms:
+    the pattern where every timed-out request triggers a new Ollama runner startup,
+    partial graph allocation, cancellation, and teardown.
+
+    Model warm state
+    ────────────────
+    Call warmup() once during startup (before the serve loop) to force Ollama to
+    fully load the model into memory.  Without this, the first N requests race
+    model loading against the NLG timeout and are reliably cancelled (HTTP 499 /
+    context canceled), which is operationally different from Ollama being unavailable.
     """
 
     def __init__(
@@ -541,15 +559,21 @@ class LLMNLGEngine:
         timeout_s: float = _NLG_TIMEOUT_S,
         model: str = "qwen2.5:14b",
         max_tokens: int = 150,
+        circuit_breaker_s: float = _NLG_CIRCUIT_BREAKER_S,
     ) -> None:
-        self._timeout_s   = timeout_s
-        self._model       = model
-        self._max_tokens  = max_tokens
-        self._fallback    = TemplateNLGEngine()
-        self._client      = None          # lazy: import inside generate to avoid startup crash
-        self._client_lock = threading.Lock()
+        self._timeout_s          = timeout_s
+        self._model              = model
+        self._max_tokens         = max_tokens
+        self._circuit_breaker_s  = circuit_breaker_s
+        self._fallback           = TemplateNLGEngine()
+        self._client             = None          # lazy: import inside generate to avoid startup crash
+        self._client_lock        = threading.Lock()
         self._available: Optional[bool] = None   # None = not yet probed
-        self._last_probe_ts: float = 0.0
+        self._last_probe_ts: float      = 0.0
+
+        # Circuit breaker state
+        self._circuit_open: bool  = False        # True = degraded mode, skip Ollama
+        self._circuit_open_until: float = 0.0   # monotonic timestamp
 
     # ── Lazy client init ──────────────────────────────────────────────────────
     _REPROBE_INTERVAL_S = 30.0  # re-check Ollama every 30 s after a failure
@@ -588,18 +612,54 @@ class LLMNLGEngine:
 
                 if not self._available:
                     logger.warning(
-                        "LLMNLGEngine: Ollama unavailable or model '%s' not loaded. "
-                        "Using template fallback.",
-                        self._model,
+                        "LLMNLGEngine: Ollama unreachable or model '%s' not found. "
+                        "Using template fallback. "
+                        "Hint: run `ollama pull %s` and ensure Ollama is running.",
+                        self._model, self._model,
                     )
 
                 else:
                     logger.info(
-                        "LLMNLGEngine: Ollama available, model '%s' loaded.",
+                        "LLMNLGEngine: Ollama available, model '%s' registered.",
                         self._model,
                     )
 
             return self._client, self._available
+
+    def warmup(self) -> bool:
+        """
+        Pre-load the model into Ollama memory before the serve loop starts.
+
+        Delegates to OllamaClient.warmup().  Call once synchronously during
+        startup.  If warmup fails the engine continues normally with template
+        fallback — it is never a hard error.
+        """
+        client, available = self._get_client()
+        if not available or client is None:
+            return False
+        return client.warmup(model=self._model, timeout_s=30.0)
+
+    # ── Circuit breaker helpers ───────────────────────────────────────────────
+
+    def _circuit_is_open(self) -> bool:
+        if not self._circuit_open:
+            return False
+        if time.monotonic() >= self._circuit_open_until:
+            self._circuit_open = False
+            logger.info(
+                "LLMNLGEngine: circuit breaker reset — resuming Ollama NLG calls"
+            )
+            return False
+        return True
+
+    def _trip_circuit(self) -> None:
+        self._circuit_open       = True
+        self._circuit_open_until = time.monotonic() + self._circuit_breaker_s
+        logger.warning(
+            "LLMNLGEngine: circuit breaker tripped — "
+            "switching to template NLG for %.0f s to prevent cancellation storm",
+            self._circuit_breaker_s,
+        )
 
         # ── Main generate ─────────────────────────────────────────────────────────
 
@@ -620,10 +680,13 @@ class LLMNLGEngine:
             built from symbolic findings via build_semantic_prompt_block().
             Otherwise falls back to the legacy raw-SHAP feature_lines format for
             backward compatibility.
-            """
-            client, available = self._get_client()
 
-            if not available or client is None:
+            NLG is always opportunistic: if Ollama is unavailable, the circuit
+            breaker is open, or the call exceeds the SLA timeout, TemplateNLGEngine
+            is used transparently.  The calling inference path is never blocked.
+            """
+            def _template_response(reason: str) -> Tuple[str, str, float]:
+                logger.debug("LLMNLGEngine: using template (%s)", reason)
                 return (
                     self._fallback.generate(
                         recommendation_type, confidence, player_name,
@@ -632,6 +695,15 @@ class LLMNLGEngine:
                     "template",
                     0.0,
                 )
+
+            # Fast path: circuit open or Ollama known unavailable
+            if self._circuit_is_open():
+                return _template_response("circuit_open")
+
+            client, available = self._get_client()
+
+            if not available or client is None:
+                return _template_response("ollama_unavailable")
 
             # ── Build prompt block ────────────────────────────────────────────
             if semantic_findings:
@@ -688,17 +760,24 @@ class LLMNLGEngine:
 
             except Exception as exc:
                 elapsed_ms = (time.perf_counter() - t0) * 1000
-                logger.warning(
-                    "LLMNLGEngine fallback (%.0f ms): %s", elapsed_ms, exc
-                )
-                return (
-                    self._fallback.generate(
-                        recommendation_type, confidence, player_name,
-                        top_contributions, workload_status, semantic_findings,
-                    ),
-                    "template",
-                    0.0,
-                )
+                # Distinguish timeout (SLA tradeoff) from genuine unavailability.
+                # Both result in template fallback, but they signal different things
+                # operationally: timeout means the model IS running but we chose not
+                # to wait; unavailable means the infrastructure is down.
+                exc_str = str(exc)
+                if "timeout" in exc_str.lower() or "timed out" in exc_str.lower():
+                    logger.debug(
+                        "LLMNLGEngine: NLG timeout after %.0f ms (SLA tradeoff, not an error) "
+                        "— template fallback activated",
+                        elapsed_ms,
+                    )
+                    self._trip_circuit()
+                else:
+                    logger.warning(
+                        "LLMNLGEngine: NLG unavailable (%.0f ms): %s — template fallback",
+                        elapsed_ms, exc,
+                    )
+                return _template_response(f"exception_{type(exc).__name__}")
 
 
 # ─────────────────────────────────────────────
@@ -734,6 +813,15 @@ class XAILayer:
     TemplateNLGEngine if Ollama is unavailable or the call exceeds the SLA.
     The engine used is recorded in SHAPExplanation.nlg_engine.
 
+    NLG is always asynchronous / opportunistic with respect to inference:
+    the inference path (model inference → attribution → alert decision) never
+    blocks on NLG generation.  If Ollama is slow or the circuit breaker is open,
+    TemplateNLGEngine is used sub-millisecond.
+
+    Startup: call warmup_nlg() once before the serve loop to pre-load the model
+    into Ollama memory.  Without this, the first N requests race model loading
+    against the NLG timeout and are reliably cancelled (HTTP 499 / context canceled).
+
     Semantic strategy (v2 — decoupled):
     Semantic interpretation is NOT performed inside this class on any direct
     explain path.  The orchestrator calls build_semantic_findings() after
@@ -751,6 +839,15 @@ class XAILayer:
         self._llm_nlg            = LLMNLGEngine(timeout_s=nlg_timeout_s)
         self._template_nlg       = TemplateNLGEngine()
         self._semantic_interp    = SemanticInterpreter()
+
+    def warmup_nlg(self) -> bool:
+        """
+        Pre-load the Ollama model before the serve loop starts.
+
+        Call once synchronously during startup.  Returns True if the model
+        loaded successfully.  Failure is non-fatal — template NLG continues.
+        """
+        return self._llm_nlg.warmup()
 
     def register_explainer(self, model, background_data: np.ndarray) -> None:
         """Register background data for a player. Call once after model training."""

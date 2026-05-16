@@ -310,10 +310,10 @@ class MatchState:
                         telemetry_confidence,
                     )
 
-                logger.info(
-                    "ANOMALY TRAJECTORY LEN=%d",
-                    len(self.recent_anomaly_scores),
-                )
+                # logger.info(
+                #     "ANOMALY TRAJECTORY LEN=%d",
+                #     len(self.recent_anomaly_scores),
+                #)
             
     # ─────────────────────────────────────────────
     # Layer 2: Finding memory — producer interface
@@ -1411,12 +1411,12 @@ class MatchStateManager:
 
             mid = match_id
             key = (player_id, mid)
-            logger.info(
-                    "MATCH STATE KEY | player=%s match=%s existing=%s",
-                    player_id,
-                    mid,
-                    key in self._states,
-        )
+        #     logger.info(
+        #             "MATCH STATE KEY | player=%s match=%s existing=%s",
+        #             player_id,
+        #             mid,
+        #             key in self._states,
+        # )
             if key not in self._states:
                 self._states[key] = MatchState(
                     player_id=player_id,

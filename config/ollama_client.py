@@ -17,10 +17,12 @@ Features
 
 Environment variables
 ─────────────────────
-  OLLAMA_BASE_URL   default: http://localhost:11434
-  OLLAMA_TIMEOUT_S  default: 30          (hard per-request timeout)
-  OLLAMA_NLG_TIMEOUT_S  default: 2       (tight SLA for serve-mode NLG)
-  OLLAMA_RETRIES    default: 2
+  OLLAMA_BASE_URL       default: http://localhost:11434
+  OLLAMA_TIMEOUT_S      default: 30          (hard per-request timeout)
+  OLLAMA_NLG_TIMEOUT_S  default: 1.5         (NLG budget; warm model ~300–1500 ms)
+  OLLAMA_RETRIES        default: 2
+  OLLAMA_WARMUP_ON_START  default: 1         (send a warmup generate before serve loop)
+  NLG_CIRCUIT_BREAKER_SECONDS  default: 30   (suppress NLG after timeout storm)
 """
 from __future__ import annotations
 
@@ -174,6 +176,51 @@ class OllamaClient:
             logger.debug("Ollama health-check failed: %s", exc)
             return False
 
+    def warmup(self, model: Optional[str] = None, timeout_s: float = 30.0) -> bool:
+        """
+        Trigger a minimal generate call to force Ollama to fully load the model
+        into GPU/CPU memory before the serve loop starts.
+
+        This eliminates the "model load time masquerading as generation latency"
+        problem: without warmup, the first N real requests race against model
+        loading and are cancelled by the NLG timeout, producing a cancellation
+        storm (HTTP 499 / context canceled).
+
+        Returns True if the model loaded successfully, False otherwise.
+        Call once during startup, synchronously, before any inference begins.
+        """
+        model = model or self.default_model
+        logger.info("OllamaClient.warmup: pre-loading model=%s (timeout=%.0fs) …", model, timeout_s)
+        t0 = time.perf_counter()
+        try:
+            resp = self._client.post(
+                "/api/generate",
+                json={
+                    "model":  model,
+                    "prompt": "warmup",
+                    "stream": False,
+                    "options": {"num_predict": 1, "temperature": 0.0},
+                },
+                timeout=self._httpx.Timeout(timeout_s, connect=5.0),
+            )
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            if resp.status_code == 200:
+                logger.info(
+                    "OllamaClient.warmup: model=%s ready in %.0f ms", model, elapsed_ms
+                )
+                return True
+            logger.warning(
+                "OllamaClient.warmup: unexpected status=%d model=%s", resp.status_code, model
+            )
+            return False
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.warning(
+                "OllamaClient.warmup: failed after %.0f ms: %s — NLG will use template fallback",
+                elapsed_ms, exc,
+            )
+            return False
+
     # ── Core generate ─────────────────────────────────────────────────────────
     def generate(
         self,
@@ -185,7 +232,7 @@ class OllamaClient:
         top_p: float = 0.9,
         json_mode: bool = False,
         timeout_s: Optional[float] = None,
-        use_cache: bool = True,
+        use_cache: bool = False,
     ) -> OllamaResponse:
         """
         Generate a completion.  Retries up to self.max_retries times on

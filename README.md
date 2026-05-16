@@ -187,6 +187,7 @@ Telemetry Stream (GPS/REST/WS/MQTT)
 | `analysis/regime.py` | `SessionRegimeClassifier`, `RegimeAwareThresholdStore` | 9-regime (Territory × Intensity) window classification and threshold routing |
 | `analysis/match_state.py` | `MatchStateManager`, `SemanticMatchState` | Longitudinal match memory, motif detection, trend reasoning |
 | `analysis/live_window_accumulator.py` | `LiveWindowAccumulator` | Per-player ring buffer; emits fixed-stride inference windows |
+| `analysis/telemetry_validity.py` | `TelemetryValidityLayer` | Physical plausibility gate (`VALID` / `DEGRADED` / `INVALID`); replay-aware timestamp validation |
 
 ### Explainability
 
@@ -202,7 +203,6 @@ Telemetry Stream (GPS/REST/WS/MQTT)
 | :--- | :--- | :--- |
 | `utils/reliability/invariants.py` | `SystemInvariantGuard` | Machine-enforced system invariants; triggers graded Safe Mode |
 | `utils/reliability/safe_mode.py` | `SafeMode` | Four-level degradation: NORMAL → LEVEL_1 → LEVEL_2 → LEVEL_3 |
-| `utils/reliability/telemetry_validity.py` | `TelemetryValidityLayer` | Physical plausibility gate (`VALID` / `DEGRADED` / `INVALID`) |
 | `utils/reliability/determinism.py` | `MutationJournal`, `TemporalCausalityGuard` | Versioned calibration log, strict event-time monotonicity |
 | `utils/reliability/calibration_store.py` | `HardenedRollingThresholdStore` | Quarantine buffers, drift monitoring, thread-safe threshold store |
 | `utils/reliability/adaptation_engine.py` | `AdaptationEngine` | Crash-safe, versioned calibration updates |
@@ -243,7 +243,10 @@ python main.py evaluate --out metrics/eval.json --min-auc 0.70
 # 4. Stream live inference (NDJSON in -> NDJSON alerts out)
 cat live_events.jsonl | python main.py serve
 
-# 5. Run fairness audit + recalibration check
+# 5. Replay historical data (interleaved multi-session streams)
+cat historical_events.jsonl | python main.py serve --replay-mode
+
+# 6. Run fairness audit + recalibration check
 python main.py audit --log logs/inference_log.jsonl
 ```
 
@@ -293,7 +296,7 @@ All configuration is driven by environment variables and typed dataclasses in `c
 | `LIVE_WS_URL` | `ws://localhost:8765` | Live match event WebSocket URL |
 | `MQTT_BROKER` | `localhost` | MQTT broker host |
 | `JSON_LOGS` | `0` | Set to `1` for structured JSON log output to stderr |
-| `OLLAMA_NLG_TIMEOUT_S` | `0.1` | Timeout for Qwen2.5:14b NLG calls |
+| `OLLAMA_NLG_TIMEOUT_S` | `30.0` | Timeout for Qwen2.5:14b async NLG calls (off SLA clock) |
 
 ### Key Tunable Parameters (`config/settings.py`)
 
@@ -390,13 +393,26 @@ Options:
   --max-latency-ms INT          SLA threshold; violations logged as WARNING [default: 200]
   --ignore-time-gaps            Disable time-gap buffer resets (use for batch replay)
   --ignore-session-boundaries   Disable session-boundary resets (use for interleaved replay)
-  --replay-mode                 Replay-safe mode; implies --ignore-time-gaps and --ignore-session-boundaries
+  --replay-mode                 Replay-safe mode; implies --ignore-time-gaps and
+                                --ignore-session-boundaries. Also relaxes TVL timestamp
+                                validation: reversals and large gaps produce DEGRADED
+                                (not INVALID) so inference is not silently dropped.
   --log-level LEVEL                                               [default: INFO]
 ```
 
-In replay mode, continuity is inferred from temporal consistency rather than raw dataset session identifiers. This prevents historical replay streams containing interleaved sessions from triggering accumulator resets on every event.
+**SLA model:** The 200 ms SLA covers inference only (LSTM forward pass + threshold comparison). LLM NLG generation runs asynchronously off the SLA clock via a thread pool with a 30 s timeout. Two latency figures are observable:
 
-Replay streams generated from historical datasets frequently contain interleaved events originating from many distinct original training sessions. Raw `session_id` transitions in these datasets do not necessarily represent live continuity boundaries and therefore cannot be treated as accumulator reset signals during replay.
+| Metric | What it covers | Where it appears |
+| :--- | :--- | :--- |
+| `latency_ms` in alert payload | Inference only (T1) | stdout NDJSON, inference log |
+| Ollama call duration | Async NLG completion (T2) | `Slow Ollama call` WARNING in stderr |
+
+**Replay mode behaviour:** Historical replay streams frequently interleave events from distinct source sessions. Raw `session_id` transitions in replay streams do not represent live continuity boundaries. In `--replay-mode`:
+
+- Accumulator does not reset on session boundary transitions or timestamp gaps
+- TVL classifies timestamp reversals as `replay_non_monotonic_timestamp` (DEGRADED, confidence floored at 0.8) rather than INVALID
+- TVL classifies large inter-session gaps as `replay_timestamp_gap_*` (no confidence penalty) rather than `timestamp_gap_*` (-0.3)
+- These replay-specific issue markers are distinct from their live equivalents so audit queries on `non_monotonic_timestamp` continue to find only genuine sensor failures
 
 **Input event fields** (NDJSON, one event per line):
 
@@ -571,7 +587,9 @@ Accumulates `SemanticFinding` objects over the full match timeline. Provides mot
 
 ### 4. NLG Engine
 
-`LLMNLGEngine` calls `qwen2.5:14b` via Ollama with a `OLLAMA_NLG_TIMEOUT_S` timeout. On timeout or connection failure, `TemplateNLGEngine` provides a deterministic, sub-millisecond fallback that preserves the full explanation interface and maintains the SLA.
+`LLMNLGEngine` calls `qwen2.5:14b` via Ollama asynchronously (off the SLA clock) with a `OLLAMA_NLG_TIMEOUT_S` timeout (default 30 s). On timeout or connection failure, `TemplateNLGEngine` provides a deterministic, sub-millisecond fallback.
+
+**NLG summary guarantee:** Every emitted alert carries a non-empty `nlg_summary`. Alerts where SHAP is on cooldown (60 s XAI cooldown between full SHAP runs per player) receive an immediate template summary. Alerts where SHAP runs receive the richer LLM-backed summary via the async worker.
 
 ---
 
@@ -586,19 +604,26 @@ Telemetry validation operates in two stages:
 
 **Pre-accumulation checks:**
 
-| Check | Rejection condition |
-| :--- | :--- |
-| **Temporal monotonicity** | Non-monotonic timestamp → buffer reset; gap >60 s → buffer reset |
+| Check | Live behaviour | Replay behaviour (`--replay-mode`) |
+| :--- | :--- | :--- |
+| **Timestamp reversal** | `non_monotonic_timestamp` → INVALID, buffer reset | `replay_non_monotonic_timestamp` → DEGRADED (confidence 0.7, floored to 0.8) |
+| **Timestamp gap > 60 s** | buffer reset | no reset (gaps expected between seasons) |
 
 **Post-window checks:**
 
-| Check | Rejection condition |
-| :--- | :--- |
-| **Mask completeness** | <75% of `{speed_ms, heart_rate_bpm, distance_delta_m, is_sprint}` present → `INVALID` |
-| **Physical plausibility** | speed >13.5 m/s (+20% margin before hard reject), HR outside [30, 220] BPM, accel >12 m/s² → `INVALID` |
-| **Temporal gap** | gap >5 s → confidence -0.3 |
+| Check | Live behaviour | Replay behaviour |
+| :--- | :--- | :--- |
+| **Mask completeness** | <75% of required fields → INVALID | same |
+| **Physical plausibility** | speed >13.5 m/s (+20% margin), HR outside [30, 220], accel >12 m/s² → INVALID | same |
+| **Timestamp gap > 5 s** | `timestamp_gap_*` → confidence -0.3 | `replay_timestamp_gap_*` → no penalty |
+
+Replay-specific issue strings (`replay_*`) are distinct from live equivalents so audit queries on `non_monotonic_timestamp` or `timestamp_gap_*` continue to find only genuine sensor failures, not expected replay stream disorder.
 
 Status values: `VALID` (confidence=1.0), `DEGRADED` (0.0–0.8), `INVALID` (0.0). Inference is blocked for `INVALID` events. `DEGRADED` events are inferred but flagged. The Alert FSM shifts to `HOLD` when event confidence <0.4.
+
+**`replay_mode` propagation:** The `--replay-mode` flag is threaded from `cmd_serve` → `_build_pipeline(replay_mode)` → `PlayersDataAnalysisPipeline(replay_mode)` → `TelemetryValidityLayer(replay_mode)` → `process_window_direct(replay_mode)` → `_effective_confidence()`. This ensures the 0.8 confidence floor and relaxed timestamp semantics are applied consistently across all layers without duplicating policy logic.
+
+**TVL epoch reset:** When the `LiveWindowAccumulator` detects a continuity break and sets a reset flag, the serve loop calls `pipeline.tvl.reset_player(player_id)` to clear TVL's per-player timestamp history. Without this, TVL would compare the first event of the new epoch against the last timestamp of the previous session, spuriously producing `non_monotonic_timestamp`.
 
 ### Alert Finite-State Machine
 
@@ -643,9 +668,13 @@ Buffers 24 raw telemetry packets per player before emitting one inference window
   - positional trajectory buffers
   - alert FSM persistence state
   - rolling match-state trajectories
-  - temporal validity timestamp history
+  - TVL per-player timestamp history (`reset_player()`)
   - output cooldown gates
 - `consume_reset_flag()` exposes reset propagation to the serve loop while preserving replay-safe operation.
+
+### SLA Measurement
+
+The SLA timer (`t_start`) is set immediately after the accumulator emits a complete window, not at raw packet receipt. This ensures the 200 ms budget measures only inference time — LSTM forward pass, threshold comparison, result assembly — and is not inflated by the time spent accumulating the preceding 23 events in the window.
 
 ### Exactly-Once Semantics & Determinism
 
@@ -699,6 +728,8 @@ All threshold adjustments are recorded in `MutationJournal` for full auditabilit
 
 Written by `serve` for every processed window (not just alerts). Fields: `inference_id`, `player_id`, `external_id`, `session_id`, `recommendation_type`, `is_anomaly`, `anomaly_score`, `confidence`, `fatigue_flag`, `drift_flag`, `workload_flag`, `nlg_summary`, `ts`. This file is the input to `audit`.
 
+When async LLM NLG completes, an enriched entry is appended with `"_nlg_enrichment": true`, `nlg_summary_llm`, and full `shap_values`. This allows downstream consumers to distinguish the immediate template summary from the richer async LLM output.
+
 ### Key Log Events to Monitor
 
 | Log pattern | Meaning |
@@ -708,12 +739,14 @@ Written by `serve` for every processed window (not just alerts). Fields: `infere
 | `BUFFER RESET reason=session_change` | LiveWindowAccumulator cleared on new session |
 | `BUFFER RESET reason=time_gap gap=…s` | Timestamp gap >60 s detected; buffer cleared |
 | `EPOCH RESET \| player=… reason=… cleared=[…]` | Unified runtime state reset triggered by continuity break |
-| `Telemetry degraded player=… status=INVALID` | TVL rejected a sensor event |
+| `Telemetry degraded player=… status=INVALID issues=[…]` | TVL rejected event; only live sensor issues appear at WARNING level |
+| `Telemetry degraded player=… status=DEGRADED issues=['borderline_speed_…']` | Speed within 20% margin above ceiling; inference proceeds |
 | `AlertManager: ENTERING GLOBAL SAFE MODE` | System-wide alert suppression active |
 | `SHAP computation failed, using fallback` | SHAP library error; magnitude-proxy used |
-| `Slow Ollama call: model=… ms` | LLM exceeded timeout; template fallback triggered |
+| `Slow Ollama call: model=… ms` | LLM NLG took longer than expected (T2 latency); alert already emitted |
+| `circuit breaker tripped — switching to template NLG` | Ollama unavailable; template fallback active for 30 s |
 
-Epoch resets are atomic runtime isolation events. They prevent contamination between discontinuous telemetry epochs by clearing all transient runtime state associated with a player before new accumulation begins.
+Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_gap_*`) are logged at DEBUG level only and do not appear in WARNING output during normal replay operation.
 
 ---
 
@@ -734,12 +767,12 @@ Epoch resets are atomic runtime isolation events. They prevent contamination bet
 
 **Current limitations:**
 
-- The 200 ms SLA applies to inference only. LLM NLG generation is asynchronous and decoupled via a configurable timeout with deterministic fallback.
+- The 200 ms SLA applies to inference only (T1). LLM NLG generation (T2) is asynchronous and decoupled via a 30 s timeout with deterministic template fallback. Both latencies are observable separately in logs and the inference log.
 - Temporal feature ablation explains the derived feature vector, not raw LSTM hidden states. True SHAP over the full sequence space would require ~2,000 model calls per window (~2–15 s), violating the SLA.
 - `SessionRegimeClassifier` uses rule-based Territory × Intensity bins. Match phase (first/second half) is not included because elapsed-time context is not threaded through the calibration interface at training time.
 - `PatternAnalysisEngine` is not thread-safe. Callers must serialise access per event loop or process. One engine per asyncio event loop or per process is the supported deployment model.
 - `TransformerAutoencoder` is experimental and disabled in production.
-- Historical replay streams may interleave telemetry originating from unrelated source sessions. Replay mode resolves continuity from timestamps rather than dataset session provenance.
+- Historical replay streams may interleave telemetry originating from unrelated source sessions. Replay mode resolves continuity from timestamps rather than dataset session provenance. Anomaly scores in replay mode will vary significantly across gate windows as the stream cycles through different historical sessions.
 
 **Roadmap:**
 

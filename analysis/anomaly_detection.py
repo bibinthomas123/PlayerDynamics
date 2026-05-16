@@ -416,6 +416,22 @@ class AnomalyResult:
     alert_level: AlertLevel = AlertLevel.NONE
     persistence_windows: int = 0
 
+    # XAI / NLG — populated by orchestrator after inference
+    nlg_summary: str = ""
+    shap_values: Dict[str, float] = field(default_factory=dict)
+    counterfactual: Optional[str] = None
+    top_contributions: List = field(default_factory=list)  # List[FeatureContribution]
+
+    # Async NLG sidecar — set when nlg_async=True so main.py can dispatch
+    # generate_explanation_from_base() to the NLG thread pool without
+    # blocking the SLA-measured inference path.
+    base_explanation: Optional[object] = field(default=None, repr=False)
+    semantic_state: Optional[object] = field(default=None, repr=False)
+    # Raw kwargs for async build_base_explanation (SHAP + semantics + LLM).
+    # Set instead of base_explanation when nlg_async=True so that all
+    # 10 MPS forward passes happen off the SLA clock.
+    _xai_kwargs: Optional[dict] = field(default=None, repr=False)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-player normaliser  (plain-array serialisation)
@@ -4359,22 +4375,22 @@ class PatternAnalysisEngine:
 
         regime_key = _REGIME_CLASSIFIER.classify(sequence).key
         tracker = self.inference_engine.get_tracker(player_id)
-        logger.info(
-                "DEBUG SCORE | player=%s raw=%.6f smooth=%.6f regime=%s threshold=%.6f",
-                player_id,
-                raw_loss,
-                smoothed_loss,
-                regime_key,
-                tracker.threshold_for(regime_key) if tracker else -1.0,
-            )
+        # logger.info(
+        #         "DEBUG SCORE | player=%s raw=%.6f smooth=%.6f regime=%s threshold=%.6f",
+        #         player_id,
+        #         raw_loss,
+        #         smoothed_loss,
+        #         regime_key,
+        #         tracker.threshold_for(regime_key) if tracker else -1.0,
+        #     )
         
-        logger.info(
-                "TRACKER STATUS | player=%s calibrated=%s threshold=%s regime=%s",
-                player_id,
-                tracker.is_calibrated if tracker else None,
-                tracker.threshold_for(regime_key) if tracker and tracker.is_calibrated else None,
-                regime_key,
-            )
+        # logger.info(
+        #         "TRACKER STATUS | player=%s calibrated=%s threshold=%s regime=%s",
+        #         player_id,
+        #         tracker.is_calibrated if tracker else None,
+        #         tracker.threshold_for(regime_key) if tracker and tracker.is_calibrated else None,
+        #         regime_key,
+        #     )
         
 
         if tracker and tracker.is_calibrated:
