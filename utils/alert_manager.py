@@ -100,9 +100,10 @@ class AlertManager:
 
                 # Hysteresis: Avoid flapping if already at a higher or equal level
                 if target_level > state.level:
+                    # Start NEW episode only from NONE
+                    if state.level == AlertLevel.NONE:
+                        state.episode_id += 1
                     state.transition(target_level)
-                    state.first_triggered_at = state.first_triggered_at or now
-                    state.episode_id += 1
 
                 state.last_triggered_at = now
         else:

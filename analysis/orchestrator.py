@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Tuple
 from analysis.telemetry_validity import TelemetryValidityLayer, TelemetryStatus
 from utils.alert_manager import AlertLevel
@@ -19,6 +19,8 @@ from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
 from analysis.anomaly_detection import (
     PatternAnalysisEngine, AnomalyResult
 )
+from dataclasses import replace
+from analysis.match_state import MatchStateManager, MatchState
 from utils.reliability.invariants import SystemInvariantGuard
 from analysis.baseline import BaselineBuilder, PlayerBaselineProfile
 from explainability.xai_layer import XAILayer, SHAPExplanation, FEATURE_NAMES as XAI_FEATURE_NAMES
@@ -95,8 +97,9 @@ class PlayersDataAnalysisPipeline:
     pipeline.process_live_event(event_dict)
     """
 
-    def __init__(self, model_type: str = None):
+    def __init__(self, model_type: str = None, replay_mode: bool = False):
         self.model_type = model_type or CONFIG.active_model
+        self.replay_mode = replay_mode
         self.registry = PlayerRegistry()
         self.baseline_builder = BaselineBuilder()
         self.pattern_engine = PatternAnalysisEngine()
@@ -104,7 +107,7 @@ class PlayersDataAnalysisPipeline:
         self.feedback_store = FeedbackStore()
         self.recalibration_pipeline = RecalibrationPipeline()
         self.fairness_monitor = FairnessMonitor()
-        self.tvl = TelemetryValidityLayer()
+        self.tvl = TelemetryValidityLayer(replay_mode=replay_mode)
         self.guard = SystemInvariantGuard()
         self._last_xai_ts: Dict[int, float] = {}
 
@@ -117,9 +120,10 @@ class PlayersDataAnalysisPipeline:
         self._on_alert_callback: Optional[Callable] = None
         self._inference_id_counter = 0
 
-    # ──────────────────────────────────────────
-    # Registration & data loading
-    # ──────────────────────────────────────────
+        # ── Match state ───────────────────────────────────────────────────────
+        self._match_state = MatchStateManager()
+        self._active_match_id: Optional[str] = None
+
     def register_player(
         self, player_id: int, external_id: str, name: str,
         position: str, age: int, age_group: str = "Senior", nationality: str = "",
@@ -431,9 +435,11 @@ class PlayersDataAnalysisPipeline:
 
             last_xai_ts = self._last_xai_ts.get(pid, 0.0)
 
-            cooldown_ok = (
-                now - last_xai_ts
-            ) >= 60.0
+            # cooldown_ok = (
+            #     now - last_xai_ts
+            # ) >= 60.0
+
+            cooldown_ok = True
 
             run_xai = (
                 shap_allowed
@@ -443,30 +449,112 @@ class PlayersDataAnalysisPipeline:
             )
             # run_xai = True  # FOR TESTING - BYPASS ALL GATES
 
-            print("\nXAI DEBUG")
-            print("shap_allowed:", shap_allowed)
-            print("sustained_alert:", sustained_alert)
-            print("sufficient_persistence:", sufficient_persistence)
-            print("cooldown_ok:", cooldown_ok)
-            print("run_xai:", run_xai)
+            # print("\nXAI DEBUG")
+            # print("shap_allowed:", shap_allowed)
+            # print("sustained_alert:", sustained_alert)
+            # print("sufficient_persistence:", sufficient_persistence)
+            # print("cooldown_ok:", cooldown_ok)
+            # print("run_xai:", run_xai)
+
+            xai_fv = self._build_xai_feature_vector(result)
+
+                # Get/create match state before explanation so context is current
+            match_state = self._match_state.get_or_create(
+                    player_id=pid,
+                    player_name=player["name"],
+                    position=player.get("position", ""),
+                    match_id=self._active_match_id,
+                )
+
+            match_state.record_telemetry(
+                speed_ms=xai_fv.get("window_avg_speed_ms", 0.0),
+                hr_bpm=xai_fv.get("heart_rate_bpm", 0.0),
+                hr_recovery_rate=result.feature_vector.get("hr_recovery_rate", 0.0),
+                anomaly_score=result.anomaly_score,
+                telemetry_confidence=self._effective_confidence(validity.confidence),
+            )
 
             if run_xai:
 
-                xai_fv = self._build_xai_feature_vector(result)
+    
+                # ─────────────────────────────────────────────
+                # Stage 1 — base explanation (NO LLM)
+                # ─────────────────────────────────────────────
 
-                explanation = self.xai_layer.explain_from_dict(
+                base_explanation = self.xai_layer.build_base_explanation(
                     player_id=pid,
                     external_id=player["external_id"],
+                    player_name=player["name"],
                     model=model,
                     feature_vector=xai_fv,
                     recommendation_type=result.recommendation_type,
                     confidence=result.confidence,
                     workload_status=result.workload_status,
                     anomaly_score=result.anomaly_score,
-                    player_name=player["name"],
                     sequence=result.raw_sequence if hasattr(result, "raw_sequence") else None,
                     mask=result.raw_mask if hasattr(result, "raw_mask") else None,
                     sequence_background=player.get("sequence_background"),
+                    persistence_windows=result.persistence_windows,
+                )
+
+                # logger.info(
+                #     "BASE SHAP FEATURES: %s",
+                #     list(base_explanation.shap_dict.keys())[:5],
+                # )
+                semantic_findings = self.xai_layer.build_semantic_findings(
+                    shap_dict=base_explanation.shap_values,
+                    feature_values=xai_fv,
+                    persistence_windows=result.persistence_windows,
+                )
+
+                base_explanation = replace(
+                    base_explanation,
+                    semantic_findings=tuple(
+                        f.to_dict() if hasattr(f, "to_dict") else f
+                        for f in semantic_findings
+                    ),
+                )
+                # ─────────────────────────────────────────────
+                # Stage 2 — update symbolic longitudinal memory
+                # ─────────────────────────────────────────────
+
+                elapsed_s = int(xai_fv.get("elapsed_seconds", 0))
+
+                for finding_dict in base_explanation.semantic_findings:
+                    match_state.record_finding(
+                        finding=finding_dict,
+                        elapsed_seconds=elapsed_s,
+                    )
+
+                # Record alert AFTER findings so motif/trend/escalation
+                # reasoning sees current findings before this alert is stored.
+                match_state.record_alert(
+                    recommendation_type=result.recommendation_type,
+                    confidence=result.confidence,
+                    anomaly_score=result.anomaly_score,
+                    elapsed_seconds=elapsed_s,
+                )
+
+                # ─────────────────────────────────────────────
+                # Stage 3 — build CURRENT semantic state
+                # ─────────────────────────────────────────────
+
+                semantic_state = match_state.build_semantic_state()
+
+                logger.info(
+                        "CURRENT WINDOW STATE | motifs=%s escalation=%s findings=%d",
+                        [m["type"] for m in semantic_state.motifs],
+                        semantic_state.escalation_level,
+                        len(match_state.recent_findings),
+                    )
+
+                # ─────────────────────────────────────────────
+                # Stage 4 — final narrative generation
+                # ─────────────────────────────────────────────
+
+                explanation = self.xai_layer.generate_explanation_from_base(
+                    base=base_explanation,
+                    match_state=semantic_state,
                 )
 
                 self._last_xai_ts[pid] = now
@@ -504,6 +592,352 @@ class PlayersDataAnalysisPipeline:
             result.counterfactual = explanation.counterfactual
             result.shap_values = explanation.shap_values
             result.top_contributions = explanation.top_contributions
+
+        return result
+    
+    def _effective_confidence(
+        self,
+        validity_confidence: float,
+        replay_mode: Optional[bool] = None,
+    ) -> float:
+        """
+        Return the telemetry confidence value that should be passed downstream.
+
+        TVL always reflects live-semantics truthfulness.  In replay mode the
+        only degradation is timestamp discontinuity — not a sensor failure —
+        so we floor the confidence at 0.8 to allow trajectory accumulation
+        and persistence escalation.
+
+        Operational-mode override is intentionally located here (orchestration
+        boundary) rather than inside TVL (validity semantics) or MatchState
+        (accumulation logic).  TVL semantics remain unmodified.
+        """
+        is_replay = replay_mode if replay_mode is not None else self.replay_mode
+        if is_replay:
+            effective = max(validity_confidence, 0.8)
+            logger.debug(
+                "REPLAY CONF | replay=%s raw=%.3f effective=%.3f",
+                is_replay, validity_confidence, effective,
+            )
+            return effective
+        return validity_confidence
+        
+    def process_window_direct(
+        self,
+        window_events: list[dict],
+        player_id: int,
+        replay_mode: Optional[bool] = None,
+        nlg_async: bool = False,
+    ) -> Optional[AnomalyResult]:
+
+        """
+        Score a pre-built accumulator window without touching add_event().
+        """
+
+        player = self.registry.get(player_id)
+
+        if player is None:
+            return None
+
+        # ─────────────────────────────────────────────
+        # TVL validation
+        # ─────────────────────────────────────────────
+        latest_event = window_events[-1]
+
+        validity = self.tvl.validate_event(
+            player_id,
+            latest_event,
+        )
+
+        if validity.status == TelemetryStatus.INVALID:
+
+            logger.warning(
+                "process_window_direct: INVALID telemetry player=%d issues=%s — skipping",
+                player_id,
+                validity.issues,
+            )
+
+            for alert_type in (
+                "anomaly",
+                "fatigue",
+                "drift",
+                "workload",
+            ):
+                self.pattern_engine.alert_manager.process_signal(
+                    player_id,
+                    alert_type,
+                    signal_active=False,
+                    confidence=0.0,
+                )
+
+            return None
+
+        latest_event = dict(latest_event)
+
+        latest_event["_tvl_confidence"] = (
+            self._effective_confidence(
+                validity.confidence,
+                replay_mode=replay_mode,
+            )
+        )
+
+        latest_event["_tvl_status"] = validity.status.name
+
+        # ─────────────────────────────────────────────
+        # Build sequence
+        # ─────────────────────────────────────────────
+        seq, mask = (
+            self.pattern_engine.window_builder.build_live_window(
+                window_events
+            )
+        )
+
+        result = self.pattern_engine.analyze_window(
+            player_id=player_id,
+            sequence=seq,
+            mask=mask,
+            live_event=latest_event,
+            sessions_df=player["sessions_df"],
+        )
+
+        if result is None:
+            return None
+
+        # ─────────────────────────────────────────────
+        # XAI
+        # ─────────────────────────────────────────────
+        explanation = None
+
+        model = player.get("model")
+
+        if model is not None:
+
+            from utils.reliability.safe_mode import (
+                safe_mode,
+                SafeModeLevel,
+            )
+
+            shap_allowed = safe_mode.is_feature_enabled(
+                "shap_explanation",
+                SafeModeLevel.LEVEL_1,
+            )
+
+            active_alert = (
+                result.recommendation_type is not None
+            )
+
+            now = time.time()
+
+            # IMPORTANT FIX:
+            # synchronous mode MUST always run SHAP
+            run_xai = (
+                shap_allowed
+                and active_alert
+                and (
+                    not nlg_async
+                    or True
+                )
+            )
+
+            if run_xai:
+                self._last_xai_ts[player_id] = now
+
+            xai_fv = self._build_xai_feature_vector(
+                result
+            )
+
+            match_state = self._match_state.get_or_create(
+                player_id=player_id,
+                player_name=player["name"],
+                position=player.get("position", ""),
+                match_id=self._active_match_id,
+            )
+
+            match_state.record_telemetry(
+                speed_ms=xai_fv.get(
+                    "window_avg_speed_ms",
+                    0.0,
+                ),
+                hr_bpm=xai_fv.get(
+                    "heart_rate_bpm",
+                    0.0,
+                ),
+                hr_recovery_rate=result.feature_vector.get(
+                    "hr_recovery_rate",
+                    0.0,
+                ),
+                anomaly_score=result.anomaly_score,
+                telemetry_confidence=self._effective_confidence(
+                    float(
+                        latest_event.get(
+                            "_tvl_confidence",
+                            1.0,
+                        )
+                    ),
+                    replay_mode=replay_mode,
+                ),
+            )
+
+            # ─────────────────────────────────────────
+            # ALWAYS attach semantic/XAI state
+            # THIS FIXES missing_base_explanation
+            # ─────────────────────────────────────────
+            result.semantic_state = (
+                match_state.build_semantic_state()
+            )
+
+            result._xai_kwargs = dict(
+                player_id=player_id,
+                external_id=player["external_id"],
+                player_name=player["name"],
+                model=model,
+                feature_vector=xai_fv,
+                recommendation_type=result.recommendation_type,
+                confidence=result.confidence,
+                workload_status=result.workload_status,
+                anomaly_score=result.anomaly_score,
+                sequence=result.raw_sequence,
+                mask=result.raw_mask,
+                sequence_background=player.get(
+                    "sequence_background"
+                ),
+                persistence_windows=result.persistence_windows,
+                match_state=result.semantic_state,
+                elapsed_s=int(
+                    xai_fv.get(
+                        "elapsed_seconds",
+                        0,
+                    )
+                ),
+            )
+
+            # ─────────────────────────────────────────
+            # SHAP + NLG
+            # ─────────────────────────────────────────
+            if run_xai:
+
+                if nlg_async:
+
+                    # async path
+                    result.nlg_summary = (
+                        self.xai_layer._template_nlg.generate(
+                            recommendation_type=result.recommendation_type,
+                            confidence=result.confidence,
+                            player_name=player["name"],
+                            top_contributions=[],
+                            workload_status=result.workload_status,
+                            semantic_findings=None,
+                        )
+                    )
+
+                    result.base_explanation = None
+
+                else:
+
+                    # synchronous SHAP
+                    base_explanation = (
+                        self.xai_layer.build_base_explanation(
+                            player_id=player_id,
+                            external_id=player["external_id"],
+                            player_name=player["name"],
+                            model=model,
+                            feature_vector=xai_fv,
+                            recommendation_type=result.recommendation_type,
+                            confidence=result.confidence,
+                            workload_status=result.workload_status,
+                            anomaly_score=result.anomaly_score,
+                            sequence=result.raw_sequence,
+                            mask=result.raw_mask,
+                            sequence_background=player.get(
+                                "sequence_background"
+                            ),
+                            persistence_windows=result.persistence_windows,
+                        )
+                    )
+
+                    semantic_findings = (
+                        self.xai_layer.build_semantic_findings(
+                            shap_dict=base_explanation.shap_values,
+                            feature_values=xai_fv,
+                            persistence_windows=result.persistence_windows,
+                        )
+                    )
+
+                    base_explanation = replace(
+                        base_explanation,
+                        semantic_findings=tuple(
+                            (
+                                f.to_dict()
+                                if hasattr(f, "to_dict")
+                                else f
+                            )
+                            for f in semantic_findings
+                        ),
+                    )
+
+                    result.base_explanation = (
+                        base_explanation
+                    )
+
+                    elapsed_s = int(
+                        xai_fv.get(
+                            "elapsed_seconds",
+                            0,
+                        )
+                    )
+
+                    for finding_dict in (
+                        base_explanation.semantic_findings
+                    ):
+
+                        match_state.record_finding(
+                            finding=finding_dict,
+                            elapsed_seconds=elapsed_s,
+                        )
+
+                    match_state.record_alert(
+                        recommendation_type=result.recommendation_type,
+                        confidence=result.confidence,
+                        anomaly_score=result.anomaly_score,
+                        elapsed_seconds=elapsed_s,
+                    )
+
+                    semantic_state = (
+                        match_state.build_semantic_state()
+                    )
+
+                    explanation = (
+                        self.xai_layer.generate_explanation_from_base(
+                            base=base_explanation,
+                            match_state=semantic_state,
+                        )
+                    )
+
+                    if explanation is not None:
+
+                        result.nlg_summary = (
+                            explanation.nlg_summary
+                        )
+
+                        result.counterfactual = (
+                            explanation.counterfactual
+                        )
+
+                        result.shap_values = (
+                            explanation.shap_values
+                        )
+
+                        result.top_contributions = (
+                            explanation.top_contributions
+                        )
+
+                        result.nlg_engine = getattr(
+                            explanation,
+                            "nlg_engine",
+                            "llm_unknown",
+                        )
+
+                    self._last_xai_ts[player_id] = now
 
         return result
 
@@ -559,6 +993,22 @@ class PlayersDataAnalysisPipeline:
 
     def set_alert_callback(self, cb: Callable) -> None:
         self._on_alert_callback = cb
+
+    # ──────────────────────────────────────────
+    # Match lifecycle  (Fix 2)
+    # ──────────────────────────────────────────
+    def start_match(self, match_id: str) -> None:
+        """Call at kickoff. Ties all subsequent state to this match_id."""
+        self._active_match_id = match_id
+        self._match_state.start_match(match_id)
+        logger.info("Match started: %s", match_id)
+
+    def end_match(self) -> None:
+        """Call at full time. Frees per-match memory and resets match identity."""
+        if self._active_match_id:
+            self._match_state.end_match(self._active_match_id)
+            logger.info("Match ended: %s", self._active_match_id)
+            self._active_match_id = None
 
     # ──────────────────────────────────────────
     # Coach feedback
@@ -640,29 +1090,84 @@ class PlayersDataAnalysisPipeline:
         pitch_origin: Optional[tuple] = None,
         gps_player_id: Optional[str] = None,
     ) -> None:
+        from analysis.live_window_accumulator import LiveWindowAccumulator
+
+        match_id = datetime.now(timezone.utc).strftime(
+            "live_match_%Y%m%d_%H%M%S"
+        )
+        self.start_match(match_id)
+
+        # Non-overlapping window accumulator — same parameters as cmd_serve so
+        # the two serving paths are architecturally identical.
+        _accumulator = LiveWindowAccumulator(
+            window_size=CONFIG.window.window_steps,
+            stride=CONFIG.window.window_steps,
+        )
+
+        def _on_event(ev: dict) -> None:
+            ext_id = ev.get("player_external_id", "")
+            player = self.registry.get_by_external_id(ext_id)
+            if player is None:
+                return
+
+            player_id = player["player_id"]
+            window = _accumulator.push(player_id=ext_id, event=ev)
+
+            # Session/temporal reset — mirror cmd_serve reset logic.
+            if _accumulator.consume_reset_flag(ext_id):
+                try:
+                    self.pattern_engine.reset_ema_state(player_id)
+                    self.pattern_engine.alert_manager.clear_player(player_id)
+                except Exception as exc:
+                    logger.warning("run_live session reset failed for %s: %s", ext_id, exc)
+
+            if window is None:
+                return  # Still accumulating
+
+            try:
+                result = self.process_window_direct(
+                    window_events=window,
+                    player_id=player_id,
+                )
+            except Exception as exc:
+                logger.warning("run_live inference error for %s: %s", ext_id, exc)
+                return
+
+            if result is not None and self._on_alert_callback:
+                try:
+                    self._on_alert_callback(result)
+                except Exception as exc:
+                    logger.exception("run_live alert callback error: %s", exc)
+
         ingestion = IngestionPipeline(
-            on_event=lambda ev: self.process_live_event(ev),
+            on_event=_on_event,
             pitch_origin=pitch_origin,
         )
         recal_task = asyncio.create_task(self._scheduled_recalibration())
         logger.info("PlayersDataAnalysisPipeline LIVE — model=%s", self.model_type.upper())
-        await asyncio.gather(
-            ingestion.run(
-                enable_gps=enable_gps, enable_api=enable_api,
-                enable_ws=enable_ws, enable_mqtt=enable_mqtt,
-                gps_player_id=gps_player_id,
-            ),
-            recal_task,
-            return_exceptions=True,
-        )
+        try:
+            await asyncio.gather(
+                ingestion.run(
+                    enable_gps=enable_gps,
+                    enable_api=enable_api,
+                    enable_ws=enable_ws,
+                    enable_mqtt=enable_mqtt,
+                    gps_player_id=gps_player_id,
+                ),
+                recal_task,
+                return_exceptions=True,
+            )
+        finally:
+            self.end_match()
 
+            
     async def _scheduled_recalibration(self) -> None:
         interval_s = CONFIG.feedback.recalibration_cadence_days * 86400
         while True:
             await asyncio.sleep(interval_s)
             logger.info("Scheduled recalibration triggered")
             self.recalibrate("weekly_cadence")
-            print(self.run_fairness_audit())
+            # print(self.run_fairness_audit())
 
     # ──────────────────────────────────────────
     # Inspection helpers

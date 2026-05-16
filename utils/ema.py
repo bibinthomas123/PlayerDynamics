@@ -8,16 +8,21 @@ class EMASmoother:
     Implements the formula: S_t = alpha * X_t + (1 - alpha) * S_{t-1}
     """
     def __init__(self, alpha: float):
-        self.alpha = alpha
+        self._alpha = alpha
         self.current_value: Optional[float] = None
+        self._ema = None
 
     def update(self, value: float) -> float:
-        """Update the EMA with a new value and return the smoothed result."""
-        if self.current_value is None:
-            self.current_value = value
+        if self._ema is None:
+            self._ema = value
         else:
-            self.current_value = self.alpha * value + (1 - self.alpha) * self.current_value
-        return self.current_value
+            self._ema = self._alpha * value + (1 - self._alpha) * self._ema
+        return self._ema
+
+    @property
+    def value(self) -> float:
+        """Last EMA value without triggering an update. Returns 0.0 if never updated."""
+        return self._ema if self._ema is not None else 0.0
 
     def reset(self) -> None:
         """Reset the smoother state."""

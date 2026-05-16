@@ -32,6 +32,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -40,17 +41,27 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
-
+from typing import Dict, List
+from time import monotonic
 import numpy as np
 import pandas as pd
-from sklearn import pipeline
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging: structured to stderr, JSON in production; human-readable in dev
 # ─────────────────────────────────────────────────────────────────────────────
 _LOG_FMT_HUMAN = "%(asctime)s  %(levelname)-8s  %(name)-20s  %(message)s"
 _LOG_FMT_JSON  = None   # set below if JSON_LOGS=1
+ALERT_COOLDOWN_S = 20
+
+ALERT_FAMILY = {
+    "anomaly_flag": "physiological_instability",
+    "substitution": "physiological_instability",
+    "fatigue_alert": "physiological_instability",
+
+    "positional_drift": "tactical_instability",
+
+    "workload_alert": "workload_instability",
+}
 
 def _configure_logging(level: str = "INFO") -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
@@ -113,13 +124,13 @@ def _load_csvs(data_dir: Path) -> Dict[str, pd.DataFrame]:
     return frames
 
 
-def _build_pipeline(model_dir: Path):
+def _build_pipeline(model_dir: Path, replay_mode: bool = False):
     """Construct a PlayersDataAnalysisPipeline pointed at model_dir."""
     from analysis.orchestrator import PlayersDataAnalysisPipeline
     from config.settings import CONFIG
 
     CONFIG.active_model = "lstm"
-    pipeline = PlayersDataAnalysisPipeline()
+    pipeline = PlayersDataAnalysisPipeline(replay_mode=replay_mode)
 
     # Override model store so the pipeline loads/saves from the right place
     import analysis.anomaly_detection as _ad
@@ -172,7 +183,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
     # Import here to keep other subcommands fast when data already exists
     try:
-        import data_generator as dg
+        import data.data_generator as dg
     except ImportError:
         _exit(1, "data_generator module not found — is it on PYTHONPATH?")
 
@@ -678,9 +689,17 @@ def cmd_serve(args: argparse.Namespace) -> None:
     )
 
     # ─────────────────────────────────────────────
-    # Build pipeline
+    # Replay mode
     # ─────────────────────────────────────────────
-    pipeline = _build_pipeline(model_dir)
+    _replay_mode = args.replay_mode or (
+        getattr(args, "ignore_time_gaps", False)
+        and getattr(args, "ignore_session_boundaries", False)
+    )
+
+    pipeline = _build_pipeline(
+        model_dir,
+        replay_mode=_replay_mode,
+    )
 
     from analysis.anomaly_detection import SharedBackboneAutoencoder
 
@@ -714,8 +733,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
             len(pipeline.registry._players),
         )
 
-        # IMPORTANT:
-        # inject model AFTER restore
         for player in pipeline.registry._players.values():
             player["model"] = shared
 
@@ -728,32 +745,40 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
         logger.warning(
             "No serve_state.json found — "
-            "player baselines and thresholds not loaded. "
-            "Run train first or provide serve_state.json."
+            "player baselines and thresholds not loaded."
         )
 
     # ─────────────────────────────────────────────
     # Alert gate
     # ─────────────────────────────────────────────
-    gate_counts: Dict[str, int] = defaultdict(int)
     gate_last: Dict[str, str] = {}
+    gate_last_emit_ts: Dict[int, int] = {}
+    gate_counts: Dict[str, int] = {}
 
     def _gate_fire(ext_id: str, rec_type: str) -> bool:
 
-        if gate_last.get(ext_id) != rec_type:
+        family = ALERT_FAMILY.get(rec_type, rec_type)
 
-            gate_counts[ext_id] = 1
-            gate_last[ext_id] = rec_type
+        previous_family = gate_last.get(ext_id)
 
-        else:
-            gate_counts[ext_id] += 1
+        if previous_family != family:
+            gate_last[ext_id] = family
+            gate_last_emit_ts.pop(ext_id, None)
 
-        return gate_counts[ext_id] >= args.min_alert_windows
+        now = monotonic()
+
+        last_emit = gate_last_emit_ts.get(ext_id, 0)
+
+        if now - last_emit < ALERT_COOLDOWN_S:
+            return False
+
+        gate_last_emit_ts[ext_id] = now
+
+        return True
 
     def _gate_reset(ext_id: str) -> None:
-
-        gate_counts[ext_id] = 0
         gate_last.pop(ext_id, None)
+        gate_last_emit_ts.pop(ext_id, None)
 
     # ─────────────────────────────────────────────
     # Enrichment
@@ -818,11 +843,105 @@ def cmd_serve(args: argparse.Namespace) -> None:
     )
 
     # ─────────────────────────────────────────────
-    # Stream loop
+    # Ollama timeout
+    # ─────────────────────────────────────────────
+    _async_nlg_timeout = float(os.getenv("OLLAMA_NLG_TIMEOUT_S", "60.0"))
+
+    os.environ["OLLAMA_NLG_TIMEOUT_S"] = str(_async_nlg_timeout)
+
+    try:
+        pipeline.xai_layer._llm_nlg._timeout_s = _async_nlg_timeout
+
+        if pipeline.xai_layer._llm_nlg._client is not None:
+            pipeline.xai_layer._llm_nlg._client.timeout_s = _async_nlg_timeout
+
+    except Exception:
+        pass
+
+    # ─────────────────────────────────────────────
+    # NLG executor
+    # ─────────────────────────────────────────────
+    _nlg_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=2,
+        thread_name_prefix="nlg",
+    )
+
+    # ─────────────────────────────────────────────
+    # Match setup
     # ─────────────────────────────────────────────
     n_events = 0
     n_alerts = 0
     sla_violations = 0
+
+    match_id = datetime.now(timezone.utc).strftime("serve_match_%Y%m%d_%H%M%S")
+
+    pipeline.start_match(match_id)
+
+    logger.info(
+        "Started serve session: %s",
+        match_id,
+    )
+
+    # ─────────────────────────────────────────────
+    # Warmup
+    # ─────────────────────────────────────────────
+    try:
+        pipeline.xai_layer.warmup_nlg()
+    except Exception as exc:
+        logger.warning(
+            "NLG warmup failed: %s",
+            exc,
+        )
+
+    # ─────────────────────────────────────────────
+    # Window accumulator
+    # ─────────────────────────────────────────────
+    WINDOW_SIZE = 24
+    STRIDE = 24
+
+    from analysis.live_window_accumulator import (
+        LiveWindowAccumulator,
+    )
+
+    accumulator = LiveWindowAccumulator(
+        window_size=WINDOW_SIZE,
+        stride=STRIDE,
+        ignore_time_gaps=args.ignore_time_gaps,
+        ignore_session_boundaries=args.ignore_session_boundaries,
+    )
+
+    logger.info(
+        "LiveWindowAccumulator ready (window_size=%d  stride=%d)",
+        WINDOW_SIZE,
+        STRIDE,
+    )
+
+    def _process_window(window):
+
+        latest_event = window[-1]
+
+        ext_id = latest_event.get(
+            "player_external_id",
+            "<missing>",
+        )
+
+        player = pipeline.registry.get_by_external_id(ext_id)
+
+        if player is None:
+
+            logger.warning(
+                "_process_window: no registry entry for ext_id=%r",
+                ext_id,
+            )
+
+            return None
+
+        return pipeline.process_window_direct(
+            window_events=window,
+            player_id=player["player_id"],
+            replay_mode=_replay_mode,
+            nlg_async=False,
+        )
 
     logger.info("Serving — reading newline-delimited JSON from stdin")
 
@@ -834,8 +953,6 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
             if not raw_line:
                 continue
-
-            t_start = time.perf_counter()
 
             n_events += 1
 
@@ -858,26 +975,51 @@ def cmd_serve(args: argparse.Namespace) -> None:
             )
 
             if not ext_id:
-
-                logger.debug(
-                    "Line %d: missing player_external_id — skipped",
-                    n_events,
-                )
-
                 continue
 
             event = _enrich(event)
 
+            window = accumulator.push(
+                player_id=ext_id,
+                event=event,
+            )
+
+            if accumulator.consume_reset_flag(ext_id):
+
+                try:
+
+                    player_id_int = int(ext_id.replace("p", ""))
+
+                    pipeline.pattern_engine.reset_ema_state(player_id_int)
+
+                    pipeline.pattern_engine.alert_manager.clear_player(
+                        player_id_int
+                    )
+
+                    pipeline.tvl.reset_player(player_id_int)
+
+                    _gate_reset(ext_id)
+
+                except Exception as exc:
+
+                    logger.warning(
+                        "Session reset failed for %s: %s",
+                        ext_id,
+                        exc,
+                    )
+
+            if window is None:
+                continue
+
+            t_start = time.perf_counter()
+
             try:
 
-                result = pipeline.process_live_event(
-                    event,
-                    segment_index=0,
-                )
+                result = _process_window(window)
 
             except Exception as exc:
 
-                logger.warning(
+                logger.exception(
                     "Inference error for %s: %s",
                     ext_id,
                     exc,
@@ -892,62 +1034,84 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 sla_violations += 1
 
                 logger.warning(
-                    "SLA breach: player=%s latency=%.1f ms > %d ms (total=%d)",
+                    "SLA breach: player=%s latency=%.1f ms > %d ms",
                     ext_id,
                     latency_ms,
                     args.max_latency_ms,
-                    sla_violations,
                 )
 
-            # ─────────────────────────────
-            # Persist inference
-            # ─────────────────────────────
+            # ─────────────────────────────────────────────
+            # FORCE synchronous LLM generation
+            # ─────────────────────────────────────────────
             if result is not None:
 
-                _inference_log_fh.write(
-                    json.dumps(
-                        {
-                            "inference_id": n_events,
-                            "player_id": result.player_id,
-                            "external_id": ext_id,
-                            "session_id": event.get(
-                                "session_id",
-                                0,
-                            ),
-                            "recommendation_type": result.recommendation_type,
-                            "is_anomaly": result.recommendation_type
-                            is not None,
-                            "anomaly_score": round(
-                                float(result.anomaly_score or 0.0),
-                                6,
-                            ),
-                            "confidence": round(
-                                float(result.confidence or 0.0),
-                                4,
-                            ),
-                            "fatigue_flag": bool(result.fatigue_flag),
-                            "drift_flag": bool(result.positional_drift_flag),
-                            "workload_flag": bool(result.workload_flag),
-                            "nlg_summary": getattr(
-                                result,
-                                "nlg_summary",
-                                "",
-                            ),
-                            "ts": datetime.now(tz=timezone.utc).isoformat(),
-                        }
-                    )
-                    + "\n"
-                )
+                try:
 
-            if result is None or result.recommendation_type is None:
+                    _base_expl = getattr(
+                        result,
+                        "base_explanation",
+                        None,
+                    )
+
+                    _sem_state = getattr(
+                        result,
+                        "semantic_state",
+                        None,
+                    )
+
+                    if _base_expl is not None:
+
+                        logger.info(
+                            "Generating LLM summary | player=%s",
+                            ext_id,
+                        )
+
+                        expl = pipeline.xai_layer.generate_nlg(
+                            base=_base_expl,
+                            match_context=_sem_state
+                        )
+
+                        result.nlg_summary = expl.nlg_summary
+
+                        result.nlg_engine = expl.nlg_engine
+
+                        result.shap_values = expl.shap_values
+
+                        if hasattr(
+                            expl,
+                            "top_contributions",
+                        ):
+                            result.top_contributions = expl.top_contributions
+
+                        logger.info(
+                            "LLM success | player=%s engine=%s len=%d",
+                            ext_id,
+                            expl.nlg_engine,
+                            len(expl.nlg_summary or ""),
+                        )
+
+                except Exception as exc:
+
+                    logger.exception(
+                        "LLM generation failed for %s: %s",
+                        ext_id,
+                        exc,
+                    )
+
+                    result.nlg_engine = "template_fallback"
+
+            # ─────────────────────────────────────────────
+            # Persist
+            # ─────────────────────────────────────────────
+            if result is None:
+                continue
+
+            if result.recommendation_type is None:
 
                 _gate_reset(ext_id)
 
                 continue
 
-            # ─────────────────────────────
-            # Consecutive alert gate
-            # ─────────────────────────────
             if not _gate_fire(
                 ext_id,
                 result.recommendation_type,
@@ -956,16 +1120,29 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
             n_alerts += 1
 
+            gate_counts[ext_id] = gate_counts.get(ext_id, 0) + 1
+
             alert_payload = {
                 "player_id": result.player_id,
                 "external_id": result.external_id,
                 "recommendation_type": result.recommendation_type,
-                "confidence": round(result.confidence, 4),
-                "anomaly_score": round(result.anomaly_score, 6),
+                "confidence": round(
+                    result.confidence,
+                    4,
+                ),
+                "anomaly_score": round(
+                    result.anomaly_score,
+                    6,
+                ),
                 "fatigue_flag": result.fatigue_flag,
                 "drift_flag": result.positional_drift_flag,
                 "workload_flag": result.workload_flag,
                 "workload_status": result.workload_status,
+                "nlg_engine": getattr(
+                    result,
+                    "nlg_engine",
+                    "unknown",
+                ),
                 "nlg_summary": getattr(
                     result,
                     "nlg_summary",
@@ -984,7 +1161,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 "top_features": [
                     {
                         "feature": c.feature_name,
-                        "shap": round(c.shap_value, 10),
+                        "shap": round(
+                            c.shap_value,
+                            10,
+                        ),
                         "value": round(
                             c.feature_value,
                             4,
@@ -1013,32 +1193,24 @@ def cmd_serve(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
+            _inference_log_fh.write(json.dumps(alert_payload) + "\n")
+
             logger.info(
-                "ALERT player=%-6s type=%-20s conf=%.2f latency=%.1f ms",
+                "ALERT player=%-6s type=%-20s conf=%.2f latency=%.1f ms engine=%s",
                 ext_id,
                 result.recommendation_type,
                 result.confidence,
                 latency_ms,
+                getattr(
+                    result,
+                    "nlg_engine",
+                    "unknown",
+                ),
             )
 
     except KeyboardInterrupt:
 
         logger.info("SIGINT received — shutting down gracefully")
-
-    except BrokenPipeError:
-
-        logger.info("Pipe closed — exiting")
-
-    except Exception as exc:
-
-        logger.exception(
-            "Unhandled stream error: %s",
-            exc,
-        )
-
-        _inference_log_fh.close()
-
-        _exit(4, f"Serve exited with unhandled error: {exc}")
 
     finally:
 
@@ -1415,6 +1587,29 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="Consecutive anomalous windows before emitting alert")
     p_sv.add_argument("--max-latency-ms",    type=int, default=200,
                       help="SLA threshold; violations are logged as warnings")
+    p_sv.add_argument(
+    "--ignore-time-gaps",
+    action="store_true",
+    default=False,
+    help="Disable temporal gap reset in the accumulator. Use for batch/replay data "
+         "where inter-event gaps are expected (e.g. one row per session).",
+)
+    p_sv.add_argument(
+    "--ignore-session-boundaries",
+    action="store_true",
+    default=False,
+    help="Disable session-boundary buffer reset in the accumulator. Use for "
+         "historical replay where events from multiple sessions are interleaved.",
+)
+    p_sv.add_argument(
+    "--replay-mode",
+    action="store_true",
+    default=False,
+    help="Replay-safe mode. Implies --ignore-time-gaps and --ignore-session-boundaries. "
+         "Historical replay streams frequently interleave events from distinct source "
+         "sessions; raw session_id transitions in these streams do not represent live "
+         "continuity boundaries and must not trigger accumulator resets.",
+)
 
     # ── audit ─────────────────────────────────────────────────────────────────
     p_au = sub.add_parser("audit", help="Fairness audit + recalibration check")

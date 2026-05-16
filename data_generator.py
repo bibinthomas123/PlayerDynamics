@@ -1117,6 +1117,11 @@ def simulate_match(
     session_nsteps:  Dict[int, int]   = {p["id"]: 0   for p in players_in_match}
 
     tick_buf = 0
+    prev_x: Dict[int, float] = {p["id"]: float(np.random.default_rng(p["id"]).normal(
+        profiles[p["position"]].x_mean, profiles[p["position"]].x_std)) for p in players_in_match}
+    prev_y: Dict[int, float] = {p["id"]: float(np.random.default_rng(p["id"] + 1000).normal(
+        profiles[p["position"]].y_mean, profiles[p["position"]].y_std)) for p in players_in_match}
+    prev_spd: Dict[int, float] = {p["id"]: 0.0 for p in players_in_match}
 
     for t in range(n_total_secs):
         engine.t_sec = t
@@ -1196,11 +1201,22 @@ def simulate_match(
                 if is_sprint_win:
                     hr_rec = round(float(r.uniform(18, 42)) * fat.recovery_slowdown(), 1)
 
+                # Compute accel and distance_delta from window averages
+                _dx_m = (lx - prev_x[pid]) / PITCH_X * PITCH_X   # lx already in metres (0–105)
+                _dy_m = (ly - prev_y[pid]) / PITCH_Y * PITCH_Y
+                _dist_delta = round(math.sqrt(_dx_m**2 + _dy_m**2), 3)
+                _accel = round((mean_spd - prev_spd[pid]) / DT_OUT, 4)
+                prev_x[pid]   = lx
+                prev_y[pid]   = ly
+                prev_spd[pid] = mean_spd
+
                 player_events[pid].append({
                     "session_id":         None,
                     "player_id":          pid,
                     "ts":                 (start_time + timedelta(seconds=t - STEPS_PER_TICK + 1)).isoformat(),
                     "speed_ms":           round(mean_spd, 3),
+                    "accel":              _accel,
+                    "distance_delta_m":   _dist_delta,
                     "x_pitch":            round(lx, 2),
                     "y_pitch":            round(ly, 2),
                     "zone_id":            _zone(lx, ly),
@@ -1215,10 +1231,9 @@ def simulate_match(
                     "ball_y":             round(engine.ball_y, 1),
                     "ball_owner":         str(engine.ball_owner_id),
                     "score":              f"{engine.score_us}-{engine.score_them}",
-                    "xg_us":              round(engine.xg_us, 3),
-                    "xg_them":            round(engine.xg_them, 3),
+                    "xg_us":             round(engine.xg_us, 3),
+                    "xg_them":           round(engine.xg_them, 3),
                 })
-
                 acc_speed[pid].clear(); acc_hr[pid].clear()
                 acc_x[pid].clear();    acc_y[pid].clear()
 
@@ -1296,6 +1311,7 @@ def simulate_training_session(
     max_sp = hr_max_s = 0.0
     hr_sum = n_steps = 0
     tick_buf = 0
+    _prev_x_tr, _prev_y_tr, _prev_spd_tr = px, py, 0.0
 
     for t in range(n_secs):
         t_min = t / 60.0
@@ -1352,10 +1368,19 @@ def simulate_training_session(
             mh = float(np.mean(acc_hr))
             lx, ly = acc_x[-1], acc_y[-1]
             is_sp = ps >= SPRINT_TH
+
+            _dx_tr = lx - _prev_x_tr
+            _dy_tr = ly - _prev_y_tr
+            _dist_delta_tr = round(math.sqrt(_dx_tr**2 + _dy_tr**2), 3)
+            _accel_tr = round((ms - _prev_spd_tr) / DT_OUT, 4)
+            _prev_x_tr, _prev_y_tr, _prev_spd_tr = lx, ly, ms
+
             events.append({
                 "session_id": sid, "player_id": player["id"],
                 "ts": (date + timedelta(seconds=t - STEPS_PER_TICK + 1)).isoformat(),
                 "speed_ms": round(ms, 3),
+                "accel": _accel_tr,
+                "distance_delta_m": _dist_delta_tr,
                 "x_pitch": round(lx, 2), "y_pitch": round(ly, 2),
                 "zone_id": _zone(lx, ly),
                 "heart_rate_bpm": round(float(np.clip(mh + r.normal(0, 1.2), 80, 200)), 1),
@@ -1367,6 +1392,7 @@ def simulate_training_session(
                 "ball_x": None, "ball_y": None, "ball_owner": None,
                 "score": None, "xg_us": None, "xg_them": None,
             })
+            
             acc_spd.clear(); acc_hr.clear(); acc_x.clear(); acc_y.clear()
             tick_buf = 0
 
