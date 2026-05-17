@@ -198,7 +198,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
     # Import here to keep other subcommands fast when data already exists
     try:
-        import data.data_generator as dg
+        import data_generator as dg
     except ImportError:
         _exit(1, "data_generator module not found — is it on PYTHONPATH?")
 

@@ -70,6 +70,41 @@ MAX_RELEVANT_EPISODES     = 3     # prior episodes relevant to current anomaly
 EPISODE_MERGE_WINDOW_MIN  = 2     # consecutive windows within this many minutes
                                    # with the same dominant finding are merged
 
+# ── Episode quality gates — tunable independently ─────────────────────────
+#
+# These four constants control episode suppression.  They were designed to
+# be tuned separately: changing one does not require changing the others.
+#
+# WARNING: tightening all four simultaneously creates state inertia —
+# the engine becomes reluctant to acknowledge real rapid state changes
+# (acute overload spikes, recovery collapses, tactical transitions).
+# Always instrument suppression counts before tightening.
+#
+# MIN_EPISODE_WINDOWS
+#   A non-last group must span this many windows before it is promoted to a
+#   closed episode.  Single-window closures are usually noise; 2-window
+#   closures still capture acute spikes.
+#   BYPASS: any group with severity >= "high" is always promoted regardless.
+#
+# MIN_EPISODE_CONFIDENCE
+#   Peak confidence required to close a low-severity episode.
+#   Applied only when severity < "high" — high/critical episodes bypass this.
+#
+# EPISODE_COOLDOWN_WINDOWS
+#   Minimum episode indices between closing and re-opening the SAME finding type.
+#   Prevents ep11/ep14/ep17 fragmentation of a sustained locomotor pattern.
+#   BYPASS: severity >= "critical" always opens immediately (acute re-escalation).
+#   Set to 0 to disable cooldown entirely.
+#
+# EPISODE_MERGE_WINDOW_MIN (above)
+#   Same-type findings within this many minutes are merged, not split.
+#   Widening this too much suppresses legitimate rapid type transitions.
+#   Keep at 2; only widen if the match clock is known to be unreliable.
+
+MIN_EPISODE_WINDOWS      = 5     # min persistence before non-last closure (acute spike bypass for high+)
+MIN_EPISODE_CONFIDENCE   = 0.55  # min peak confidence for low/medium severity closure
+EPISODE_COOLDOWN_WINDOWS = 2     # min episode-index gap before same type re-opens (0 = disabled)
+
 
 # ─────────────────────────────────────────────
 # Episode data structures
@@ -243,6 +278,13 @@ class CompressedTemporalContext:
     relevant_prior_episodes: List[str]           # compressed summaries of relevant past episodes
     current_escalation:     str                  # current escalation level
     episode_count:          int                  # total episodes this match
+    # Persistence of the current ongoing episode (window count).
+    # Set by the compressor so to_prompt_block() never parses strings to recover it.
+    persistence_windows:    int = 0
+    # Cross-match historical episodes retrieved from EpisodeStore (optional).
+    # Scored and filtered before compression so only salient episodes reach the prompt.
+    historical_episodes:    List[dict] = field(default_factory=list)
+    active_pattern:         Optional[str] = None 
 
     def is_empty(self) -> bool:
         return (
@@ -256,62 +298,104 @@ class CompressedTemporalContext:
 
     def to_prompt_block(self) -> str:
         """
-        Render as a labelled LLM-ready prompt block.
-        Hard cap at MAX_CONTEXT_TOKENS chars; truncates gracefully.
+        Render as a compact JSON envelope for LLM injection (~40-80 tokens).
+
+        The LLM narrates these conclusions; it does not re-reason from raw history.
+
+        Fields
+        ------
+        active_pattern          : dominant finding type string e.g. "locomotor suppression"
+        trend                   : first non-stable trend direction, or "stable"
+        persistence_windows     : consecutive windows the pattern has lasted (from compressor)
+        in_match_recurrence     : closed episodes this match with the same dominant finding
+        cross_match_recurrence  : closed episodes in prior matches (from EpisodeStore)
+        last_similar_outcome    : response from most recent similar prior-match episode
+        current_escalation      : escalation level string
+        recent_transitions      : up to 2 detected state transitions (absent if none)
+        last_intervention       : most recent intervention logged (absent if none)
         """
+        import json as _json
+        import re as _re
+
         if self.is_empty():
             return ""
 
-        parts: List[str] = []
+        # ── Active pattern ────────────────────────────────────────────────────
+        # Use the canonical field set by compress().  Never parse episode summary
+        # strings — that path was fragile and produced None on first occurrences.
+        #
+        # Fallback chain (only reached when compress() didn't set the field,
+        # e.g. when deserialising an older checkpoint that predates this field):
+        #   1. recurring_patterns  → "locomotor suppression (×6 episodes)"
+        #   2. relevant_prior_episodes → parse the summary string as last resort
+        active_pattern = self.active_pattern
 
-        parts.append(
-            f"Match trajectory [{self.current_escalation.upper()}] "
-            f"({self.episode_count} episode(s)):"
+        if not active_pattern and self.recurring_patterns:
+            m = _re.match(r"^(.+?)\s+\(", self.recurring_patterns[0])
+            active_pattern = m.group(1).strip() if m else self.recurring_patterns[0]
+
+        if not active_pattern and self.relevant_prior_episodes:
+            # Last resort: parse "Ep7 (min~0→min~0): HIGH — locomotor suppression [persisted]"
+            # The em-dash (—) or ASCII dash separates severity from finding label.
+            m = _re.search(r"[—\u2014]\s*(.+?)(?:\s*\[|$)", self.relevant_prior_episodes[0])
+            if m:
+                active_pattern = m.group(1).strip()
+
+        # ── Persistence ───────────────────────────────────────────────────────
+        # Authoritative value written by compress() — never re-derive from strings.
+        persistence_w = self.persistence_windows
+
+        # ── In-match recurrence ───────────────────────────────────────────────
+        in_match_recurrence = sum(
+            1 for pat in self.recurring_patterns
+            if active_pattern and active_pattern in pat
         )
-        if self.trajectory_narrative:
-            parts.append(f"  Arc: {self.trajectory_narrative}")
 
-        if self.trend_summaries:
-            trend_str = "; ".join(
-                f"{k}: {v}"
-                for k, v in self.trend_summaries.items()
-                if v not in ("stable", "insufficient data")
-            )
-            if trend_str:
-                parts.append(f"  Trends: {trend_str}")
+        # ── Cross-match recurrence (EpisodeStore) ─────────────────────────────
+        # Match against both the human-readable form ("locomotor suppression") and
+        # the raw underscore form ("locomotor_suppression") so naming differences
+        # between the compressor and EpisodeStore payloads don't silently zero this.
+        target_readable  = {active_pattern} if active_pattern else set()
+        target_raw       = {active_pattern.replace(" ", "_")} if active_pattern else set()
+        target_set       = target_readable | target_raw
 
-        if self.recurring_patterns:
-            parts.append(
-                "  Recurring patterns: " + "; ".join(self.recurring_patterns[:3])
-            )
+        cross_match_recurrence = sum(
+            1 for ep in self.historical_episodes
+            if set(ep.get("dominant_findings", [])) & target_set
+        )
+        last_similar_outcome = None
+        for ep in reversed(self.historical_episodes):
+            if set(ep.get("dominant_findings", [])) & target_set:
+                resp = ep.get("response", "unknown")
+                if resp not in ("unknown", ""):
+                    last_similar_outcome = resp
+                break
+
+        # ── Trend ─────────────────────────────────────────────────────────────
+        trend = next(
+            (v for v in self.trend_summaries.values()
+             if v not in ("stable", "insufficient data")),
+            "stable",
+        )
+
+        # ── Envelope ──────────────────────────────────────────────────────────
+        envelope = {
+            "active_pattern":         active_pattern,
+            "trend":                  trend,
+            "persistence_windows":    persistence_w,
+            "in_match_recurrence":    in_match_recurrence,
+            "cross_match_recurrence": cross_match_recurrence,
+            "last_similar_outcome":   last_similar_outcome,
+            "current_escalation":     self.current_escalation,
+        }
 
         if self.state_transitions:
-            parts.append(
-                "  Transitions: " + "; ".join(self.state_transitions[:3])
-            )
-
-        if self.relevant_prior_episodes:
-            parts.append("  Prior episodes relevant to current anomaly:")
-            for ep_line in self.relevant_prior_episodes[:MAX_RELEVANT_EPISODES]:
-                parts.append(f"    • {ep_line}")
-
-        if self.recent_context:
-            parts.append(f"  Recent context: {self.recent_context}")
+            envelope["recent_transitions"] = self.state_transitions[:2]
 
         if self.intervention_history:
-            parts.append(
-                "  Interventions: " + "; ".join(self.intervention_history[-3:])
-            )
+            envelope["last_intervention"] = self.intervention_history[-1]
 
-        block = "\n".join(parts)
-
-        # Hard truncate to budget (prefer clean line boundaries)
-        if len(block) > MAX_CONTEXT_TOKENS:
-            block = block[:MAX_CONTEXT_TOKENS].rsplit("\n", 1)[0] + "\n  [context truncated]"
-
-        return block
-
-
+        return _json.dumps(envelope, separators=(",", ":"))
 # ─────────────────────────────────────────────
 # Temporal context compressor
 # ─────────────────────────────────────────────
@@ -333,6 +417,58 @@ class TemporalContextCompressor:
     No raw telemetry values enter the output. The LLM reasons over
     symbolic summaries, not sensor data.
     """
+    @staticmethod
+    def _merge_adjacent_same_type(
+        episodes: List[PlayerEpisode],
+        merge_gap_minutes: int = 3,
+    ) -> List[PlayerEpisode]:
+        """
+        Post-process: merge consecutive closed episodes that share a dominant finding
+        and are separated by <= merge_gap_minutes.
+
+        This is the last line of defence against ep11/ep14/ep17 fragmentation when
+        the cooldown gate alone doesn't catch it (e.g. burst of distinct intermediate
+        types between same-type groups that reset the cooldown counter).
+        """
+        if len(episodes) < 2:
+            return episodes
+
+        merged: List[PlayerEpisode] = [episodes[0]]
+        for ep in episodes[1:]:
+            prev = merged[-1]
+            same_type = (
+                prev.dominant_findings
+                and ep.dominant_findings
+                and prev.dominant_findings[0] == ep.dominant_findings[0]
+            )
+            # Only merge closed→closed; ongoing is handled by extend-existing logic
+            both_closed = not prev.is_ongoing() and not ep.is_ongoing()
+            # Gap check: None minutes → always allow merge (clock absent)
+            gap_ok = (
+                prev.end_minute is None
+                or ep.start_minute is None
+                or (ep.start_minute - prev.end_minute) <= merge_gap_minutes
+            )
+            if same_type and both_closed and gap_ok:
+                # Absorb ep into prev
+                prev.end_minute         = ep.end_minute
+                prev.persistence_duration += ep.persistence_duration
+                prev.peak_anomaly_score = max(prev.peak_anomaly_score, ep.peak_anomaly_score)
+                prev.peak_confidence    = max(prev.peak_confidence,    ep.peak_confidence)
+                if ep.trend_direction == "worsening":
+                    prev.trend_direction = "worsening"
+                if ep.response in ("escalated", "persisted"):
+                    prev.response = ep.response
+                _SEV = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+                if _SEV.get(ep.severity, 0) > _SEV.get(prev.severity, 0):
+                    prev.severity = ep.severity
+                logger.debug(
+                    "Episode merge: Ep%d absorbed Ep%d (type=%s)",
+                    prev.episode_index, ep.episode_index, prev.dominant_findings[0],
+                )
+            else:
+                merged.append(ep)
+        return merged
 
     # ── Episode builder ────────────────────────────────────────────────────────
 
@@ -346,32 +482,63 @@ class TemporalContextCompressor:
         """
         Segment the finding history into discrete episodes.
 
-        Strategy:
+        Strategy
+        ────────
         - Group consecutive findings where the dominant type stays the same
-          (within EPISODE_MERGE_WINDOW_MIN minutes).
+          within EPISODE_MERGE_WINDOW_MIN minutes.
         - A change of dominant type triggers a new episode.
-        - Episodes that share the same dominant type as an existing episode
-          are merged with it (persistence extension), not duplicated.
+        - Episodes that share the same dominant type as an existing ongoing
+          episode are merged with it (persistence extension), not duplicated.
+
+        Quality gates (applied independently — each has severity bypasses)
+        ──────────────────────────────────────────────────────────────────
+        1. MIN_EPISODE_WINDOWS  — non-last groups must span ≥ 2 windows.
+           BYPASS: severity >= "high" always closes regardless (acute spikes).
+
+        2. MIN_EPISODE_CONFIDENCE — peak confidence gate for low/medium severity.
+           BYPASS: severity >= "high" always closes regardless.
+
+        3. EPISODE_COOLDOWN_WINDOWS — prevents same-type fragmentation.
+           BYPASS: severity == "critical" always re-opens immediately.
+           BYPASS: first-ever episode of this type (no prior close recorded).
+
+        4. Clock propagation — start/end minutes taken from finding["minute"]
+           (real match clock). Never defaulted to 0; None when absent.
 
         Returns the updated full episode list (existing + new).
         """
+        _SEV = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
         if not findings_snapshot:
             return existing_episodes or []
+
+        logger.debug(
+            "Episode builder: findings=%d existing_episodes=%d",
+            len(findings_snapshot),
+            len(existing_episodes or []),
+        )
 
         episodes: List[PlayerEpisode] = list(existing_episodes or [])
         next_idx = max((ep.episode_index for ep in episodes), default=0) + 1
 
-        # Group findings into runs by dominant type
+        # ── Instrumentation counters ──────────────────────────────────────────
+        _stats: Dict[str, int] = {
+            "merged":                 0,
+            "suppressed_min_windows": 0,
+            "suppressed_confidence":  0,
+            "suppressed_cooldown":    0,
+        }
+
+        # ── Group findings into runs by dominant type ─────────────────────────
         groups: List[List[dict]] = []
         current_group: List[dict] = []
         current_dominant: Optional[str] = None
 
         for f in findings_snapshot:
-            ftype = f.get("type", "unknown")
-            fmin  = f.get("minute")
+            ftype    = f.get("type", "unknown")
+            fmin     = f.get("minute")
             prev_min = current_group[-1].get("minute") if current_group else None
 
-            # Start new group if: type changed, or time gap exceeds merge window
             time_gap_ok = (
                 prev_min is None
                 or fmin is None
@@ -388,26 +555,44 @@ class TemporalContextCompressor:
         if current_group:
             groups.append(current_group)
 
-        # Convert groups to episodes — skip groups already covered by existing episodes
+        # ── Cooldown tracker: last closed episode_index per finding type ───────
+        last_closed_idx: Dict[str, int] = {}
+        for ep in episodes:
+            if not ep.is_ongoing() and ep.dominant_findings:
+                last_closed_idx[ep.dominant_findings[0]] = ep.episode_index
+
+        # ── Convert groups → episodes ──────────────────────────────────────────
         for group in groups:
             dominant = group[0].get("type", "unknown")
-            start_m  = group[0].get("minute")
-            end_m    = group[-1].get("minute")
+            is_last  = (group is groups[-1])
+
+            # Real clock: first/last non-None minute in the group
+            minutes_in_group = [
+                f.get("minute") for f in group if f.get("minute") is not None
+            ]
+            start_m = minutes_in_group[0]  if minutes_in_group else None
+            end_m   = minutes_in_group[-1] if minutes_in_group else None
+
             severity = max(
                 (f.get("severity", "low") for f in group),
-                key=lambda s: {"low": 0, "medium": 1, "high": 2, "critical": 3}.get(s, 0),
+                key=lambda s: _SEV.get(s, 0),
             )
+            sev_int     = _SEV.get(severity, 0)
+            is_high_sev = sev_int >= 2   # "high" or "critical"
+
             confidences = [f.get("confidence", 0.5) for f in group]
             peak_conf   = max(confidences) if confidences else 0.5
 
-            # Anomaly score range: use average over episode length as proxy
-            n_scores = len(anomaly_scores_snapshot)
-            peak_score = max(anomaly_scores_snapshot[-len(group):]) if n_scores >= len(group) else 0.0
+            n_scores   = len(anomaly_scores_snapshot)
+            peak_score = (
+                max(anomaly_scores_snapshot[-len(group):])
+                if n_scores >= len(group) else 0.0
+            )
 
             trend_dir = self._infer_episode_trend(group)
             response  = self._infer_episode_response(group, findings_snapshot)
 
-            # Try to extend an existing episode rather than creating a duplicate
+            # ── Try to extend an existing ongoing episode of the same type ────
             matched = False
             for ep in reversed(episodes):
                 if (
@@ -415,20 +600,80 @@ class TemporalContextCompressor:
                     and ep.dominant_findings[0] == dominant
                     and ep.is_ongoing()
                 ):
-                    ep.end_minute = end_m
-                    ep.persistence_duration += len(group)
-                    ep.peak_anomaly_score = max(ep.peak_anomaly_score, peak_score)
-                    ep.peak_confidence = max(ep.peak_confidence, peak_conf)
-                    ep.trend_direction = trend_dir
-                    ep.response = response
+                    ep.persistence_duration = len(group)
+                    ep.peak_anomaly_score   = max(ep.peak_anomaly_score, peak_score)
+                    ep.peak_confidence      = max(ep.peak_confidence, peak_conf)
+                    ep.trend_direction      = trend_dir
+                    ep.response             = response
+                    ep.severity             = severity
+                    if start_m is not None and ep.start_minute is None:
+                        ep.start_minute = start_m
+
+                    if not is_last:
+                        # Gate 1: min-windows (bypass for high/critical)
+                        if not is_high_sev and ep.persistence_duration < MIN_EPISODE_WINDOWS:
+                            _stats["suppressed_min_windows"] += 1
+                            logger.debug(
+                                "Episode gate [min_windows]: type=%s windows=%d sev=%s — "
+                                "not closing (below threshold, not high severity)",
+                                dominant, ep.persistence_duration, severity,
+                            )
+                        # Gate 2: confidence (bypass for high/critical)
+                        elif not is_high_sev and ep.peak_confidence < MIN_EPISODE_CONFIDENCE:
+                            _stats["suppressed_confidence"] += 1
+                            logger.debug(
+                                "Episode gate [confidence]: type=%s conf=%.2f sev=%s — "
+                                "not closing (below threshold, not high severity)",
+                                dominant, ep.peak_confidence, severity,
+                            )
+                        else:
+                            ep.end_minute = end_m
+                            last_closed_idx[dominant] = ep.episode_index
+
+                    _stats["merged"] += 1
                     matched = True
                     break
 
             if not matched:
+                # Gate 3: cooldown — prevent same-type fragmentation.
+                # BYPASS 1: critical severity always re-opens immediately.
+                # BYPASS 2: first-ever episode of this type — no prior close
+                #           recorded so cooldown does not apply yet.
+                if EPISODE_COOLDOWN_WINDOWS > 0 and not is_last and sev_int < 3:
+                    last_close  = last_closed_idx.get(dominant, -999)
+                    since_close = next_idx - last_close
+                    if last_close != -999 and since_close < EPISODE_COOLDOWN_WINDOWS:
+                        _stats["suppressed_cooldown"] += 1
+                        logger.info(
+                            "Episode gate [cooldown]: type=%s since_close=%d "
+                            "threshold=%d sev=%s — suppressed",
+                            dominant, since_close, EPISODE_COOLDOWN_WINDOWS, severity,
+                        )
+                        continue
+
+                # Gate 1+2 on new episodes: non-last, non-high-severity short groups
+                if not is_last and not is_high_sev:
+                    if len(group) < MIN_EPISODE_WINDOWS:
+                        _stats["suppressed_min_windows"] += 1
+                        logger.debug(
+                            "Episode gate [min_windows]: type=%s windows=%d — "
+                            "new episode suppressed",
+                            dominant, len(group),
+                        )
+                        continue
+                    if peak_conf < MIN_EPISODE_CONFIDENCE:
+                        _stats["suppressed_confidence"] += 1
+                        logger.debug(
+                            "Episode gate [confidence]: type=%s conf=%.2f — "
+                            "new episode suppressed",
+                            dominant, peak_conf,
+                        )
+                        continue
+
                 ep = PlayerEpisode(
                     episode_index=next_idx,
                     start_minute=start_m,
-                    end_minute=end_m if len(groups) > 1 else None,  # last group is ongoing
+                    end_minute=end_m if not is_last else None,
                     dominant_findings=[dominant],
                     trend_direction=trend_dir,
                     severity=severity,
@@ -439,10 +684,25 @@ class TemporalContextCompressor:
                     peak_confidence=peak_conf,
                 )
                 episodes.append(ep)
+                if not is_last:
+                    last_closed_idx[dominant] = next_idx
                 next_idx += 1
 
-        return episodes
+        if any(_stats.values()):
+            logger.info(
+                "Episode suppression | merged=%d min_windows=%d confidence=%d "
+                "cooldown=%d total_episodes=%d",
+                _stats["merged"],
+                _stats["suppressed_min_windows"],
+                _stats["suppressed_confidence"],
+                _stats["suppressed_cooldown"],
+                len(episodes),
+            )
 
+        episodes = self._merge_adjacent_same_type(
+            episodes, merge_gap_minutes=EPISODE_MERGE_WINDOW_MIN + 1
+        )
+        return episodes
     # ── Trend detection helpers ────────────────────────────────────────────────
 
     @staticmethod
@@ -486,32 +746,52 @@ class TemporalContextCompressor:
     def _infer_episode_response(group: List[dict], full_history: List[dict]) -> str:
         """
         Infer whether the episode resolved, escalated, persisted, or is unknown.
-        Looks for the state label on the most recent finding of the same type.
+
+        Looks at findings that appear *after* the last member of this group in
+        full_history to determine the outcome.  For the ongoing (last) group,
+        uses the state label on the final finding rather than returning "unknown".
         """
         if not group:
             return "unknown"
+
         dominant = group[-1].get("type", "unknown")
-        # Check if same type recurs after the group in full history
-        group_set = {id(f) for f in group}
-        later = [
-            f for f in full_history
-            if id(f) not in group_set and f.get("type") == dominant
-        ]
-        if later:
-            last_state = later[-1].get("state", "active")
-            if last_state in ("resolving",):
+        group_ids = {id(f) for f in group}
+
+        # Locate the position of the last group member in the full history list
+        # so we can inspect everything that comes after it.
+        last_pos = -1
+        for i, f in enumerate(full_history):
+            if id(f) in group_ids:
+                last_pos = i
+        after = full_history[last_pos + 1:] if last_pos >= 0 else []
+
+        same_type_later = [f for f in after if f.get("type") == dominant]
+
+        if same_type_later:
+            last_state = same_type_later[-1].get("state", "active")
+            if last_state == "resolving":
                 return "resolved"
-            if last_state in ("escalating",):
+            if last_state == "escalating":
                 return "escalated"
+            # Same finding type recurs after the group — still ongoing
             return "persisted"
 
-        # No later occurrences — check final state in group
+        if after:
+            # Different finding types follow — this type has been superseded
+            last_state = group[-1].get("state", "active")
+            if last_state == "escalating":
+                return "escalated"
+            return "resolved"
+
+        # This is the trailing group (ongoing episode) — no later findings exist.
+        # Classify from the current state label rather than defaulting to "unknown".
         last_state = group[-1].get("state", "active")
         if last_state == "resolving":
             return "resolved"
         if last_state == "escalating":
             return "escalated"
-        if last_state == "stabilizing":
+        if last_state in ("stabilizing", "active"):
+            # Finding is still present without a resolution signal — persisting
             return "persisted"
         return "unknown"
 
@@ -739,6 +1019,7 @@ class TemporalContextCompressor:
         current_minute: Optional[int],
         current_escalation: str,
         current_finding_types: Optional[List[str]] = None,
+        historical_episodes: Optional[List[dict]] = None,
     ) -> CompressedTemporalContext:
         """
         Build CompressedTemporalContext from all available symbolic memory.
@@ -759,9 +1040,9 @@ class TemporalContextCompressor:
         CompressedTemporalContext
             Token-efficient, LLM-ready. Contains NO raw telemetry.
         """
-        trajectory = self.build_trajectory_narrative(episodes, current_escalation)
-        recent_ctx = self.build_recent_context(recent_findings, current_minute)
-        recurring  = self.detect_recurring_patterns(episodes)
+        trajectory  = self.build_trajectory_narrative(episodes, current_escalation)
+        recent_ctx  = self.build_recent_context(recent_findings, current_minute)
+        recurring   = self.detect_recurring_patterns(episodes)
         transitions = self.detect_state_transitions(episodes)
 
         relevant = self.find_relevant_episodes(
@@ -769,6 +1050,22 @@ class TemporalContextCompressor:
             current_findings=current_finding_types or [],
         )
         relevant_lines = [ep.compressed_summary() for ep in relevant]
+
+        # ── Ongoing episode — single authoritative source for two fields ───────
+        # Never infer persistence or active_pattern from string parsing.
+        # Both values come directly from the ongoing episode object.
+        ongoing_ep    = next((ep for ep in reversed(episodes) if ep.is_ongoing()), None)
+        persistence_w = ongoing_ep.persistence_duration if ongoing_ep else 0
+
+        # active_pattern: the dominant finding of the current ongoing episode,
+        # human-readable (underscores → spaces).  None when no episode is active.
+        active_pattern: Optional[str] = None
+        if ongoing_ep and ongoing_ep.dominant_findings:
+            active_pattern = ongoing_ep.dominant_findings[0].replace("_", " ")
+        elif current_finding_types:
+            # Fallback: use the first finding type from the current window when
+            # there is no ongoing episode yet (first window of a new pattern).
+            active_pattern = current_finding_types[0].replace("_", " ")
 
         return CompressedTemporalContext(
             trajectory_narrative=trajectory,
@@ -780,4 +1077,7 @@ class TemporalContextCompressor:
             relevant_prior_episodes=relevant_lines,
             current_escalation=current_escalation,
             episode_count=len(episodes),
+            persistence_windows=persistence_w,
+            active_pattern=active_pattern,
+            historical_episodes=historical_episodes or []
         )

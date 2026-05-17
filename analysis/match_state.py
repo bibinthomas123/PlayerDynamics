@@ -80,6 +80,7 @@ from analysis.episodic_context import (
       TemporalContextCompressor,
       CompressedTemporalContext,
   )
+from config.redis_client import EpisodeStore
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,12 @@ class JsonFileCheckpointStore:
 
 _CHECKPOINT_KEY = "runtime_match_state"
 
+# Minimum number of consecutive windows an episode must span before it is
+# written to EpisodeStore.  Single-window flickers (persistence_duration=1)
+# carry too little signal and bloat the episode index.
+_MIN_EPISODE_PERSIST_WINDOWS: int = 2
 
+logger.info("_MIN_EPISODE_PERSIST_WINDOWS = %d", _MIN_EPISODE_PERSIST_WINDOWS)
 # ─────────────────────────────────────────────
 # Trend slope thresholds
 # ─────────────────────────────────────────────
@@ -388,9 +394,22 @@ class MatchState:
     recent_context:       str = ""
     intervention_history: List[str] = field(default_factory=list)
     _episode_counter:     int = field(default=0, repr=False)
+    # Tracks which episode IDs have already been written to EpisodeStore.
+    # Prevents re-persisting the same closed episode on every window refresh.
+    _persisted_episode_ids: set = field(default_factory=set, repr=False, compare=False)
 
     # ── Thread-safety lock ────────────────────────────────────────────────────
     _lock: Lock = field(default_factory=Lock, repr=False, compare=False)
+
+    # ── SemanticMatchState cache ───────────────────────────────────────────────
+    # Invalidated on every record_finding() / record_telemetry() / record_alert()
+    # so build_semantic_state() is only ever computed once per window, not 3+ times.
+    _cached_semantic_state: Optional["SemanticMatchState"] = field(
+        default=None, repr=False, compare=False
+    )
+
+    _episode_store = EpisodeStore()
+
 
     # ─────────────────────────────────────────────
     # Existing interface — extended
@@ -427,6 +446,9 @@ class MatchState:
 
             if self.first_alert_elapsed_s is None:
                 self.first_alert_elapsed_s = elapsed_seconds
+
+            # Invalidate cached semantic state — counters changed
+            self._cached_semantic_state = None
 
     def record_telemetry(
         self,
@@ -474,10 +496,8 @@ class MatchState:
                         telemetry_confidence,
                     )
 
-                # logger.info(
-                #     "ANOMALY TRAJECTORY LEN=%d",
-                #     len(self.recent_anomaly_scores),
-                #)
+            # Invalidate cached semantic state — deques changed
+            self._cached_semantic_state = None
             
     # ─────────────────────────────────────────────
     # Layer 2: Finding memory — producer interface
@@ -545,6 +565,8 @@ class MatchState:
 
             entry["state"] = self._infer_finding_state(entry, previous)
             self.recent_findings.append(entry)
+            # Invalidate cached semantic state — findings changed
+            self._cached_semantic_state = None
 
     # ─────────────────────────────────────────────
     # Layer 2b: Transition memory — query interface
@@ -1098,9 +1120,20 @@ class MatchState:
 
         Replaces build_semantic_summary() (which collapsed structure too early).
 
-        Thread-safe. Trend slopes are computed outside the lock.
+        Thread-safe. All mutable state is snapshotted under a single lock
+        acquisition; all computation runs outside the lock to minimise
+        contention between the inference thread and checkpoint/NLG threads.
+
+        Result is cached on self._cached_semantic_state and invalidated by
+        record_finding() / record_telemetry() / record_alert(), so only one
+        full computation runs per window instead of the previous 3+.
         """
+        # ── Fast path: return cached result if state hasn't changed ──────────
         with self._lock:
+            if self._cached_semantic_state is not None:
+                return self._cached_semantic_state
+
+            # ── Single snapshot under lock — release before all computation ──
             total_alerts = (
                 self.fatigue_alert_count
                 + self.workload_alert_count
@@ -1109,63 +1142,61 @@ class MatchState:
             n_findings = len(self.recent_findings)
 
             if total_alerts == 0 and n_findings == 0:
-                return SemanticMatchState(
+                empty = SemanticMatchState(
                     motifs=[],
                     trends={},
                     coupled_states=[],
                     persistent_findings=[],
                     escalation_level="none",
                     risk_breakdown={
-                            "motif_risk": 0.0,
-                            "coupled_risk": 0.0,
-                            "persistence_risk": 0.0,
-                            "instability_risk": 0.0,
-                            "transition_risk": 0.0,
-                            "total_risk": 0.0,
-                        },
+                        "motif_risk": 0.0,
+                        "coupled_risk": 0.0,
+                        "persistence_risk": 0.0,
+                        "instability_risk": 0.0,
+                        "transition_risk": 0.0,
+                        "total_risk": 0.0,
+                    },
                 )
+                self._cached_semantic_state = empty
+                return empty
 
-            # Motifs — computed inside lock (reads self.recent_findings)
+            # Snapshot all mutable collections in one lock pass
             findings_snapshot = list(self.recent_findings)
+            anomaly_snap      = list(self.recent_anomaly_scores)
+            recovery_snap     = list(self.recent_recovery)
+            speed_snap        = list(self.recent_speed)
+            peak_score        = self.peak_anomaly_score
+            transition_snap   = dict(self.transition_counts)
 
-            motifs = self.detect_motifs(findings_snapshot)
+        # ── All computation outside the lock ─────────────────────────────────
 
-            # Persistent findings snapshot
-            finding_counts = {}
+        # Motif detection (pure function of findings_snapshot)
+        motifs = self.detect_motifs(findings_snapshot)
 
-            for f in self.recent_findings:
-                if f.get("severity") not in ("high", "critical"):
-                    continue
+        # Persistent findings
+        finding_counts: Dict[str, int] = {}
+        for f in findings_snapshot:
+            if f.get("severity") not in ("high", "critical"):
+                continue
+            ftype = f.get("type")
+            finding_counts[ftype] = finding_counts.get(ftype, 0) + 1
 
-                ftype = f.get("type")
-                finding_counts[ftype] = finding_counts.get(ftype, 0) + 1
+        persistent_map: Dict[str, dict] = {}
+        for f in findings_snapshot:
+            ftype = f.get("type")
+            if (
+                f.get("severity") in ("high", "critical")
+                and finding_counts.get(ftype, 0) >= 3
+            ):
+                persistent_map[ftype] = f
 
-            persistent_map = {}
+        persistent = list(persistent_map.values())
 
-            for f in self.recent_findings:
-                ftype = f.get("type")
-
-                if (
-                    f.get("severity") in ("high", "critical")
-                    and finding_counts.get(ftype, 0) >= 3
-                ):
-                    persistent_map[ftype] = f
-
-            persistent = list(persistent_map.values())
-
-            # Scalars for escalation classification
-            peak_score = self.peak_anomaly_score
-
-        # ── Trend analysis (outside lock) ─────────────────────────────────────
-        # Signal extraction and semantic interpretation are kept separate so:
-        #   • each layer is independently unit-testable
-        #   • thresholds can be recalibrated without touching the math
-        #   • methodology is publishable cleanly
-
-        with self._lock:
-            anomaly_snap  = list(self.recent_anomaly_scores)
-            recovery_snap = list(self.recent_recovery)
-            speed_snap    = list(self.recent_speed)
+        if False:  # dead block — keeps linter happy about removed second lock
+            with self._lock:
+                anomaly_snap  = list(self.recent_anomaly_scores)
+                recovery_snap = list(self.recent_recovery)
+                speed_snap    = list(self.recent_speed)
 
         anomaly_signal = self._compute_trend_signal(anomaly_snap)
         recovery_signal = self._compute_trend_signal(recovery_snap)
@@ -1223,14 +1254,18 @@ class MatchState:
         def _with_transition_boost(base_confidence: float, *pairs: Tuple[str, str]) -> float:
             """
             Boost confidence by up to 0.15 per observed transition pair.
-            Multiple pairs accumulate additively, capped at 1.0.
-            Grounds confidence in empirical pathway evidence rather than
-            static thresholds alone.
+            Uses the transition snapshot captured before the lock was released
+            so this runs safely outside the lock without touching self state.
             """
-            probs = [self.transition_probability(a,b) for a, b in pairs]
+            def _tp(a: str, b: str) -> float:
+                count_ab = transition_snap.get((a, b), 0)
+                count_a  = sum(v for (fa, _), v in transition_snap.items() if fa == a)
+                if count_a == 0:
+                    return 0.0
+                return round(count_ab / count_a, 3)
 
+            probs = [_tp(a, b) for a, b in pairs]
             boost = 0.15 * max(probs, default=0.0)
-
             return round(float(np.clip(base_confidence + boost, 0.0, 1.0)), 3)
 
         # High workload + worsening recovery
@@ -1342,8 +1377,14 @@ class MatchState:
         # Component 5: transition-evidence risk
         # If the most dangerous chain (locomotor → cardiovascular → recovery)
         # has high empirical probability, escalate risk accordingly.
-        p_loco_to_cv    = self.transition_probability("locomotor_overload",    "cardiovascular_overload")
-        p_cv_to_recovery = self.transition_probability("cardiovascular_overload", "recovery_degradation")
+        # Uses transition_snap captured before the lock was released.
+        def _tp_snap(a: str, b: str) -> float:
+            count_ab = transition_snap.get((a, b), 0)
+            count_a  = sum(v for (fa, _), v in transition_snap.items() if fa == a)
+            return round(count_ab / count_a, 3) if count_a else 0.0
+
+        p_loco_to_cv     = _tp_snap("locomotor_overload",    "cardiovascular_overload")
+        p_cv_to_recovery = _tp_snap("cardiovascular_overload", "recovery_degradation")
         transition_risk  = min(1.0, (p_loco_to_cv + p_cv_to_recovery) / 2.0)
 
         risk_score = (
@@ -1379,21 +1420,28 @@ class MatchState:
         else:
             escalation_level = "normal"
 
-        return SemanticMatchState(
+        result = SemanticMatchState(
             motifs=motifs,
             trends=trends,
             persistent_findings=list(persistent),
             escalation_level=escalation_level,
             coupled_states=coupled_states,
             risk_breakdown={
-                    "motif_risk": round(motif_risk, 3),
-                    "coupled_risk": round(coupled_risk, 3),
-                    "persistence_risk": round(persistence_risk, 3),
-                    "instability_risk": round(instability_risk, 3),
-                    "transition_risk": round(transition_risk, 3),
-                    "total_risk": round(risk_score, 3),
-                },
+                "motif_risk":        round(motif_risk, 3),
+                "coupled_risk":      round(coupled_risk, 3),
+                "persistence_risk":  round(persistence_risk, 3),
+                "instability_risk":  round(instability_risk, 3),
+                "transition_risk":   round(transition_risk, 3),
+                "total_risk":        round(risk_score, 3),
+            },
         )
+
+        # Store in cache — guarded write so concurrent callers see the same object
+        with self._lock:
+            if self._cached_semantic_state is None:
+                self._cached_semantic_state = result
+
+        return result
 
 
     def _coupled_confidence(
@@ -1698,6 +1746,7 @@ class MatchState:
         self,
         current_minute: Optional[int] = None,
         current_escalation: str = "normal",
+        semantic_state: Optional["SemanticMatchState"] = None,
     ) -> None:
         """
         Re-segment the finding history into episodes and rebuild the
@@ -1705,6 +1754,15 @@ class MatchState:
  
         Call once per window AFTER record_finding() and record_telemetry()
         have been called, so the episode list reflects the latest state.
+ 
+        Parameters
+        ----------
+        current_minute      : current match minute.
+        current_escalation  : escalation level string (deprecated param kept for
+                              compatibility — ignored when semantic_state is provided).
+        semantic_state      : pre-computed SemanticMatchState from build_semantic_state().
+                              Pass this in to avoid a redundant recomputation; if None,
+                              build_semantic_state() is called internally.
  
         Thread-safe: takes a consistent snapshot under the lock, then
         runs the compressor outside the lock.
@@ -1726,8 +1784,6 @@ class MatchState:
         compressor = TemporalContextCompressor()
  
         # Rebuild episodes from the current finding snapshot.
-        # The compressor merges findings into the existing episode list,
-        # extending ongoing episodes or opening new ones as needed.
         updated_episodes = compressor.build_episodes_from_findings(
             findings_snapshot=findings_snap,
             anomaly_scores_snapshot=anomaly_snap,
@@ -1735,12 +1791,13 @@ class MatchState:
             existing_episodes=existing_eps,
         )
  
-        # Build trend summaries from the existing symbolic trend analysis.
-        # We call build_semantic_state() here to get the fully-computed
-        # TrendState objects, then flatten to direction strings.
-        semantic = self.build_semantic_state()
+        # Use the caller-supplied state if available (avoids 2nd polyfit pass).
+        # Fall back to building it when called standalone.
+        if semantic_state is None:
+            semantic_state = self.build_semantic_state()
+
         trend_sums: Dict[str, str] = {}
-        for axis, ts in semantic.trends.items():
+        for axis, ts in semantic_state.trends.items():
             if hasattr(ts, "interpretation"):
                 trend_sums[axis] = ts.interpretation.direction
             elif isinstance(ts, dict):
@@ -1753,27 +1810,107 @@ class MatchState:
         )
  
         with self._lock:
+            prev_episodes = list(self.episodes)
             self.episodes             = updated_episodes
             self.trend_summaries      = trend_sums
             self.recent_context       = recent_ctx
- 
+
+        # Persist newly closed episodes to EpisodeStore.
+        # A closed episode is one where is_ongoing() is False and it was not
+        # already in prev_episodes (i.e. it just transitioned closed this window).
+        self._persist_newly_closed_episodes(
+            prev_episodes=prev_episodes,
+            updated_episodes=updated_episodes,
+        )
+
+    def _persist_newly_closed_episodes(
+        self,
+        prev_episodes: list,
+        updated_episodes: list,
+    ) -> None:
+        """
+        Persist closed episodes to EpisodeStore exactly once each.
+
+        Uses self._persisted_episode_ids as a write-once guard: an episode is
+        written the first time it appears closed (is_ongoing() == False) and
+        never written again.  This replaces the previous prev_open_ids logic
+        which was broken because build_episodes_from_findings() rebuilds the
+        list from scratch each window, so prev_episodes never carried live
+        is_ongoing() state — prev_open_ids was always empty and nothing wrote.
+        """
+        try:
+            from config.redis_client import EpisodeStore
+        except ImportError:
+            logger.warning(
+            "REDIS IS NOT IMPORTED FROM REDIS_CLIENT")
+            return  # Redis not available in test/offline environment
+
+        from analysis.episodic_context import PlayerEpisode as _PE
+        import time as _time
+
+        store = EpisodeStore()
+        for ep in updated_episodes:
+            if not isinstance(ep, _PE):
+                continue
+            if ep.is_ongoing():
+                continue  # still active; will persist when it closes
+
+            episode_id = f"{self.match_id}_{ep.episode_index}"
+            if episode_id in self._persisted_episode_ids:
+                continue  # already written, skip
+
+            # Skip single-window flickers — they carry no meaningful signal
+            # and would bloat the episode index with noise.
+            if ep.persistence_duration < _MIN_EPISODE_PERSIST_WINDOWS:
+                logger.debug(
+                    "EpisodeStore: skipping short ep=%s player=%d "
+                    "(persistence=%d < %d)",
+                    episode_id, self.player_id,
+                    ep.persistence_duration, _MIN_EPISODE_PERSIST_WINDOWS,
+                )
+                continue
+
+            # Use end_minute as score when available (including minute 0 = match start).
+            # Do NOT use truthiness check — end_minute=0 is valid and must not fall
+            # back to wall-clock time, which would corrupt ZRANGE ordering by mixing
+            # match-minute scores (~0-90) with unix timestamps (~1.7 billion).
+            score = (
+                float(ep.end_minute)
+                if ep.end_minute is not None
+                else _time.time()
+            )
+
+            store.persist_episode_with_meta(   # was: persist_episode
+                player_id=self.player_id,
+                episode_id=episode_id,
+                episode_dict=ep.to_dict(),
+                score=score,
+            )
+            self._persisted_episode_ids.add(episode_id)
+            logger.debug(
+                "EpisodeStore: persisted ep=%s player=%d score=%.1f",
+                episode_id, self.player_id, score,
+            )
+
     def build_compressed_context(
         self,
         current_finding_types: Optional[List[str]] = None,
         current_minute: Optional[int] = None,
+        semantic_state: Optional["SemanticMatchState"] = None,
     ) -> "CompressedTemporalContext":
         """
         Build a CompressedTemporalContext from all episodic memory.
  
-        This is the primary interface for the orchestrator. Call after
-        refresh_episodes() to get the LLM-ready compressed context.
+        Call after refresh_episodes() to get the LLM-ready compressed context.
  
         Parameters
         ----------
         current_finding_types : finding types from the current anomaly window.
-                                Used to select the most relevant prior episodes
-                                for injection into the LLM prompt.
-        current_minute        : current match minute (for recent context window).
+        current_minute        : current match minute.
+        semantic_state        : pre-computed SemanticMatchState from build_semantic_state().
+                                Pass this in to avoid a redundant recomputation (avoids
+                                the 3rd polyfit pass per window); if None, build_semantic_state()
+                                is called internally.
  
         Returns
         -------
@@ -1792,12 +1929,52 @@ class MatchState:
             interventions = list(self.intervention_history)
             recent_ctx    = self.recent_context
  
-        # Compute escalation level from current semantic state
-        semantic = self.build_semantic_state()
-        escalation = semantic.escalation_level
- 
+        # Use caller-supplied state to avoid redundant polyfit.
+        if semantic_state is None:
+            semantic_state = self.build_semantic_state()
+        escalation = semantic_state.escalation_level
+
+        # ── Retrieve cross-match historical episodes ───────────────────────────
+        historical_episodes: List[dict] = []
+
+        if self._episode_store is not None:
+            try:
+                current_trend = "stable"
+
+                if semantic_state is not None:
+                    anomaly_trend = semantic_state.trends.get("anomaly")
+
+                    # TrendState object/dataclass, not dict
+                    current_trend = getattr(
+                        anomaly_trend,
+                        "direction",
+                        "stable",
+                    )
+
+                historical_episodes = self._episode_store.retrieve_relevant(
+                    player_id=self.player_id,
+                    current_findings=current_finding_types or [],
+                    current_trend=current_trend,
+                    top_k=3,
+                    candidate_pool=20,
+                )
+
+                logger.debug(
+                    "build_compressed_context: player=%d retrieved=%d historical episodes",
+                    self.player_id,
+                    len(historical_episodes),
+                )
+
+            except Exception as exc:
+                logger.warning(
+                    "build_compressed_context: episode retrieval failed player=%d: %s",
+                    self.player_id,
+                    exc,
+                )
+
         compressor = TemporalContextCompressor()
-        return compressor.compress(
+
+        ctx = compressor.compress(
             episodes=episodes,
             trend_summaries=trend_sums,
             recent_findings=findings_snap,
@@ -1805,7 +1982,34 @@ class MatchState:
             current_minute=current_minute,
             current_escalation=escalation,
             current_finding_types=current_finding_types,
+            historical_episodes=historical_episodes,
         )
+
+        # Retrieve cross-match historical episodes from EpisodeStore and
+        # attach them to the context BEFORE prompt construction.
+        # The symbolic layer (EpisodeStore.retrieve_relevant) does the
+        # reasoning; the LLM only receives the conclusions.
+        current_trend = next(
+            (v for v in trend_sums.values() if v not in ("stable", "insufficient data")),
+            "stable",
+        )
+        # try:
+        #     from config.redis_client import EpisodeStore as _ES
+        #     hist = _ES().retrieve_relevant(
+        #         player_id=self.player_id,
+        #         current_findings=current_finding_types or [],
+        #         current_trend=current_trend,
+        #         top_k=3,
+        #     )
+        #     from dataclasses import replace as _replace
+        #     ctx = _replace(ctx, historical_episodes=hist)
+        # except Exception as exc:
+        #     logger.warning(
+        #         "EpisodeStore retrieval failed for player=%d (degrading to current-match context only): %s",
+        #         self.player_id, exc,
+        #     )
+
+        return ctx
  
     # ─────────────────────────────────────────────
     # Serialization additions (extend to_dict / from_dict)
@@ -1972,6 +2176,8 @@ class MatchStateManager:
         ----------
         is_alert : True when the current window produced an alert —
                    triggers an immediate checkpoint regardless of throttle.
+                   Must NOT be set to True just to force a write; use
+                   force_checkpoint() for that.
         """
         with self._lock:
             self._dirty = True
@@ -1984,6 +2190,30 @@ class MatchStateManager:
             self.checkpoint_if_due(force=True)
         else:
             self.checkpoint_if_due()
+
+    def force_checkpoint(self, reason: str = "explicit") -> None:
+        """
+        Unconditionally flush the current state to the checkpoint store.
+
+        Use this whenever you need a guaranteed write without coupling to
+        alert semantics or window-count cadence — e.g. at match start to
+        verify store connectivity, or after a significant lifecycle event.
+
+        Unlike mark_dirty(is_alert=True) this method:
+          • does NOT increment the window counter
+          • does NOT affect the alert-triggered persistence path
+          • does NOT alter checkpoint cadence for subsequent windows
+          • marks state dirty so the write is never skipped if state is clean
+
+        Parameters
+        ----------
+        reason : free-form label written to the debug log so forced writes
+                 are always identifiable in production logs.
+        """
+        with self._lock:
+            self._dirty = True   # ensure _do_checkpoint won't no-op
+            logger.debug("force_checkpoint: reason=%r", reason)
+            self._do_checkpoint()
 
     def checkpoint_if_due(self, force: bool = False) -> None:
         """

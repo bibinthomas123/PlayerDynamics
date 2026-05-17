@@ -119,6 +119,7 @@ class PlayersDataAnalysisPipeline:
         self._inference_log: List[dict] = []
         self._on_alert_callback: Optional[Callable] = None
         self._inference_id_counter = 0
+        self._nlg_latency_ms: List[float] = []  # ring buffer for observability
 
         # ── Match state ───────────────────────────────────────────────────────
         self._match_state = MatchStateManager(
@@ -523,7 +524,11 @@ class PlayersDataAnalysisPipeline:
                 # Stage 2 — update symbolic longitudinal memory
                 # ─────────────────────────────────────────────
 
-                elapsed_s = int(xai_fv.get("elapsed_seconds", 0))
+                elapsed_s = int(
+                    # Same fix as process_window_direct: elapsed_seconds is a
+                    # raw event field absent from the model feature_vector.
+                    normalized_event.get("elapsed_seconds", 0)
+                )
 
                 for finding_dict in base_explanation.semantic_findings:
                     match_state.record_finding(
@@ -543,7 +548,7 @@ class PlayersDataAnalysisPipeline:
                 )
 
                 # ─────────────────────────────────────────────
-                # Stage 3 — build CURRENT semantic state
+                # Stage 3 — build CURRENT semantic state (once)
                 # ─────────────────────────────────────────────
 
                 semantic_state = match_state.build_semantic_state()
@@ -562,6 +567,12 @@ class PlayersDataAnalysisPipeline:
                 match_state.refresh_episodes(
                     current_minute=current_min,
                     current_escalation=semantic_state.escalation_level,
+                    semantic_state=semantic_state,   # reuse, no recompute
+                )
+
+                logger.debug(
+                    "Window clock: elapsed_s=%d current_min=%s player=%d",
+                    elapsed_s, current_min, pid,
                 )
 
                 current_finding_types = [
@@ -573,6 +584,7 @@ class PlayersDataAnalysisPipeline:
                     compressed_context = match_state.build_compressed_context(
                         current_finding_types=current_finding_types,
                         current_minute=current_min,
+                        semantic_state=semantic_state,   # reuse, no recompute
                     )
                 else:
                     compressed_context = None
@@ -580,17 +592,31 @@ class PlayersDataAnalysisPipeline:
                 # result.compressed_context = compressed_context
                 result._xai_kwargs["compressed_context"] = compressed_context
                 
-                # ── Stage 4 — final narrative generation (with episodic context) ─────────
-                explanation = self.xai_layer.generate_explanation_from_base(
+                # ── Stage 4 — async NLG dispatch ──────────────────────────────────────
+                # Alert is emitted immediately; narration is generated in a background
+                # thread and delivered via the alert callback when ready.
+                # Inference latency is never blocked by LLM generation time.
+                t_nlg_start = time.perf_counter()
+                explanation = self._dispatch_nlg_async(
                     base=base_explanation,
-                    match_state=semantic_state,
-                    compressed_context=compressed_context, 
+                    semantic_state=semantic_state,
+                    compressed_context=compressed_context,
+                    result=result,
                 )
+                self._nlg_latency_ms.append((time.perf_counter() - t_nlg_start) * 1000)
 
                 self._last_xai_ts[pid] = now
 
-        # Log inference
+        # Log inference with observability fields
         self._inference_id_counter += 1
+
+        # ── Observability metrics ─────────────────────────────────────────────
+        prompt_size     = len(compressed_context.to_prompt_block()) if compressed_context else 0
+        ep_count        = getattr(compressed_context, "episode_count", 0) if compressed_context else 0
+        hist_ep_count   = len(getattr(compressed_context, "historical_episodes", [])) if compressed_context else 0
+        raw_size        = len(list(getattr(self._match_state._state_map.get(pid, None), "recent_findings", [])) if hasattr(self._match_state, "_state_map") else [])
+        compression_ratio = round(raw_size / max(prompt_size, 1), 2) if raw_size else 0.0
+
         log_entry = {
             "inference_id":        self._inference_id_counter,
             "player_id":           pid,
@@ -604,6 +630,13 @@ class PlayersDataAnalysisPipeline:
             "feature_values":      result.feature_vector,
             "shap_values":         explanation.shap_values if explanation else {},
             "nlg_summary":         explanation.nlg_summary if explanation else "",
+            # ── observability ────────────────────────────────────────────────
+            "obs_prompt_chars":       prompt_size,
+            "obs_retrieved_episodes": ep_count,
+            "obs_historical_episodes": hist_ep_count,
+            "obs_compression_ratio":  compression_ratio,
+            "obs_nlg_engine":         explanation.nlg_engine if explanation else "none",
+            "obs_nlg_latency_ms":     round(self._nlg_latency_ms[-1], 1) if self._nlg_latency_ms else 0.0,
         }
         self._inference_log.append(log_entry)
 
@@ -615,7 +648,7 @@ class PlayersDataAnalysisPipeline:
 
         t_ms = (time.perf_counter() - t0) * 1000
         if t_ms > CONFIG.inference.max_latency_ms:
-            logger.warning("Inference latency %.1f ms > 200 ms SLA", t_ms)
+            logger.warning("Inference latency %.1f ms > 200 ms SLA (NLG async)", t_ms)
 
         if explanation is not None:
             result.nlg_summary = explanation.nlg_summary
@@ -628,7 +661,138 @@ class PlayersDataAnalysisPipeline:
         )
         self._match_state.mark_dirty(is_alert=is_alert)
         return result
-    
+
+    def _dispatch_nlg_async(
+        self,
+        base,
+        semantic_state,
+        compressed_context,
+        result,
+    ):
+        """
+        Dispatch NLG generation in a background thread.
+
+        Queue discipline — staleness-aware, not FIFO suppression
+        ──────────────────────────────────────────────────────────
+        Problem with simple FIFO dropping (NLG_MAX_QUEUE_DEPTH=4 → drop new):
+          Under burst load the most recent, highest-severity alert gets dropped
+          while older lower-priority narrations stay queued.  In a realtime
+          system, recent operational state always matters more than old queued
+          narration.
+
+        Solution: evict-oldest-stale, keep-newest
+          1. Prune the pending queue: cancel any future that has been waiting
+             longer than NLG_STALE_AGE_S (default 12 s = ~2 LLM round-trips).
+             Stale narration describes state that has already passed — useless.
+          2. If queue still exceeds NLG_MAX_QUEUE_DEPTH after pruning,
+             cancel the oldest remaining future regardless of staleness.
+             This makes room for the new (more recent) submission.
+          3. If the incoming alert is "critical" severity, skip the depth
+             check entirely — critical alerts are always narrated.
+
+        Queue depth and drop counts are logged each call for load-test observability.
+        """
+        import concurrent.futures as _cf
+
+        NLG_MAX_QUEUE_DEPTH = 4      # max pending futures before eviction kicks in
+        NLG_STALE_AGE_S     = 12.0   # futures older than this are unconditionally stale
+
+        if not hasattr(self, "_nlg_executor"):
+            self._nlg_executor  = _cf.ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="nlg"
+            )
+            # Each entry: (future, submitted_at_monotonic, severity_int)
+            self._nlg_pending: List[tuple] = []
+            # Lifetime drop counters for observability
+            self._nlg_drops_stale: int = 0
+            self._nlg_drops_depth: int = 0
+
+        _SEV_INT = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+        incoming_sev = _SEV_INT.get(
+            getattr(semantic_state, "escalation_level", "normal")
+            .replace("elevated", "medium").replace("none", "low"),
+            0,
+        )
+        is_critical = incoming_sev >= 3
+
+        now_mono = time.monotonic()
+
+        # ── Step 1: prune completed and stale futures ─────────────────────────
+        pruned_stale = 0
+        live_pending = []
+        for (f, submitted_at, sev) in self._nlg_pending:
+            if f.done():
+                continue   # already finished — drop from tracking
+            age = now_mono - submitted_at
+            if age > NLG_STALE_AGE_S:
+                f.cancel()   # best-effort; no-op if already running
+                pruned_stale += 1
+                self._nlg_drops_stale += 1
+                logger.debug(
+                    "NLG queue: cancelled stale future age=%.1fs sev=%d "
+                    "(lifetime stale_drops=%d)",
+                    age, sev, self._nlg_drops_stale,
+                )
+            else:
+                live_pending.append((f, submitted_at, sev))
+        self._nlg_pending = live_pending
+
+        queue_depth = len(self._nlg_pending)
+        logger.debug(
+            "NLG queue depth=%d pruned_stale=%d incoming_sev=%d critical=%s "
+            "lifetime(stale=%d depth=%d)",
+            queue_depth, pruned_stale, incoming_sev, is_critical,
+            self._nlg_drops_stale, self._nlg_drops_depth,
+        )
+
+        # ── Step 2: evict oldest if still over depth (non-critical only) ──────
+        if not is_critical and queue_depth >= NLG_MAX_QUEUE_DEPTH:
+            oldest_future, oldest_ts, oldest_sev = self._nlg_pending.pop(0)
+            oldest_future.cancel()
+            self._nlg_drops_depth += 1
+            logger.warning(
+                "NLG queue full (depth=%d): evicted oldest future age=%.1fs sev=%d "
+                "for incoming sev=%d (lifetime depth_drops=%d)",
+                queue_depth, now_mono - oldest_ts, oldest_sev, incoming_sev,
+                self._nlg_drops_depth,
+            )
+
+        # ── Step 3: submit the new task ───────────────────────────────────────
+        def _do_nlg():
+            try:
+                return self.xai_layer.generate_explanation_from_base(
+                    base=base,
+                    match_state=semantic_state,
+                    compressed_context=compressed_context,
+                )
+            except Exception as exc:
+                logger.exception("Async NLG failed: %s", exc)
+                return None
+
+        try:
+            future = self._nlg_executor.submit(_do_nlg)
+            self._nlg_pending.append((future, now_mono, incoming_sev))
+
+            # Block for at most 50 ms on the first call so startup doesn't emit
+            # an empty summary.  After that return immediately.
+            wait_s = 0.05 if self._inference_id_counter <= 1 else 0.0
+            try:
+                explanation = future.result(timeout=wait_s)
+                return explanation
+            except _cf.TimeoutError:
+                logger.debug("NLG async: background in progress, returning template")
+                return self.xai_layer.generate_explanation_from_base(
+                    base=base,
+                    match_state=semantic_state,
+                    compressed_context=None,
+                )
+
+        except Exception as exc:
+            logger.exception("NLG dispatch error: %s", exc)
+            return None
+        
+
+
     def _effective_confidence(
         self,
         validity_confidence: float,
@@ -844,7 +1008,10 @@ class PlayersDataAnalysisPipeline:
                 ),
                 persistence_windows=result.persistence_windows,
                 elapsed_s=int(
-                    xai_fv.get(
+                    # elapsed_seconds is a raw event field — it is NOT part of
+                    # the model feature vector and will be 0 if read from xai_fv.
+                    # Read directly from the latest window event instead.
+                    latest_event.get(
                         "elapsed_seconds",
                         0,
                     )
@@ -898,7 +1065,10 @@ class PlayersDataAnalysisPipeline:
 
                     result.base_explanation = base_explanation
 
-                    elapsed_s = int(xai_fv.get("elapsed_seconds", 0))
+                    # elapsed_seconds must come from the raw event, not xai_fv.
+                    # The model feature_vector does not carry this field, so
+                    # xai_fv.get("elapsed_seconds") is always 0 → minute=0.
+                    elapsed_s = int(latest_event.get("elapsed_seconds", 0))
 
                     for finding_dict in base_explanation.semantic_findings:
                         match_state.record_finding(
@@ -913,14 +1083,10 @@ class PlayersDataAnalysisPipeline:
                         elapsed_seconds=elapsed_s,
                     )
 
-                    # Snapshot AFTER findings + alert are recorded so motifs,
-                    # trends, and persistent_findings are populated.
-                    # main.py's "FORCE synchronous LLM generation" block reads
-                    # result.semantic_state and passes it to generate_nlg() —
-                    # that is the single LLM call for this alert.
-                    # Do NOT call generate_explanation_from_base() here; doing
-                    # so causes a second Ollama call whose output is overwritten
-                    # by main.py's call ~10 seconds later, doubling latency.
+                    # Build semantic state ONCE after findings + alert are recorded.
+                    # Pass it into refresh_episodes and build_compressed_context so
+                    # neither method calls build_semantic_state() internally — that
+                    # would be the 2nd and 3rd polyfit pass per window.
                     semantic_state = match_state.build_semantic_state()
 
                     current_min = elapsed_s // 60 if elapsed_s else None
@@ -928,6 +1094,12 @@ class PlayersDataAnalysisPipeline:
                     match_state.refresh_episodes(
                         current_minute=current_min,
                         current_escalation=semantic_state.escalation_level,
+                        semantic_state=semantic_state,   # reuse, no recompute
+                    )
+
+                    logger.debug(
+                        "Window clock: elapsed_s=%d current_min=%s player=%d",
+                        elapsed_s, current_min, player_id,
                     )
 
                     current_finding_types = [
@@ -935,15 +1107,10 @@ class PlayersDataAnalysisPipeline:
                         for fd in base_explanation.semantic_findings
                     ]
 
-                    # Always build compressed context from accumulated match state history.
-                    # Even when the current window has no semantic findings (quality gate
-                    # suppressed them), prior windows may have populated episodes, transitions,
-                    # and recurring patterns that are still valid context for the LLM.
-                    # is_empty() inside format_episodic_context() will suppress the block
-                    # if there is genuinely nothing to report.
                     compressed_context = match_state.build_compressed_context(
                         current_finding_types=current_finding_types,
                         current_minute=current_min,
+                        semantic_state=semantic_state,   # reuse, no recompute
                     )
 
                     result.compressed_context = compressed_context
@@ -1027,6 +1194,14 @@ class PlayersDataAnalysisPipeline:
         self._active_match_id = match_id
         self._match_state.start_match(match_id)
         restored = self._match_state.restore_if_active(match_id)
+
+        # Write an empty checkpoint immediately at match start.
+        # Purpose: verify store connectivity early and anchor the match_id +
+        # match_start_ts in the store so restore_if_active() can detect
+        # same-match resumptions after a crash.
+        # force_checkpoint() keeps alert semantics and window cadence clean.
+        self._match_state.force_checkpoint(reason="match_start")
+
         if restored:
             logger.info("Match started: %s — resumed %d player state(s) from checkpoint", match_id, restored)
         else:
