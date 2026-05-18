@@ -33,33 +33,92 @@ class DeterministicCalibrationManager:
         self.store = HardenedRollingThresholdStore(player_id)
         self._current_version = 0
 
-    def process_window(self, window_id: str, loss: float, confidence: float, timestamp: datetime):
+    def process_window(
+        self,
+        window_id: str,
+        loss: float,
+        confidence: float,
+        timestamp: datetime,
+        match_id: Optional[str] = None,
+        model_version: str = "unknown",
+    ):
+        """Feed one scored window into the calibration pipeline.
+
+        This is the ONLY legal path through which HardenedRollingThresholdStore
+        may mutate. The sequence is strictly:
+
+          1. add_window()                   — pure data ingestion, no mutation
+          2. should_adapt()                 — read-only predicate
+          3. compute_proposed_threshold()   — read-only proposal
+          4. journal.commit()               — durable record written first
+          5. apply_adaptation()             — store mutates ONLY after journal confirms
+
+        If the journal commit fails, apply_adaptation() is never called.
+        The store state and the journal therefore stay consistent under crashes.
         """
-        Processes a window for calibration. If an adaptation occurs,
-        it is committed to the journal.
-        """
-        # The store handles the internal logic of quarantine/drift.
-        # We wrap the 'attempt_adaptation' to make it a versioned mutation.
+        # Step 1: ingest data — no side effects on threshold state
         self.store.add_window(window_id, loss, confidence, timestamp)
 
-        if self.store.attempt_adaptation():
-            # Adaptation happened! Create a deterministic mutation record.
-            new_version = self.store.calibration_version
-            new_threshold = self.store.get_threshold()
+        # Step 2: check whether adaptation criteria are met (read-only)
+        if not self.store.should_adapt():
+            return
 
-            mutation = StateMutation(
-                mutation_id=f"calib_{self.player_id}_{new_version}",
-                target_object=f"calibration_{self.player_id}",
-                previous_version=self._current_version,
-                new_version=new_version,
-                change_set={"threshold": new_threshold},
-                event_id=window_id # Causal link to the window that triggered it
-            )
+        # Step 3: compute what the threshold would become (read-only)
+        proposed_threshold = self.store.compute_proposed_threshold()
+        if proposed_threshold is None:
+            # Vetting or drift check would reject — quarantine already cleared
+            # inside compute_proposed_threshold via apply_adaptation guard logic.
+            # Force-clear quarantine so the store doesn't re-trigger next window.
+            self.store.quarantine.clear()
+            return
 
-            if self.journal.commit(mutation):
+        version_before = self._current_version
+        new_version    = version_before + 1
+
+        # Step 4: write the journal record BEFORE mutating the store
+        mutation = StateMutation(
+            mutation_id=f"calib_{self.player_id}_{new_version}",
+            target_object=f"calibration_{self.player_id}",
+            previous_version=version_before,
+            new_version=new_version,
+            change_set={
+                "threshold":      proposed_threshold,
+                "match_id":       match_id,
+                "model_version":  model_version,
+                "version_before": version_before,
+                "version_after":  new_version,
+            },
+            event_id=window_id,  # causal link: which inference window triggered this
+        )
+
+        if self.journal.commit(mutation):
+            # Step 5: apply only after journal confirms durability
+            applied = self.store.apply_adaptation()
+            if applied:
                 self._current_version = new_version
-                logger.info("Deterministic Calibration Commit: Player %d v%d -> v%d (Thr: %.4f)",
-                             self.player_id, self._current_version - 1, new_version, new_threshold)
+                logger.info(
+                    "Deterministic Calibration Commit: Player %d v%d -> v%d "
+                    "(threshold: %.4f match: %s model: %s)",
+                    self.player_id, version_before, new_version,
+                    proposed_threshold, match_id, model_version,
+                )
+            else:
+                logger.warning(
+                    "Player %d: journal committed v%d but apply_adaptation() rejected — "
+                    "journal and store version are now inconsistent. "
+                    "This indicates a race condition or quarantine state change between "
+                    "compute_proposed_threshold() and apply_adaptation().",
+                    self.player_id, new_version,
+                )
+
+    def get_current_threshold(self, quantile: float = 0.995) -> float:
+        """Return the current calibrated threshold for injection into analyze_window.
+
+        Returns float('inf') when the store is not yet calibrated (< 30 windows),
+        which causes analyze_window to treat all windows as non-anomalous — the
+        correct safe default before enough baseline data is collected.
+        """
+        return self.store.get_threshold(quantile)
 
     def recover_from_journal(self):
         """Restores the calibration state from the mutation journal."""

@@ -116,7 +116,6 @@ except ImportError:
     TQDM_AVAILABLE = False
 from utils.ema import EMASmoother
 from utils.alert_manager import AlertManager, AlertLevel
-from utils.reliability.calibration_store import HardenedRollingThresholdStore
 from config.settings import LSTMAutoencoderConfig
 import numpy as np
 import pandas as pd
@@ -4268,6 +4267,7 @@ class PatternAnalysisEngine:
         mask:        np.ndarray,
         live_event:  dict,
         sessions_df: pd.DataFrame,
+        operational_threshold: Optional[float] = None,
     ) -> Optional[AnomalyResult]:
         """Run the full ML + heuristic scoring pipeline on a completed window.
  
@@ -4275,6 +4275,18 @@ class PatternAnalysisEngine:
         (live-serving path via ``build_live_window``).  Stateless with respect
         to the window buffer — ``sequence`` and ``mask`` must already be built
         by the caller.
+
+        Parameters
+        ----------
+        operational_threshold:
+            When provided, overrides the regime-tracker threshold for anomaly
+            classification. Must be supplied by the orchestrator from
+            DeterministicCalibrationManager.get_current_threshold() to ensure
+            the journaled threshold value is what drives detection.
+            When None, falls back to the per-player RegimeAwareThresholdStore
+            (training-time calibration only — acceptable before live adaptation
+            has occurred, not acceptable once DeterministicCalibrationManager
+            has committed at least one version).
  
         Parameters
         ----------
@@ -4393,7 +4405,17 @@ class PatternAnalysisEngine:
         #     )
         
 
-        if tracker and tracker.is_calibrated:
+        if operational_threshold is not None:
+            # Injected from DeterministicCalibrationManager — this is the
+            # journaled, replay-safe value. Use it directly.
+            if operational_threshold == float("inf"):
+                is_anomaly, confidence = False, 0.0
+            else:
+                is_anomaly = smoothed_loss > operational_threshold
+                confidence = tracker.confidence_for(smoothed_loss, regime_key) if (
+                    tracker and tracker.is_calibrated
+                ) else float(smoothed_loss > operational_threshold)
+        elif tracker and tracker.is_calibrated:
             is_anomaly = smoothed_loss > tracker.threshold_for(regime_key)
             confidence = tracker.confidence_for(smoothed_loss, regime_key)
         else:

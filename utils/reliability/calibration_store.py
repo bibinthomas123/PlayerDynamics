@@ -44,7 +44,7 @@ class HardenedRollingThresholdStore:
         self.drift_threshold = 0.15     # KS-test statistic limit
         self.adaptation_cooldown_s = 3600 # 1 hour cooldown between updates
 
-        self._last_update_at = datetime.min.replace(tzinfo=timezone.utc)
+        self._last_update_at = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     def add_window(self, window_id: str, loss: float, confidence: float, timestamp: datetime):
         """Adds a window to the quarantine buffer for vetting."""
@@ -65,11 +65,109 @@ class HardenedRollingThresholdStore:
         )
         self.quarantine.append(window)
 
-        if len(self.quarantine) >= self.quarantine_threshold:
-            self.attempt_adaptation()
+    # ------------------------------------------------------------------
+    # Read-only predicates — no side effects, safe to call at any time
+    # ------------------------------------------------------------------
+
+    def should_adapt(self) -> bool:
+        """Return True when the quarantine is full and cooldown has elapsed.
+
+        Pure predicate: reads state only, never mutates it.
+        Call this from DeterministicCalibrationManager to decide whether
+        to open a mutation transaction — do NOT call attempt_adaptation()
+        directly from outside this module.
+        """
+        if len(self.quarantine) < self.quarantine_threshold:
+            return False
+        now = datetime.now(tz=timezone.utc)
+        return (now - self._last_update_at).total_seconds() >= self.adaptation_cooldown_s
+
+    def compute_proposed_threshold(self, quantile: float = 0.995) -> Optional[float]:
+        """Compute what the threshold *would* become if adaptation is applied.
+
+        Pure computation: reads quarantine + windows, never mutates them.
+        Returns None when vetting or drift checks would reject the update.
+        """
+        healthy_candidates = [w for w in self.quarantine if w.is_healthy]
+        if not healthy_candidates:
+            return None
+
+        if self.is_calibrated():
+            active_losses = np.array([w.loss for w in self.windows])
+            cand_losses   = np.array([w.loss for w in healthy_candidates])
+            stat, _       = ks_2samp(active_losses, cand_losses)
+            if stat > self.drift_threshold:
+                return None  # drift check would reject
+
+        # Simulate the merged window set to compute the proposed value
+        merged = list(self.windows) + healthy_candidates
+        merged = merged[-self.max_windows:]
+        losses = np.array([w.loss for w in merged])
+        cutoff = np.quantile(losses, 0.95)
+        clean  = losses[losses <= cutoff]
+        return float(np.quantile(clean, quantile))
+
+    # ------------------------------------------------------------------
+    # Write path — called ONLY by DeterministicCalibrationManager
+    # ------------------------------------------------------------------
+
+    def apply_adaptation(self) -> bool:
+        """Commit the quarantine into the active window set and bump version.
+
+        MUST only be called after:
+          1. should_adapt() returned True
+          2. compute_proposed_threshold() returned a non-None value
+          3. DeterministicCalibrationManager has committed the mutation to journal
+
+        Returns True if the adaptation was applied, False if vetting rejects it
+        (e.g. no healthy windows or drift check fails — same guards as before).
+        """
+        now = datetime.now(tz=timezone.utc)
+        healthy_candidates = [w for w in self.quarantine if w.is_healthy]
+
+        if not healthy_candidates:
+            self.quarantine.clear()
+            return False
+
+        if self.is_calibrated():
+            active_losses = np.array([w.loss for w in self.windows])
+            cand_losses   = np.array([w.loss for w in healthy_candidates])
+            stat, _       = ks_2samp(active_losses, cand_losses)
+            if stat > self.drift_threshold:
+                logger.warning(
+                    "Calibration drift detected (KS=%.3f). Adaptation rejected.", stat
+                )
+                self.quarantine.clear()
+                return False
+
+        self.windows.extend(healthy_candidates)
+        self.windows = self.windows[-self.max_windows:]
+        self.quarantine.clear()
+        self.calibration_version += 1
+        self._last_update_at = now
+        return True
 
     def attempt_adaptation(self) -> bool:
-        """Vets quarantine and updates the active threshold set."""
+        """Vets quarantine and updates the active threshold set.
+
+        .. deprecated::
+            Do not call this directly. Use the split interface:
+              1. should_adapt()                  — predicate, no side effects
+              2. compute_proposed_threshold()    — read-only proposal
+              3. apply_adaptation()              — write path, journal first
+
+            Direct calls bypass DeterministicCalibrationManager and break
+            replay-safe mutation authority. This method is retained only for
+            backward compatibility during migration and will be removed.
+        """
+        import warnings
+        warnings.warn(
+            "attempt_adaptation() called directly — this bypasses the "
+            "DeterministicCalibrationManager journal and breaks replay safety. "
+            "Use should_adapt() / compute_proposed_threshold() / apply_adaptation() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         now = datetime.now(tz=timezone.utc)
         if (now - self._last_update_at).total_seconds() < self.adaptation_cooldown_s:
             return False
