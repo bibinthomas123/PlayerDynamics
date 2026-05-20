@@ -79,7 +79,7 @@ Telemetry Stream (GPS/REST/WS/MQTT)
   │  └──────────────────────────────────────────────┘  │
   │  ┌──────────────────────────────────────────────┐  │
   │  │  Auxiliary Detectors                         │  │
-  │  │  · FatigueCurveComparator  (speed decay fit) │  │
+  │  │  · FatigueCurveAnalyzer    (speed decay fit) │  │
   │  │  · PositionalDriftAnalyzer (GPS centroid)    │  │
   │  │  · WorkloadTrendTracker    (ACWR 0.8–1.5)    │  │
   │  └──────────────────────────────────────────────┘  │
@@ -293,25 +293,25 @@ A single telemetry event passes through ten distinct processing stages before re
 | `explainability/xai_layer.py` | `XAILayer`, `LLMNLGEngine`, `TemplateNLGEngine` | Temporal feature ablation, SHAP routing, Qwen2.5:14b NLG |
 | `explainability/semantics_layer.py` | `SemanticInterpreter` | Symbolic physiological reasoning — cardiovascular, locomotor, workload, tactical |
 | `explainability/shap_compat.py` | `compute_shap_values`, `build_kmeans_background` | SHAP with magnitude-proxy fallback; background deduplication guard |
-| `explainability/state_compression.py` | `StateCompressor` | Compresses `SemanticFinding` streams into trajectory narratives, escalation summaries, and episodic abstractions before LLM conditioning |
+| `explainability/episodic_context.py` | `TemporalContextCompressor`, `CompressedTemporalContext`, `PlayerEpisode`, `TacticalEpisode` | Compresses `SemanticFinding` streams into trajectory narratives, escalation summaries, and episodic abstractions before LLM conditioning |
 
 ### Cache-Augmented Generation
 
 | File | Class | Responsibility |
 | :--- | :--- | :--- |
-| `cag/redis_store.py` | `RedisCAGStore` | Per-player SHAP attribution cache and `SemanticFinding` history; sorted-set TTL management |
-| `cag/context_builder.py` | `CAGContextBuilder` | Retrieves cached findings and attributions; assembles augmented context for `SemanticInterpreter` |
+| `cag/redis_client.py` | `RedisCheckpointStore`, `EpisodeStore` | Per-player SHAP attribution cache and `SemanticFinding` history; sorted-set TTL management |
+| `cag/redis_client.py` | `RedisPubSubClient`, `RedisConnectionPool` | Pub/sub event streaming; connection pool management |
 
 ### Reliability Layer
 
 | File | Class | Responsibility |
 | :--- | :--- | :--- |
 | `utils/reliability/invariants.py` | `SystemInvariantGuard` | Machine-enforced system invariants; triggers graded Safe Mode |
-| `utils/reliability/safe_mode.py` | `SafeMode` | Four-level degradation: NORMAL → LEVEL_1 → LEVEL_2 → LEVEL_3 |
+| `utils/reliability/safe_mode.py` | `SafeModeController` | Four-level degradation: NORMAL → LEVEL_1 → LEVEL_2 → LEVEL_3 |
 | `utils/reliability/determinism.py` | `MutationJournal`, `TemporalCausalityGuard` | Versioned calibration log, strict event-time monotonicity |
 | `utils/reliability/calibration_store.py` | `HardenedRollingThresholdStore` | Quarantine buffers, drift monitoring, thread-safe threshold store |
-| `utils/reliability/adaptation_engine.py` | `AdaptationEngine` | Crash-safe, versioned calibration updates |
-| `utils/reliability/queue_manager.py` | `PriorityQueueManager` | Priority-aware backpressure; sheds LLM tasks before SHAP before inference |
+| `utils/reliability/adaptation_engine.py` | `DeterministicCalibrationManager` | Crash-safe, versioned calibration updates |
+| `utils/reliability/queue_manager.py` | `BoundedPriorityQueue` | Priority-aware backpressure; sheds LLM tasks before SHAP before inference |
 
 ### Ingestion & Infrastructure
 
@@ -541,7 +541,7 @@ Options:
 {
   "player_id": 7,
   "external_id": "p007",
-  "recommendation_type": "substitution",
+  "recommendation_type": "substitute",
   "confidence": 0.923,
   "anomaly_score": 0.418,
   "fatigue_flag": true,
@@ -564,11 +564,12 @@ Options:
 
 | Priority | `recommendation_type` | Trigger condition |
 | :---: | :--- | :--- |
-| 1 | `substitution` | Anomaly + fatigue flag + confidence > 85% |
-| 2 | `fatigue_alert` | Fatigue flag without high confidence |
-| 3 | `positional_drift` | Tactical zone violation |
-| 4 | `workload_warning` | ACWR outside [0.8, 1.5] safe band |
-| 5 | `anomaly_flag` | Model anomaly + confidence > 75% |
+| 1 | `substitute` | Recurrent cross-match pattern + sustained persistence (≥4 windows) + high/critical escalation |
+| 2 | `recovery_intervention` | Cardiovascular or recovery degradation finding, sustained (≥3 windows), high/critical severity |
+| 3 | `workload_restriction` | Fatigue accumulation finding OR ACWR ≥ 1.30, sustained ≥2 windows |
+| 4 | `tactical_adjustment` | Tactical instability finding, any severity |
+| 5 | `performance_monitor` | Locomotor overload finding with worsening trend |
+| 6 | `anomaly_flag` | Default fallback; no specific rule matched |
 
 ---
 
@@ -693,7 +694,7 @@ Accumulates `SemanticFinding` objects over the full match timeline. Provides mot
 
 ### 4. NLG Engine
 
-`LLMNLGEngine` calls `qwen2.5:14b` via Ollama asynchronously (off the SLA clock) with a `OLLAMA_NLG_TIMEOUT_S` timeout (default 30 s). The LLM receives a **compressed state representation** from the `StateCompressor` — not raw telemetry or the full finding stream — ensuring prompt entropy is minimised and physiological reasoning remains in the symbolic layer. On timeout or connection failure, `TemplateNLGEngine` provides a deterministic, sub-millisecond fallback.
+`LLMNLGEngine` calls `qwen2.5:14b` via Ollama asynchronously (off the SLA clock) with a `OLLAMA_NLG_TIMEOUT_S` timeout (default 30 s). The LLM receives a **compressed state representation** from the `TemporalContextCompressor` — not raw telemetry or the full finding stream — ensuring prompt entropy is minimised and physiological reasoning remains in the symbolic layer. On timeout or connection failure, `TemplateNLGEngine` provides a deterministic, sub-millisecond fallback.
 
 **NLG summary guarantee:** Every emitted alert carries a non-empty `nlg_summary`. Alerts where SHAP is on cooldown (60 s XAI cooldown between full SHAP runs per player) receive an immediate template summary backed by cached attribution context from Redis. Alerts where SHAP runs receive the richer LLM-backed summary via the async worker.
 
@@ -712,7 +713,7 @@ Naively feeding the LLM a full stream of `SemanticFinding` objects accumulates f
 
 ### Compression Pipeline
 
-`StateCompressor` (in `explainability/state_compression.py`) operates in three stages after `MatchStateManager` has accumulated findings for the current episode:
+`TemporalContextCompressor` (in `explainability/episodic_context.py`) operates in three stages after `MatchStateManager` has accumulated findings for the current episode:
 
 **1. Trajectory Narrative**
 Constructs a structured summary of the player's physiological trajectory over the last `compression.trajectory_window_steps` (default 5) inference windows. Each named domain (`cardiovascular_load`, `locomotor_load`, etc.) is represented by its direction vector (stable / worsening / recovering) and peak severity, not by individual finding instances. This reduces a 5-window finding sequence to a single structured object per domain.
@@ -743,7 +744,7 @@ Total: ~160–200 tokens of structured context, regardless of match duration or 
 
 ### Integration with Redis CAG
 
-The compression layer is cache-aware. Before building the trajectory narrative, `StateCompressor` queries `RedisCAGStore` for the player's cached SHAP attributions from the XAI cooldown period. This ensures that windows where full SHAP was not recomputed (due to the 60 s cooldown) still contribute their attribution signal to the trajectory narrative via the cached values, rather than appearing as gaps.
+The compression layer is cache-aware. Before building the trajectory narrative, `TemporalContextCompressor` queries `RedisCheckpointStore` / `EpisodeStore` for the player's cached SHAP attributions from the XAI cooldown period. This ensures that windows where full SHAP was not recomputed (due to the 60 s cooldown) still contribute their attribution signal to the trajectory narrative via the cached values, rather than appearing as gaps.
 
 ---
 
@@ -765,10 +766,10 @@ For a closed, structured domain like per-player physiological findings, RAG's re
 ### Cached Artefacts
 
 **SHAP attribution cache (`player_id:shap:window_ts`)**
-After each SHAP run, the 8-feature attribution vector is written to Redis with a `REDIS_CAG_TTL_S` TTL (default 3600 s). During the 60-second XAI cooldown between full SHAP runs per player, the `SemanticInterpreter` and `StateCompressor` read the most recent cached attribution rather than falling back to zero-weight attribution. This means the trajectory narrative always reflects real attribution signal, not silence.
+After each SHAP run, the 8-feature attribution vector is written to Redis with a `REDIS_CAG_TTL_S` TTL (default 3600 s). During the 60-second XAI cooldown between full SHAP runs per player, the `SemanticInterpreter` and `TemporalContextCompressor` read the most recent cached attribution rather than falling back to zero-weight attribution. This means the trajectory narrative always reflects real attribution signal, not silence.
 
 **SemanticFinding history (`player_id:findings` sorted set)**
-Each `SemanticFinding` emitted by the `SemanticInterpreter` is appended to a per-player Redis sorted set, scored by Unix timestamp. `CAGContextBuilder` retrieves the N most recent findings (default N=10) before interpreter runs, enabling trend-aware symbolic reasoning:
+Each `SemanticFinding` emitted by the `SemanticInterpreter` is appended to a per-player Redis sorted set, scored by Unix timestamp. `EpisodeStore` retrieves the N most recent findings (default N=10) before interpreter runs, enabling trend-aware symbolic reasoning:
 
 ```python
 # Without CAG: interpreter sees only current window
@@ -786,7 +787,7 @@ This is the critical enabler for multi-window trend detection — the interprete
 
 ### Graceful Degradation
 
-When Redis is unavailable, `RedisCAGStore` returns empty context objects. The `SemanticInterpreter` falls back to single-window classification, and the `StateCompressor` builds trajectory narratives from in-memory `MatchStateManager` state only. No alerts are suppressed; the finding quality degrades gracefully from trend-aware to window-local.
+When Redis is unavailable, `RedisCheckpointStore` / `EpisodeStore` returns empty context objects. The `SemanticInterpreter` falls back to single-window classification, and the `TemporalContextCompressor` builds trajectory narratives from in-memory `MatchStateManager` state only. No alerts are suppressed; the finding quality degrades gracefully from trend-aware to window-local.
 
 ```
 REDIS_CAG_AVAILABLE=True  →  trend-aware findings, full trajectory narrative
@@ -870,7 +871,7 @@ The SLA timer (`t_start`) is set immediately after the accumulator emits a compl
 
 **Temporal Causality Guard:** Detects timestamp reversals and epoch discontinuities before accumulation, triggering epoch-scoped runtime resets. Configurable strict/warn mode.
 
-**Priority-aware backpressure (`PriorityQueueManager`):** Under load, tasks are shed in reverse priority — LLM summaries dropped first, then SHAP, then inference — ensuring the 200 ms SLA is preserved even when the LLM is slow or unavailable.
+**Priority-aware backpressure (`BoundedPriorityQueue`):** Under load, tasks are shed in reverse priority — LLM summaries dropped first, then SHAP, then inference — ensuring the 200 ms SLA is preserved even when the LLM is slow or unavailable.
 
 ---
 
