@@ -12,21 +12,25 @@ Real-time anomaly detection platform for professional football. Transforms high-
 ## Table of Contents
 
 1. [System Architecture](#system-architecture)
-2. [Tech Stack](#tech-stack)
-3. [File Map](#file-map)
-4. [Quick Start](#quick-start)
-5. [Installation](#installation)
-6. [Configuration](#configuration)
-7. [CLI Reference](#cli-reference)
-8. [Data Schema](#data-schema)
-9. [ML Pipeline](#ml-pipeline)
-10. [Explainability (XAI)](#explainability-xai)
-11. [Reliability & Hardening](#reliability--hardening)
-12. [Fairness & Recalibration](#fairness--recalibration)
-13. [Logging & Observability](#logging--observability)
-14. [Exit Codes](#exit-codes)
-15. [Known Limitations & Roadmap](#known-limitations--roadmap)
-16. [References](#references)
+2. [Event Lifecycle](#event-lifecycle)
+3. [Tech Stack](#tech-stack)
+4. [File Map](#file-map)
+5. [Quick Start](#quick-start)
+6. [Installation](#installation)
+7. [Configuration](#configuration)
+8. [CLI Reference](#cli-reference)
+9. [Data Schema](#data-schema)
+10. [ML Pipeline](#ml-pipeline)
+11. [Explainability (XAI)](#explainability-xai)
+12. [Temporal State Compression](#temporal-state-compression)
+13. [Cache-Augmented Generation (Redis CAG)](#cache-augmented-generation-redis-cag)
+14. [Reliability & Hardening](#reliability--hardening)
+15. [Replay Consistency Guarantees](#replay-consistency-guarantees)
+16. [Fairness & Recalibration](#fairness--recalibration)
+17. [Logging & Observability](#logging--observability)
+18. [Exit Codes](#exit-codes)
+19. [Known Limitations & Roadmap](#known-limitations--roadmap)
+20. [References](#references)
 
 ---
 
@@ -89,7 +93,25 @@ Telemetry Stream (GPS/REST/WS/MQTT)
   │  · SemanticInterpreter        (symbolic reasoning)  │
   │  · LLMNLGEngine (Qwen2.5:14b) ─→ TemplateNLGEngine │
   └────────────────────┬────────────────────────────────┘
-                       │  SHAPExplanation + nlg_summary
+                       │  SemanticFindings + SHAP attributions
+                       ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  Redis CAG Layer                                    │  ◄── Cache-Augmented Generation
+  │  · Per-player SHAP attribution cache                │
+  │  · SemanticFinding history (sorted sets, TTL-gated) │
+  │  · Augments SemanticInterpreter with cached context │
+  │    without re-running SHAP over past windows        │
+  └────────────────────┬────────────────────────────────┘
+                       │  Augmented findings
+                       ▼
+  ┌─────────────────────────────────────────────────────┐
+  │  Temporal State Compression                         │
+  │  · Trajectory narrative builder                     │
+  │  · Escalation summary encoder                       │
+  │  · Episodic abstraction (episode_id-scoped)         │
+  │  Compresses finding stream → structured LLM prompt  │
+  └────────────────────┬────────────────────────────────┘
+                       │  Compressed state + SHAPExplanation
                        ▼
   ┌─────────────────────────────────────────────────────┐
   │  Alert FSM (AlertManager)                           │
@@ -110,6 +132,79 @@ Telemetry Stream (GPS/REST/WS/MQTT)
   │  · MutationJournal  (versioned threshold audit)     │
   └─────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Event Lifecycle
+
+A single telemetry event passes through ten distinct processing stages before reaching the coach. This diagram provides the mental model for navigating the codebase.
+
+```
+  Raw Telemetry Event (GPS · HR · accelerometry)
+          │
+          │  player_external_id, ts, speed_ms, heart_rate_bpm, …
+          ▼
+  ┌───────────────────────┐
+  │  1. Validity Gate     │  Pre-accumulation timestamp guard
+  │     (TVL)             │  Epoch discontinuity → buffer reset
+  └──────────┬────────────┘  INVALID → dropped  |  DEGRADED → flagged
+             │
+             ▼
+  ┌───────────────────────┐
+  │  2. Sequence Window   │  LiveWindowAccumulator ring buffer
+  │     (24-event stride) │  Emits one window per 24 raw packets
+  └──────────┬────────────┘  Post-window plausibility re-check (TVL)
+             │
+             ▼
+  ┌───────────────────────┐
+  │  3. Shared Model      │  SharedBackboneAutoencoder
+  │     (LSTM + FiLM)     │  Regime-routed threshold comparison
+  └──────────┬────────────┘  EMA-smoothed anomaly score
+             │
+             ▼
+  ┌───────────────────────┐
+  │  4. Attribution       │  Temporal Feature Ablation (F+2 calls)
+  │     (SHAP / Ablation) │  SHAP KernelExplainer when available
+  └──────────┬────────────┘  Magnitude-proxy fallback (shap_compat)
+             │
+             ▼
+  ┌───────────────────────┐
+  │  5. Semantic Findings │  SemanticInterpreter
+  │                       │  SHAP weights → typed SemanticFinding
+  └──────────┬────────────┘  Domains: cardiovascular · locomotor ·
+             │               workload · tactical · persistence
+             ▼
+  ┌───────────────────────┐
+  │  6. Redis CAG         │  Augment current findings with
+  │     (Context Cache)   │  cached SHAP history + prior findings
+  └──────────┬────────────┘  Deterministic, zero-retrieval-latency
+             │               per-player longitudinal context
+             ▼
+  ┌───────────────────────┐
+  │  7. State Compression │  MatchStateManager
+  │                       │  Finding stream → trajectory narrative
+  └──────────┬────────────┘  Motif detection · escalation summary ·
+             │               episodic abstraction (episode_id-scoped)
+             ▼
+  ┌───────────────────────┐
+  │  8. Policy Engine     │  AlertManager FSM
+  │     (Alert FSM)       │  Hysteresis · cooldown · Safe Mode
+  └──────────┬────────────┘  Recommendation priority ladder
+             │
+             ▼
+  ┌───────────────────────┐
+  │  9. NLG Layer         │  LLMNLGEngine (Qwen2.5:14b, async)
+  │                       │  Receives compressed state only —
+  └──────────┬────────────┘  not raw telemetry or full history
+             │               TemplateNLGEngine fallback (<1 ms)
+             ▼
+  ┌───────────────────────┐
+  │  10. Coach Dashboard  │  NDJSON alert → stdout
+  │                       │  nlg_summary · top_features ·
+  └───────────────────────┘  counterfactual · latency_ms
+```
+
+**SLA boundary:** The 200 ms clock runs from stage 2 (window emission) through stage 8 (alert FSM output). Stages 9–10 are asynchronous and off the SLA clock.
 
 ---
 
@@ -148,6 +243,7 @@ Telemetry Stream (GPS/REST/WS/MQTT)
 | :--- | :--- |
 | **PostgreSQL** | Primary store; `psycopg2` for sync ORM, `asyncpg` for async paths |
 | **SQLAlchemy** | ORM models — `Player`, `Session`, `PlayerEvent`, audit logs |
+| **Redis** | CAG backing store; per-player SHAP attribution cache and `SemanticFinding` history (sorted sets, TTL-gated); deterministic context augmentation without retrieval latency |
 
 ### Python Standard Library (key modules)
 
@@ -171,6 +267,7 @@ Telemetry Stream (GPS/REST/WS/MQTT)
 | `tqdm` | Progress bars replaced with `logger.info()` calls |
 | `pynmea2` | GPS serial/TCP adapter disabled; REST + WS still work |
 | `aiohttp` | REST polling adapter disabled |
+| `redis` | CAG disabled; `SemanticInterpreter` operates without cached history |
 
 ---
 
@@ -181,11 +278,11 @@ Telemetry Stream (GPS/REST/WS/MQTT)
 | File | Class / Entry Point | Responsibility |
 | :--- | :--- | :--- |
 | `main.py` | `main()` | Production CLI entrypoint (`generate · train · evaluate · serve · audit`) |
-| `analysis/orchestrator.py` | `PlayersDataAnalysisPipeline` | Wires ingestion → TVL → ML → XAI → FSM → feedback; match lifecycle |
+| `analysis/orchestrator.py` | `PlayersDataAnalysisPipeline` | Wires ingestion → TVL → ML → XAI → CAG → compression → FSM → feedback; match lifecycle |
 | `analysis/anomaly_detection.py` | `SharedBackboneAutoencoder`, `PatternAnalysisEngine` | LSTM AE training + inference, threshold calibration, positional drift |
 | `analysis/baseline.py` | `BaselineBuilder`, `PlayerBaselineProfile` | 28-day rolling baselines, fatigue curve fitting, ACWR tracking |
 | `analysis/regime.py` | `SessionRegimeClassifier`, `RegimeAwareThresholdStore` | 9-regime (Territory × Intensity) window classification and threshold routing |
-| `analysis/match_state.py` | `MatchStateManager`, `SemanticMatchState` | Longitudinal match memory, motif detection, trend reasoning |
+| `analysis/match_state.py` | `MatchStateManager`, `SemanticMatchState` | Longitudinal match memory, motif detection, trend reasoning, state compression |
 | `analysis/live_window_accumulator.py` | `LiveWindowAccumulator` | Per-player ring buffer; emits fixed-stride inference windows |
 | `analysis/telemetry_validity.py` | `TelemetryValidityLayer` | Physical plausibility gate (`VALID` / `DEGRADED` / `INVALID`); replay-aware timestamp validation |
 
@@ -196,6 +293,14 @@ Telemetry Stream (GPS/REST/WS/MQTT)
 | `explainability/xai_layer.py` | `XAILayer`, `LLMNLGEngine`, `TemplateNLGEngine` | Temporal feature ablation, SHAP routing, Qwen2.5:14b NLG |
 | `explainability/semantics_layer.py` | `SemanticInterpreter` | Symbolic physiological reasoning — cardiovascular, locomotor, workload, tactical |
 | `explainability/shap_compat.py` | `compute_shap_values`, `build_kmeans_background` | SHAP with magnitude-proxy fallback; background deduplication guard |
+| `explainability/state_compression.py` | `StateCompressor` | Compresses `SemanticFinding` streams into trajectory narratives, escalation summaries, and episodic abstractions before LLM conditioning |
+
+### Cache-Augmented Generation
+
+| File | Class | Responsibility |
+| :--- | :--- | :--- |
+| `cag/redis_store.py` | `RedisCAGStore` | Per-player SHAP attribution cache and `SemanticFinding` history; sorted-set TTL management |
+| `cag/context_builder.py` | `CAGContextBuilder` | Retrieves cached findings and attributions; assembles augmented context for `SemanticInterpreter` |
 
 ### Reliability Layer
 
@@ -264,6 +369,9 @@ pip install aiohttp websockets asyncio-mqtt pynmea2
 # Database drivers
 pip install sqlalchemy psycopg2-binary asyncpg
 
+# CAG backing store
+pip install redis
+
 # Optional: progress bars
 pip install tqdm
 
@@ -289,6 +397,9 @@ All configuration is driven by environment variables and typed dataclasses in `c
 | `DB_NAME` | `players_data` | Database name |
 | `DB_USER` | `postgres` | Database user |
 | `DB_PASSWORD` | `` | Database password |
+| `REDIS_HOST` | `localhost` | Redis host for CAG store |
+| `REDIS_PORT` | `6379` | Redis port |
+| `REDIS_CAG_TTL_S` | `3600` | TTL for cached SHAP and SemanticFinding entries (seconds) |
 | `GPS_SERIAL_PORT` | `/dev/ttyUSB0` | Serial port for NMEA GPS |
 | `GPS_TCP_HOST` | `None` | TCP host for gpsd / NMEA-over-TCP |
 | `GPS_TCP_PORT` | `2947` | TCP port for gpsd |
@@ -311,6 +422,8 @@ All configuration is driven by environment variables and typed dataclasses in `c
 | `AnomalyScoringConfig` | `threshold_quantile` | `0.995` | Quantile for large calibration sets (>=150 windows) |
 | `AnomalyScoringConfig` | `score_ema_alpha` | `0.25` | EMA smoothing factor for anomaly scores |
 | `SHAPConfig` | `n_background_samples` | `30` | Background samples for feature ablation |
+| `CompressionConfig` | `max_findings_per_episode` | `12` | Finding cap before episodic abstraction triggers |
+| `CompressionConfig` | `trajectory_window_steps` | `5` | Window count for trajectory narrative construction |
 | `FeedbackConfig` | `recalibration_cadence_days` | `7` | Scheduled recalibration interval |
 | `FairnessConfig` | `flag_rate_disparity_threshold` | `0.15` | Max allowed flag-rate gap between groups |
 
@@ -400,19 +513,12 @@ Options:
   --log-level LEVEL                                               [default: INFO]
 ```
 
-**SLA model:** The 200 ms SLA covers inference only (LSTM forward pass + threshold comparison). LLM NLG generation runs asynchronously off the SLA clock via a thread pool with a 30 s timeout. Two latency figures are observable:
+**SLA model:** The 200 ms SLA covers inference only (LSTM forward pass + threshold comparison + state compression). LLM NLG generation runs asynchronously off the SLA clock via a thread pool with a 30 s timeout. Two latency figures are observable:
 
 | Metric | What it covers | Where it appears |
 | :--- | :--- | :--- |
-| `latency_ms` in alert payload | Inference only (T1) | stdout NDJSON, inference log |
+| `latency_ms` in alert payload | Inference + compression (T1) | stdout NDJSON, inference log |
 | Ollama call duration | Async NLG completion (T2) | `Slow Ollama call` WARNING in stderr |
-
-**Replay mode behaviour:** Historical replay streams frequently interleave events from distinct source sessions. Raw `session_id` transitions in replay streams do not represent live continuity boundaries. In `--replay-mode`:
-
-- Accumulator does not reset on session boundary transitions or timestamp gaps
-- TVL classifies timestamp reversals as `replay_non_monotonic_timestamp` (DEGRADED, confidence floored at 0.8) rather than INVALID
-- TVL classifies large inter-session gaps as `replay_timestamp_gap_*` (no confidence penalty) rather than `timestamp_gap_*` (-0.3)
-- These replay-specific issue markers are distinct from their live equivalents so audit queries on `non_monotonic_timestamp` continue to find only genuine sensor failures
 
 **Input event fields** (NDJSON, one event per line):
 
@@ -579,17 +685,113 @@ Converts raw SHAP attributions into typed `SemanticFinding` objects across five 
 | `tactical` | `x_pitch`, `y_pitch`, positional drift |
 | `persistence` | Longitudinal recurrence patterns |
 
-The LLM receives `SemanticFinding` objects and acts as narrator only — physiological reasoning lives in this symbolic layer, not in the prompt.
+The `SemanticInterpreter` is augmented by the Redis CAG layer (see [Cache-Augmented Generation](#cache-augmented-generation-redis-cag)): before classifying current-window attributions, the interpreter retrieves cached SHAP results and prior `SemanticFinding` objects for the player, enabling trend-aware symbolic reasoning without recomputing past windows. The LLM receives `SemanticFinding` objects and acts as narrator only — physiological reasoning lives in this symbolic layer, not in the prompt.
 
 ### 3. Match State
 
-Accumulates `SemanticFinding` objects over the full match timeline. Provides motif detection (repeated finding patterns within a session) and trend reasoning (increasing/decreasing severity over time). `build_semantic_summary()` feeds the LLM prompt with longitudinal context.
+Accumulates `SemanticFinding` objects over the full match timeline. Provides motif detection (repeated finding patterns within a session) and trend reasoning (increasing/decreasing severity over time). `build_semantic_summary()` feeds the state compression layer, which condenses the finding stream before LLM conditioning.
 
 ### 4. NLG Engine
 
-`LLMNLGEngine` calls `qwen2.5:14b` via Ollama asynchronously (off the SLA clock) with a `OLLAMA_NLG_TIMEOUT_S` timeout (default 30 s). On timeout or connection failure, `TemplateNLGEngine` provides a deterministic, sub-millisecond fallback.
+`LLMNLGEngine` calls `qwen2.5:14b` via Ollama asynchronously (off the SLA clock) with a `OLLAMA_NLG_TIMEOUT_S` timeout (default 30 s). The LLM receives a **compressed state representation** from the `StateCompressor` — not raw telemetry or the full finding stream — ensuring prompt entropy is minimised and physiological reasoning remains in the symbolic layer. On timeout or connection failure, `TemplateNLGEngine` provides a deterministic, sub-millisecond fallback.
 
-**NLG summary guarantee:** Every emitted alert carries a non-empty `nlg_summary`. Alerts where SHAP is on cooldown (60 s XAI cooldown between full SHAP runs per player) receive an immediate template summary. Alerts where SHAP runs receive the richer LLM-backed summary via the async worker.
+**NLG summary guarantee:** Every emitted alert carries a non-empty `nlg_summary`. Alerts where SHAP is on cooldown (60 s XAI cooldown between full SHAP runs per player) receive an immediate template summary backed by cached attribution context from Redis. Alerts where SHAP runs receive the richer LLM-backed summary via the async worker.
+
+---
+
+## Temporal State Compression
+
+### Motivation
+
+Naively feeding the LLM a full stream of `SemanticFinding` objects accumulates four compounding problems as a match progresses:
+
+- **Prompt entropy** — unrelated findings from different match phases dilute the signal relevant to the current alert.
+- **Repeated findings** — the same physiological pattern (e.g., `hr_recovery` below baseline) may appear in every window of a sustained episode, adding tokens without adding information.
+- **Temporal redundancy** — findings from 70 minutes ago carry little diagnostic weight for a substitution decision at 85 minutes.
+- **Alert flooding** — without compression, the LLM receives the same escalation narrative on every window of a sustained episode, producing near-identical summaries.
+
+### Compression Pipeline
+
+`StateCompressor` (in `explainability/state_compression.py`) operates in three stages after `MatchStateManager` has accumulated findings for the current episode:
+
+**1. Trajectory Narrative**
+Constructs a structured summary of the player's physiological trajectory over the last `compression.trajectory_window_steps` (default 5) inference windows. Each named domain (`cardiovascular_load`, `locomotor_load`, etc.) is represented by its direction vector (stable / worsening / recovering) and peak severity, not by individual finding instances. This reduces a 5-window finding sequence to a single structured object per domain.
+
+```
+cardiovascular_load: worsening  (peak severity: HIGH, onset: window -3)
+locomotor_load:      stable     (severity: MEDIUM)
+tactical:            recovering (drift cleared at window -1)
+```
+
+**2. Escalation Summary**
+Encodes the Alert FSM trajectory for the current episode as a compact descriptor:
+`NONE → WARNING (w=2) → SUSTAINED (w=4) → gate_windows=6`. This gives the LLM the full escalation arc in a single token-efficient string, replacing per-window FSM state repetition.
+
+**3. Episodic Abstraction**
+When `compression.max_findings_per_episode` (default 12) is exceeded within a single `episode_id`, older findings are collapsed into a typed episode header: `[EPISODE_START: cardiovascular+locomotor, onset 00:74:12, initial_confidence 0.81]`. Only findings from the most recent 3 windows are passed verbatim. This preserves longitudinal behavioural structure — the LLM knows what kind of episode this is and when it started — while eliminating token-for-token repetition of resolved findings.
+
+### What the LLM Receives
+
+The compressed prompt contains:
+- **Trajectory narrative** (domain → direction + severity): ~40–80 tokens
+- **Escalation summary** (FSM arc): ~15 tokens
+- **Episodic header** (if applicable): ~25 tokens
+- **Current-window top SHAP features** (from ablation or cache): ~60 tokens
+- **Counterfactual** (what would clear the alert): ~20 tokens
+
+Total: ~160–200 tokens of structured context, regardless of match duration or episode length. Without compression, a 90-minute match with 5-window findings would accumulate ~2,700+ tokens of raw finding history.
+
+### Integration with Redis CAG
+
+The compression layer is cache-aware. Before building the trajectory narrative, `StateCompressor` queries `RedisCAGStore` for the player's cached SHAP attributions from the XAI cooldown period. This ensures that windows where full SHAP was not recomputed (due to the 60 s cooldown) still contribute their attribution signal to the trajectory narrative via the cached values, rather than appearing as gaps.
+
+---
+
+## Cache-Augmented Generation (Redis CAG)
+
+### Design Rationale
+
+The system implements Cache-Augmented Generation (CAG) — as opposed to Retrieval-Augmented Generation (RAG) — using Redis as the backing store. The distinction is consequential for a real-time inference pipeline:
+
+| | CAG (this system) | RAG (not used) |
+| :--- | :--- | :--- |
+| **Retrieval** | Deterministic key lookup (`player_id:shap`, `player_id:findings`) | Approximate nearest-neighbour search |
+| **Latency** | O(1) Redis GET / ZRANGE | Vector store query latency (5–50 ms typical) |
+| **Correctness** | Exact cached artefacts; no retrieval error | Relevant documents may not be returned |
+| **Domain** | Closed, structured (per-player physiological history) | Open, unstructured (general knowledge) |
+
+For a closed, structured domain like per-player physiological findings, RAG's retrieval flexibility is unnecessary and its latency and retrieval error are unacceptable within the 200 ms SLA. CAG provides the right tradeoff.
+
+### Cached Artefacts
+
+**SHAP attribution cache (`player_id:shap:window_ts`)**
+After each SHAP run, the 8-feature attribution vector is written to Redis with a `REDIS_CAG_TTL_S` TTL (default 3600 s). During the 60-second XAI cooldown between full SHAP runs per player, the `SemanticInterpreter` and `StateCompressor` read the most recent cached attribution rather than falling back to zero-weight attribution. This means the trajectory narrative always reflects real attribution signal, not silence.
+
+**SemanticFinding history (`player_id:findings` sorted set)**
+Each `SemanticFinding` emitted by the `SemanticInterpreter` is appended to a per-player Redis sorted set, scored by Unix timestamp. `CAGContextBuilder` retrieves the N most recent findings (default N=10) before interpreter runs, enabling trend-aware symbolic reasoning:
+
+```python
+# Without CAG: interpreter sees only current window
+findings = interpreter.classify(current_shap, current_window)
+
+# With CAG: interpreter sees current window + longitudinal context
+cached_context = cag_store.get_recent_findings(player_id, n=10)
+cached_shap    = cag_store.get_latest_shap(player_id)
+findings = interpreter.classify(current_shap, current_window,
+                                context=cached_context,
+                                prior_shap=cached_shap)
+```
+
+This is the critical enabler for multi-window trend detection — the interpreter can classify a finding as `persistence` (recurrent pattern) rather than `first_occurrence` only because the cached history is available without reprocessing the `MatchStateManager` trajectory.
+
+### Graceful Degradation
+
+When Redis is unavailable, `RedisCAGStore` returns empty context objects. The `SemanticInterpreter` falls back to single-window classification, and the `StateCompressor` builds trajectory narratives from in-memory `MatchStateManager` state only. No alerts are suppressed; the finding quality degrades gracefully from trend-aware to window-local.
+
+```
+REDIS_CAG_AVAILABLE=True  →  trend-aware findings, full trajectory narrative
+REDIS_CAG_AVAILABLE=False →  window-local findings, in-memory trajectory only
+```
 
 ---
 
@@ -620,10 +822,6 @@ Telemetry validation operates in two stages:
 Replay-specific issue strings (`replay_*`) are distinct from live equivalents so audit queries on `non_monotonic_timestamp` or `timestamp_gap_*` continue to find only genuine sensor failures, not expected replay stream disorder.
 
 Status values: `VALID` (confidence=1.0), `DEGRADED` (0.0–0.8), `INVALID` (0.0). Inference is blocked for `INVALID` events. `DEGRADED` events are inferred but flagged. The Alert FSM shifts to `HOLD` when event confidence <0.4.
-
-**`replay_mode` propagation:** The `--replay-mode` flag is threaded from `cmd_serve` → `_build_pipeline(replay_mode)` → `PlayersDataAnalysisPipeline(replay_mode)` → `TelemetryValidityLayer(replay_mode)` → `process_window_direct(replay_mode)` → `_effective_confidence()`. This ensures the 0.8 confidence floor and relaxed timestamp semantics are applied consistently across all layers without duplicating policy logic.
-
-**TVL epoch reset:** When the `LiveWindowAccumulator` detects a continuity break and sets a reset flag, the serve loop calls `pipeline.tvl.reset_player(player_id)` to clear TVL's per-player timestamp history. Without this, TVL would compare the first event of the new epoch against the last timestamp of the previous session, spuriously producing `non_monotonic_timestamp`.
 
 ### Alert Finite-State Machine
 
@@ -659,32 +857,59 @@ Buffers 24 raw telemetry packets per player before emitting one inference window
 
 - 1,092 telemetry packets → ~45 inference cycles instead of 1,092
 - Reduces: alert duplication from near-identical overlapping buffers, fake persistence increments on every packet, exploding trajectory lengths, motif reinforcement without new information
-- Resets automatically on confirmed continuity breaks:
-  - session boundary transitions (live mode only)
-  - timestamp discontinuities
-  - epoch-scale temporal gaps
-- Buffer resets propagate through a unified epoch-reset path that atomically clears:
-  - EMA smoothing state
-  - positional trajectory buffers
-  - alert FSM persistence state
-  - rolling match-state trajectories
-  - TVL per-player timestamp history (`reset_player()`)
-  - output cooldown gates
-- `consume_reset_flag()` exposes reset propagation to the serve loop while preserving replay-safe operation.
+- Resets automatically on confirmed continuity breaks (session boundary transitions, timestamp discontinuities, epoch-scale temporal gaps)
+- Buffer resets propagate through a unified epoch-reset path that atomically clears EMA state, positional trajectory buffers, alert FSM persistence state, rolling match-state trajectories, TVL per-player timestamp history, and output cooldown gates
 
 ### SLA Measurement
 
-The SLA timer (`t_start`) is set immediately after the accumulator emits a complete window, not at raw packet receipt. This ensures the 200 ms budget measures only inference time — LSTM forward pass, threshold comparison, result assembly — and is not inflated by the time spent accumulating the preceding 23 events in the window.
+The SLA timer (`t_start`) is set immediately after the accumulator emits a complete window. The 200 ms budget measures inference time — LSTM forward pass, threshold comparison, result assembly, and state compression — and is not inflated by accumulation time or asynchronous LLM NLG.
 
 ### Exactly-Once Semantics & Determinism
 
-**Event fingerprinting (`MutationJournal`):** Each calibration update is content-hashed. Idempotent replay: duplicate updates from Redis retries or worker crashes are silently dropped.
+**Event fingerprinting (`MutationJournal`):** Each calibration update is content-hashed. Idempotent replay: duplicate updates are silently dropped.
 
-**Temporal Causality Guard:** Detects timestamp reversals and epoch discontinuities before accumulation, triggering epoch-scoped runtime resets when continuity cannot be preserved. Configurable strict/warn mode.
-
-**Replay-safe state:** `serve_state.json` serialises baselines and threshold tracker state required for deterministic cold-start serving and replay reconstruction.
+**Temporal Causality Guard:** Detects timestamp reversals and epoch discontinuities before accumulation, triggering epoch-scoped runtime resets. Configurable strict/warn mode.
 
 **Priority-aware backpressure (`PriorityQueueManager`):** Under load, tasks are shed in reverse priority — LLM summaries dropped first, then SHAP, then inference — ensuring the 200 ms SLA is preserved even when the LLM is slow or unavailable.
+
+---
+
+## Replay Consistency Guarantees
+
+Replay consistency is a first-class design concern. Most sports AI systems process historical data without guaranteeing that the inference, alert, and explanation outputs produced during replay are bitwise-reproducible and semantically equivalent to what would have been produced in live operation. This system provides explicit guarantees across four layers.
+
+### 1. Deterministic Event Ordering
+
+The `TemporalCausalityGuard` enforces strict event-time monotonicity across all ingestion paths. In replay mode, timestamp reversals that are expected artefacts of interleaved multi-session streams are classified as `replay_non_monotonic_timestamp` (DEGRADED, confidence floored at 0.8) rather than triggering buffer resets. This preserves inference continuity through interleaved streams while keeping the live `non_monotonic_timestamp` marker clean for genuine sensor failure auditing.
+
+The replay-specific issue taxonomy (`replay_non_monotonic_timestamp`, `replay_timestamp_gap_*`) is distinct from live equivalents at every layer — TVL classification, log emission, and audit query — so post-match analysis of replay logs cannot be contaminated by expected stream disorder.
+
+### 2. Persistence Accumulation Semantics
+
+In live mode, the `LiveWindowAccumulator` resets on session boundary transitions and timestamp gaps > 60 s. In `--replay-mode`, these resets are suppressed because historical streams routinely interleave events from unrelated source sessions, and session-boundary transitions in the stream do not represent genuine continuity breaks. The accumulator instead relies solely on the `TemporalCausalityGuard` for epoch-scoped resets, preserving the same accumulation semantics that governed alert persistence during live operation.
+
+### 3. State Transition Integrity
+
+The unified epoch-reset path ensures that when a continuity break does occur in replay, the full runtime state is cleared atomically: EMA smoothing state, positional trajectory buffers, Alert FSM persistence counters, rolling match-state trajectories, TVL timestamp history, Redis CAG context (player findings and SHAP cache), and output cooldown gates are all reset together. Partial state resets — where the FSM clears but the EMA does not, for example — are architecturally prevented by routing all resets through a single `reset_player()` call chain.
+
+### 4. Telemetry Confidence Behaviour
+
+The 0.8 confidence floor applied to `DEGRADED` replay events is propagated consistently through the full pipeline: from `TelemetryValidityLayer._effective_confidence()` through `AlertManager` (which gates on confidence < 0.4 for `HOLD`) and through the inference log (`confidence` field in every NDJSON entry). This means that post-match confidence distributions computed from the inference log accurately reflect the replay-time confidence behaviour, enabling reproducible threshold sensitivity analysis.
+
+The `--replay-mode` flag is threaded from `cmd_serve` → `_build_pipeline(replay_mode)` → `PlayersDataAnalysisPipeline(replay_mode)` → `TelemetryValidityLayer(replay_mode)` → `process_window_direct(replay_mode)` → `_effective_confidence()` without duplicating policy logic at any layer.
+
+### Replay vs. Live: Behavioural Differences Summary
+
+| Behaviour | Live mode | Replay mode (`--replay-mode`) |
+| :--- | :--- | :--- |
+| Timestamp reversal | INVALID → buffer reset | DEGRADED (conf 0.8) → inference proceeds |
+| Timestamp gap > 60 s | Buffer reset | No reset |
+| Session boundary transition | Buffer reset | No reset |
+| TVL issue label | `non_monotonic_timestamp` | `replay_non_monotonic_timestamp` |
+| Audit query contamination | Genuine sensor failures only | Replay disorder isolated to `replay_*` labels |
+| Confidence floor on DEGRADED | 0.0–0.8 (unclamped) | 0.8 (floored) |
+
+These differences are intentional and documented. They ensure replay outputs are maximally useful for post-match analysis and debugging while preserving the integrity of live sensor-failure auditing.
 
 ---
 
@@ -726,9 +951,11 @@ All threshold adjustments are recorded in `MutationJournal` for full auditabilit
 
 ### Inference Log (`logs/inference_log.jsonl`)
 
-Written by `serve` for every processed window (not just alerts). Fields: `inference_id`, `player_id`, `external_id`, `session_id`, `recommendation_type`, `is_anomaly`, `anomaly_score`, `confidence`, `fatigue_flag`, `drift_flag`, `workload_flag`, `nlg_summary`, `ts`. This file is the input to `audit`.
+Written by `serve` for every processed window (not just alerts). Fields: `inference_id`, `player_id`, `external_id`, `session_id`, `recommendation_type`, `is_anomaly`, `anomaly_score`, `confidence`, `fatigue_flag`, `drift_flag`, `workload_flag`, `nlg_summary`, `compression_tokens`, `cag_hit`, `ts`.
 
-When async LLM NLG completes, an enriched entry is appended with `"_nlg_enrichment": true`, `nlg_summary_llm`, and full `shap_values`. This allows downstream consumers to distinguish the immediate template summary from the richer async LLM output.
+`cag_hit: true` indicates the window used Redis-cached SHAP attributions (XAI cooldown was active). `compression_tokens` records the token count of the compressed state passed to the LLM, enabling prompt efficiency monitoring.
+
+When async LLM NLG completes, an enriched entry is appended with `"_nlg_enrichment": true`, `nlg_summary_llm`, and full `shap_values`.
 
 ### Key Log Events to Monitor
 
@@ -736,14 +963,15 @@ When async LLM NLG completes, an enriched entry is appended with `"_nlg_enrichme
 | :--- | :--- |
 | `ALERT player=… type=… conf=… latency=… ms` | Alert emitted to stdout |
 | `SLA breach: player=… latency=…ms > 200ms` | Inference exceeded SLA; investigate model load |
+| `CAG hit: player=… shap_cached=True findings_cached=N` | SemanticInterpreter augmented from Redis |
+| `CAG miss: player=… redis_unavailable` | Redis down; falling back to single-window classification |
+| `STATE COMPRESSED: player=… tokens=… findings_collapsed=N` | Episodic abstraction triggered; N findings collapsed to header |
 | `BUFFER RESET reason=session_change` | LiveWindowAccumulator cleared on new session |
-| `BUFFER RESET reason=time_gap gap=…s` | Timestamp gap >60 s detected; buffer cleared |
 | `EPOCH RESET \| player=… reason=… cleared=[…]` | Unified runtime state reset triggered by continuity break |
-| `Telemetry degraded player=… status=INVALID issues=[…]` | TVL rejected event; only live sensor issues appear at WARNING level |
-| `Telemetry degraded player=… status=DEGRADED issues=['borderline_speed_…']` | Speed within 20% margin above ceiling; inference proceeds |
+| `Telemetry degraded player=… status=INVALID issues=[…]` | TVL rejected event; only live sensor issues appear at WARNING |
 | `AlertManager: ENTERING GLOBAL SAFE MODE` | System-wide alert suppression active |
 | `SHAP computation failed, using fallback` | SHAP library error; magnitude-proxy used |
-| `Slow Ollama call: model=… ms` | LLM NLG took longer than expected (T2 latency); alert already emitted |
+| `Slow Ollama call: model=… ms` | LLM NLG took longer than expected; alert already emitted |
 | `circuit breaker tripped — switching to template NLG` | Ollama unavailable; template fallback active for 30 s |
 
 Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_gap_*`) are logged at DEBUG level only and do not appear in WARNING output during normal replay operation.
@@ -767,12 +995,13 @@ Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_
 
 **Current limitations:**
 
-- The 200 ms SLA applies to inference only (T1). LLM NLG generation (T2) is asynchronous and decoupled via a 30 s timeout with deterministic template fallback. Both latencies are observable separately in logs and the inference log.
+- The 200 ms SLA covers inference and state compression (T1). LLM NLG generation (T2) is asynchronous and decoupled via a 30 s timeout with deterministic template fallback. Both latencies are observable separately in logs and the inference log.
 - Temporal feature ablation explains the derived feature vector, not raw LSTM hidden states. True SHAP over the full sequence space would require ~2,000 model calls per window (~2–15 s), violating the SLA.
 - `SessionRegimeClassifier` uses rule-based Territory × Intensity bins. Match phase (first/second half) is not included because elapsed-time context is not threaded through the calibration interface at training time.
-- `PatternAnalysisEngine` is not thread-safe. Callers must serialise access per event loop or process. One engine per asyncio event loop or per process is the supported deployment model.
+- `PatternAnalysisEngine` is not thread-safe. One engine per asyncio event loop or per process is the supported deployment model.
 - `TransformerAutoencoder` is experimental and disabled in production.
-- Historical replay streams may interleave telemetry originating from unrelated source sessions. Replay mode resolves continuity from timestamps rather than dataset session provenance. Anomaly scores in replay mode will vary significantly across gate windows as the stream cycles through different historical sessions.
+- Redis CAG TTL is uniform across all artefact types. SHAP attributions and `SemanticFinding` objects have different useful lifetimes (SHAP: ~1 match; findings: ~1 session) that a tiered TTL policy would address.
+- Historical replay streams may interleave telemetry from unrelated source sessions. Anomaly scores in replay mode will vary across gate windows as the stream cycles through different historical sessions.
 
 **Roadmap:**
 
@@ -782,6 +1011,8 @@ Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_
 - Kafka consumer integration for multi-worker `serve` deployments.
 - FastAPI wrapper exposing `process_window_direct()` as a REST endpoint for integration with external dashboards.
 - Elapsed-time axis in regime classification (match phase as a third regime dimension).
+- Tiered Redis TTL policy: short TTL for SHAP attributions (match-scoped), longer TTL for compressed episodic abstractions (season-scoped post-match analysis).
+- Redis Streams integration for distributed exactly-once event fingerprinting across multi-worker `serve` deployments.
 
 ---
 
@@ -795,13 +1026,17 @@ Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_
 6. Lundberg & Lee (2017) — SHAP: A Unified Approach to Interpreting Model Predictions; DOI: https://doi.org/10.48550/arXiv.1705.07874
 7. Hochreiter & Schmidhuber (1997) — Long Short-Term Memory
 8. Bai et al. (2018) — An Empirical Evaluation of Generic Convolutional and Recurrent Networks for Sequence Modeling; DOI: https://doi.org/10.48550/arXiv.1803.01271
-9. Matthew Caron & Oliver Müller (2023) - TacticalGPT: Uncovering the Potential of LLMs for Predicting Tactical Decisions in Professional Football
-10. Emilio Ferrara (2024) - Large Language Models for Wearable Sensor-Based Human Activity Recognition, DOI: https://doi.org/10.3390/s24155045
-11. GuangLiang Yang (2024) - ChatPPG: Multi-Modal Alignment of Large Language Models for Time-Series Forecasting in Table Tennis 
-12. Wenbo Tian, Ruting Lin, Hongxian Zheng, Yaodong Yang, Geng Wu, Zihao Zhang and Zhang Zhang (2025) - SportsGPT: An LLM-driven Framework for Interpretable Sports Motion Assessment and Training Guidance; DOI: https://doi.org/10.48550/arXiv.2512.14121
-13. Ziao Liu, Xiao Xie, Moqi He, Wenshuo Zhao, Yihong Wu, Liqi Cheng (2024) - Smartboard: Visual Exploration of Team Tactics with LLM Agent; DOI: https://doi.org/10.1109/TVCG.2024.3456200
-14. Mohammad Feli, Iman Azimi, Pasi Liljeberg, Amir M. Rahmani (2025) - An LLM-Powered Agent for Physiological Data Analysis: A Case Study on PPG-based Heart Rate Estimation; DOI: https://doi.org/10.1109/EMBC58623.2025.11254428
-15. Haotian Xia, Zhengbang Yang, Yuqing Wang, Rhys Tracy, Yun Zhao, Dongdong Huang, Zezhi Chen, Yan Zhu, Yuan-fang Wang, Weining Shen - SportQA: A Benchmark for Sports Understanding in Large Language Models (2024) ; DOI: https://doi.org/10.18653/v1/2024.naacl-long.283
-16. Konstantinos Apostolou, Christos Tjortjis (2019) - Sports Analytics algorithms for performance prediction; https://doi.org/10.1109/IISA.2019.8900754
-17. Vangelis Sarlis, Christos Tjortjis (2020) - Sports analytics — Evaluation of basketball players and team performance; DOI: https://doi.org/10.1016/j.is.2020.101562
-18. Indrajeet Ghosh, Sreenivasan Ramasamy Ramamurthy, Avijoy Chakma, Nirmalya Roy (2023) - Sports analytics review: Artificial intelligence applications, emerging technologies, and algorithmic perspective; DOI: https://doi.org/10.1002/widm.1496
+9. Caron & Müller (2023) — TacticalGPT: Uncovering the Potential of LLMs for Predicting Tactical Decisions in Professional Football
+10. Ferrara (2024) — Large Language Models for Wearable Sensor-Based Human Activity Recognition; DOI: https://doi.org/10.3390/s24155045
+11. Yang (2024) — ChatPPG: Multi-Modal Alignment of Large Language Models for Time-Series Forecasting in Table Tennis
+12. Tian et al. (2025) — SportsGPT: An LLM-driven Framework for Interpretable Sports Motion Assessment and Training Guidance; DOI: https://doi.org/10.48550/arXiv.2512.14121
+13. Liu et al. (2024) — Smartboard: Visual Exploration of Team Tactics with LLM Agent; DOI: https://doi.org/10.1109/TVCG.2024.3456200
+14. Feli et al. (2025) — An LLM-Powered Agent for Physiological Data Analysis; DOI: https://doi.org/10.1109/EMBC58623.2025.11254428
+15. Xia et al. (2024) — SportQA: A Benchmark for Sports Understanding in Large Language Models; DOI: https://doi.org/10.18653/v1/2024.naacl-long.283
+16. Apostolou & Tjortjis (2019) — Sports Analytics algorithms for performance prediction; DOI: https://doi.org/10.1109/IISA.2019.8900754
+17. Sarlis & Tjortjis (2020) — Sports analytics — Evaluation of basketball players and team performance; DOI: https://doi.org/10.1016/j.is.2020.101562
+18. Ghosh et al. (2023) — Sports analytics review: AI applications, emerging technologies, and algorithmic perspective; DOI: https://doi.org/10.1002/widm.1496
+19. Chan et al. (2025) — Don't Do RAG: When Cache-Augmented Generation is Better than Retrieval Augmented Generation; DOI: https://doi.org/10.48550/arXiv.2412.15605
+20. Lewis et al. (2020) — Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks; DOI: https://doi.org/10.48550/arXiv.2005.11401
+21. Perez et al. (2018) — FiLM: Visual Reasoning with a General Conditioning Layer; AAAI 2018
+22. Gabbett (2016) — The training-injury prevention paradox; DOI: https://doi.org/10.1136/bjsports-2015-095788
