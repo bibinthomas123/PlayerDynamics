@@ -183,7 +183,7 @@ class GPSIngestionAdapter:
             latitude=lat,
             longitude=lon,
             speed_ms=speed_ms,
-            raw_payload={"sentence": raw},
+            raw_payloadf={"sentence": raw},
         )
 
         self._prev_lat, self._prev_lon, self._prev_ts = lat, lon, now

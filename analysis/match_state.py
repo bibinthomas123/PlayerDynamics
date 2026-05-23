@@ -293,6 +293,163 @@ class CoupledState:
         }
 
 
+# ─────────────────────────────────────────────
+# Escalation thresholds — two-level hysteresis
+# ─────────────────────────────────────────────
+# ENTER: total_risk_windows required to reach a level
+# EXIT:  total_risk_windows required to STAY at a level once reached
+# This prevents the dashboard from flickering when a single clean window
+# appears between sustained risk windows.
+_ESCALATION_ENTER: Dict[str, int] = {
+    "elevated": 3,
+    "high":     5,
+    "critical": 8,
+}
+_ESCALATION_EXIT: Dict[str, int] = {
+    "critical": 5,
+    "high":     3,
+    "elevated": 1,
+}
+# Windows of clean (no alert) state required before total_risk_windows resets
+_RECOVERY_RESET_WINDOWS: int = 2
+
+
+@dataclass
+class ActiveRiskTrajectory:
+    """Per-player match-level risk accumulator.
+
+    Tracks two orthogonal persistence counters so that transitions between
+    semantic subtypes (e.g. locomotor_suppression → recovery_degradation) do
+    NOT destroy escalation continuity.
+
+    Attributes
+    ----------
+    current_pattern : str
+        Dominant finding type of the current group.  Resets when the pattern
+        changes; used for pattern-specific policy rules.
+    pattern_persistence_windows : int
+        Consecutive windows the *exact* current pattern has been active.
+        Resets when ``current_pattern`` changes.  Use this when a policy
+        rule targets a specific finding type (e.g. locomotor suppression ≥ 5).
+    total_risk_windows : int
+        Total alert windows since the player last returned to a clean state.
+        Does NOT reset on pattern transitions — only resets after
+        ``_RECOVERY_RESET_WINDOWS`` consecutive clean windows.
+        Use this for escalation logic so subtype transitions don't destroy
+        escalation continuity.
+    escalation_level : str
+        Current escalation level derived from ``total_risk_windows`` with
+        hysteresis.  One of: ``"normal"``, ``"elevated"``, ``"high"``,
+        ``"critical"``.
+    _recovery_window_count : int
+        Internal counter for consecutive clean (no-alert) windows.
+        When this reaches ``_RECOVERY_RESET_WINDOWS``, ``total_risk_windows``
+        and ``escalation_level`` reset to baseline.
+    """
+    current_pattern: str = ""
+    pattern_persistence_windows: int = 0
+    total_risk_windows: int = 0
+    escalation_level: str = "normal"
+    _recovery_window_count: int = 0
+
+    def record_alert_window(self, dominant_finding: Optional[str]) -> None:
+        """Call once per window when an alert fires for this player.
+
+        Updates both persistence counters and recomputes escalation.
+        """
+        # Any alert window breaks a recovery streak
+        self._recovery_window_count = 0
+        self.total_risk_windows += 1
+
+        if dominant_finding and dominant_finding != self.current_pattern:
+            # Pattern subtype changed — reset pattern-specific persistence only
+            self.current_pattern = dominant_finding
+            self.pattern_persistence_windows = 1
+        elif dominant_finding:
+            self.pattern_persistence_windows += 1
+        # If dominant_finding is None, total_risk_windows still accumulates
+        # but pattern persistence is not updated.
+
+        self.escalation_level = _compute_escalation(
+            self.total_risk_windows, self.escalation_level
+        )
+
+    def record_clean_window(self) -> None:
+        """Call once per window when NO alert fires for this player.
+
+        Counts toward recovery.  Only resets risk state after sustained
+        clean play (``_RECOVERY_RESET_WINDOWS`` consecutive windows).
+        """
+        self._recovery_window_count += 1
+        if self._recovery_window_count >= _RECOVERY_RESET_WINDOWS:
+            self.total_risk_windows = 0
+            self.pattern_persistence_windows = 0
+            self.current_pattern = ""
+            self._recovery_window_count = 0
+            self.escalation_level = "normal"
+        # Partial recovery: escalation may drop under hysteresis
+        else:
+            self.escalation_level = _compute_escalation(
+                self.total_risk_windows, self.escalation_level
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "current_pattern":            self.current_pattern,
+            "pattern_persistence_windows": self.pattern_persistence_windows,
+            "total_risk_windows":         self.total_risk_windows,
+            "escalation_level":           self.escalation_level,
+            "_recovery_window_count":     self._recovery_window_count,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ActiveRiskTrajectory":
+        obj = cls()
+        obj.current_pattern            = d.get("current_pattern", "")
+        obj.pattern_persistence_windows = d.get("pattern_persistence_windows", 0)
+        obj.total_risk_windows         = d.get("total_risk_windows", 0)
+        obj.escalation_level           = d.get("escalation_level", "normal")
+        obj._recovery_window_count     = d.get("_recovery_window_count", 0)
+        return obj
+
+
+def _compute_escalation(total_risk_windows: int, current_level: str) -> str:
+    """Map total_risk_windows → escalation level with hysteresis.
+
+    Enter thresholds are higher than exit thresholds so escalation doesn't
+    flicker when a single clean window appears mid-sustained-risk.
+
+    Parameters
+    ----------
+    total_risk_windows : int
+        Accumulated alert windows since last clean reset.
+    current_level : str
+        The player's current escalation level (for hysteresis logic).
+
+    Returns
+    -------
+    str
+        One of: ``"normal"``, ``"elevated"``, ``"high"``, ``"critical"``.
+    """
+    # Try to enter a higher level first (entry thresholds)
+    if total_risk_windows >= _ESCALATION_ENTER["critical"]:
+        return "critical"
+    if total_risk_windows >= _ESCALATION_ENTER["high"]:
+        return "high"
+    if total_risk_windows >= _ESCALATION_ENTER["elevated"]:
+        return "elevated"
+
+    # Already elevated — only exit if below exit threshold (hysteresis)
+    if current_level == "critical" and total_risk_windows >= _ESCALATION_EXIT["critical"]:
+        return "critical"
+    if current_level == "high" and total_risk_windows >= _ESCALATION_EXIT["high"]:
+        return "high"
+    if current_level == "elevated" and total_risk_windows >= _ESCALATION_EXIT["elevated"]:
+        return "elevated"
+
+    return "normal"
+
+
 @dataclass
 class TrendState:
     signal: Optional[TrendSignal]
@@ -397,6 +554,19 @@ class MatchState:
     # Tracks which episode IDs have already been written to EpisodeStore.
     # Prevents re-persisting the same closed episode on every window refresh.
     _persisted_episode_ids: set = field(default_factory=set, repr=False, compare=False)
+
+    # ── Layer 6: Risk trajectory — cross-subtype persistence + escalation ─────
+    # ActiveRiskTrajectory tracks total_risk_windows (never resets on subtype
+    # transitions) and pattern_persistence_windows (resets on subtype change).
+    # This is the authoritative source for escalation_level and
+    # persistence_windows in CompressedTemporalContext.
+    # Never use ongoing_episode.persistence_duration for escalation — that
+    # resets on every pattern transition and destroys escalation continuity.
+    _risk_trajectory: "ActiveRiskTrajectory" = field(
+        default_factory=lambda: ActiveRiskTrajectory(),
+        repr=False,
+        compare=False,
+    )
 
     # ── Thread-safety lock ────────────────────────────────────────────────────
     _lock: Lock = field(default_factory=Lock, repr=False, compare=False)
@@ -1610,6 +1780,7 @@ class MatchState:
             "trend_summaries":      self.trend_summaries,
             "recent_context":       self.recent_context,
             "intervention_history": self.intervention_history,
+            "_risk_trajectory":     self._risk_trajectory.to_dict(),
         }
 
     @classmethod
@@ -1685,6 +1856,15 @@ class MatchState:
         state.recent_context       = data.get("recent_context", "")
         state.intervention_history = data.get("intervention_history", [])
 
+        # Restore risk trajectory — deserialise if present, otherwise start fresh.
+        # A missing key means this checkpoint predates the ActiveRiskTrajectory
+        # feature; the trajectory will rebuild from scratch over the next windows.
+        traj_data = data.get("_risk_trajectory")
+        if traj_data and isinstance(traj_data, dict):
+            state._risk_trajectory = ActiveRiskTrajectory.from_dict(traj_data)
+        else:
+            state._risk_trajectory = ActiveRiskTrajectory()
+
         return state
 
     def _infer_finding_state(self, current: Dict, previous: Optional[Dict]) -> str:
@@ -1741,6 +1921,53 @@ class MatchState:
                 if isinstance(ep, _PE) and ep.is_ongoing():
                     ep.interventions.append(description)
                     break
+
+    def update_risk_trajectory(
+        self,
+        is_alert_window: bool,
+        dominant_finding: Optional[str] = None,
+    ) -> "ActiveRiskTrajectory":
+        """Update the cross-subtype risk trajectory for this player.
+
+        Call once per processed window, BEFORE refresh_episodes() and
+        build_compressed_context().  The trajectory's escalation_level and
+        total_risk_windows feed CompressedTemporalContext so downstream policy
+        sees the correct escalation even when semantic subtypes fluctuate.
+
+        Parameters
+        ----------
+        is_alert_window : bool
+            True when the current window produced an alert (any signal type).
+        dominant_finding : str, optional
+            The primary finding type for this window (e.g.
+            ``"locomotor_suppression"``).  Used to track pattern-specific
+            persistence separately from total risk accumulation.  Pass None
+            when no finding was identified (pure anomaly score alert).
+
+        Returns
+        -------
+        ActiveRiskTrajectory
+            The updated trajectory (same object as ``self._risk_trajectory``).
+        """
+        with self._lock:
+            traj = self._risk_trajectory
+
+        if is_alert_window:
+            traj.record_alert_window(dominant_finding)
+        else:
+            traj.record_clean_window()
+
+        logger.warning(
+            "RISK TRAJECTORY | player=%d pattern=%r "
+            "pattern_persistence=%d total_risk=%d escalation=%s",
+            self.player_id,
+            traj.current_pattern,
+            traj.pattern_persistence_windows,
+            traj.total_risk_windows,
+            traj.escalation_level,
+        )
+
+        return traj
  
     def refresh_episodes(
         self,
@@ -1928,11 +2155,20 @@ class MatchState:
             findings_snap = list(self.recent_findings)
             interventions = list(self.intervention_history)
             recent_ctx    = self.recent_context
+            traj          = self._risk_trajectory
  
         # Use caller-supplied state to avoid redundant polyfit.
         if semantic_state is None:
             semantic_state = self.build_semantic_state()
-        escalation = semantic_state.escalation_level
+
+        # ── Escalation: use risk trajectory, NOT SemanticMatchState ──────────
+        # SemanticMatchState.escalation_level is driven by motifs, coupled states,
+        # and persistent findings — a complex score that can stay "normal" even
+        # when the player has been in a degraded state for many windows.
+        # _risk_trajectory.escalation_level is driven by total_risk_windows with
+        # hysteresis — it accumulates across subtype transitions and is the
+        # authoritative source for downstream policy decisions.
+        escalation = traj.escalation_level
 
         # ── Retrieve cross-match historical episodes ───────────────────────────
         historical_episodes: List[dict] = []
@@ -1983,6 +2219,11 @@ class MatchState:
             current_escalation=escalation,
             current_finding_types=current_finding_types,
             historical_episodes=historical_episodes,
+            # Pass trajectory counters so compress() can override the
+            # episode-derived persistence_windows with the cross-subtype value.
+            trajectory_total_risk_windows=traj.total_risk_windows,
+            trajectory_pattern_persistence=traj.pattern_persistence_windows,
+            trajectory_active_pattern=traj.current_pattern,
         )
 
         # Retrieve cross-match historical episodes from EpisodeStore and

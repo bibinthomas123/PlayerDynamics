@@ -101,6 +101,7 @@ from __future__ import annotations
 import logging
 import math
 import warnings
+from enum import Enum
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -298,6 +299,189 @@ def to_device(t: "torch.Tensor") -> "torch.Tensor":
 # Result dataclass
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass
+# ─────────────────────────────────────────────────────────────────────────────
+# Coach decision vocabulary — split into feedback taxonomy and intervention taxonomy
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AlertFeedback(Enum):
+    """Coach evaluation of model/alert quality.
+
+    These values feed the recalibration pipeline.  They describe whether the
+    detection was correct, not what the coach did operationally.  Keeping this
+    separate from ``CoachIntervention`` ensures recalibration trains on clean
+    model-quality signal rather than a mix of correctness labels and operational
+    responses.
+    """
+    CORRECT         = "correct"          # alert was appropriate
+    FALSE_POSITIVE  = "false_positive"   # alert was wrong; recalibrate
+    MISSED_SEVERITY = "missed_severity"  # alert fired but understated the risk
+    LATE_ALERT      = "late_alert"       # alert was correct but delayed
+
+
+class CoachIntervention(Enum):
+    """Operational response taken by the coach after seeing an alert.
+
+    These values describe what the coach *did*, not whether the model was
+    correct.  A coach can substitute a player while also marking the alert
+    as a false positive (e.g. they substituted for tactical reasons, not
+    because of the detected anomaly).
+    """
+    NONE         = "none"
+    MONITOR      = "monitor"
+    REDUCE_LOAD  = "reduce_load"
+    SUBSTITUTE   = "substitute"
+
+
+# DEPRECATED: use AlertFeedback + CoachIntervention separately.
+# Retained for backward compatibility with existing call-sites.
+# Will be removed in a future version.
+class CoachDecision(Enum):
+    """Deprecated.  Use AlertFeedback and CoachIntervention instead."""
+    ACCEPT_ALERT      = "accept_alert"
+    DISMISS_ALERT     = "dismiss_alert"
+    MONITOR_PLAYER    = "monitor_player"
+    SUBSTITUTE_PLAYER = "substitute_player"
+    FALSE_POSITIVE    = "false_positive"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signal — structured ML-layer output replacing flat string signal_types list
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Signal:
+    """A single typed signal emitted by the ML detection layer.
+
+    Replaces the flat ``["anomaly", "fatigue"]`` list with structured objects
+    that carry severity, subtype, and confidence so downstream policy does not
+    have to reconstruct semantics from string matching.
+
+    Attributes
+    ----------
+    category:
+        Top-level signal class: ``"anomaly"``, ``"fatigue"``, ``"drift"``,
+        or ``"workload"``.
+    subtype:
+        Optional finer classification, e.g. ``"speed_sprint_decline"``,
+        ``"acwr_overload"``, ``"recovery_degradation"``.
+    severity:
+        ``"low"``, ``"medium"``, or ``"high"``.
+    confidence:
+        Model confidence in [0.0, 1.0] at the time the signal was emitted.
+    """
+    category: str
+    subtype: Optional[str] = None
+    severity: str = "medium"
+    confidence: float = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RiskState — synthesised from episodic context, not raw ML output
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RiskState(Enum):
+    """Operational risk level derived from episodic reasoning.
+
+    This is NOT ML output.  It is a deterministic synthesis of
+    escalation level, persistence, recurrence, and pattern type.
+    The mapping is performed by ``assess_risk_state()`` in the orchestrator.
+
+    Levels
+    ------
+    NORMAL    — no actionable signal
+    MONITOR   — mild or first-occurrence signal; watchlist only
+    ELEVATED  — sustained signal; increased attention warranted
+    HIGH_RISK — persistent multi-signal; load reduction recommended
+    CRITICAL  — sustained recurrent pattern; substitution gated
+    """
+    NORMAL    = "normal"
+    MONITOR   = "monitor"
+    ELEVATED  = "elevated"
+    HIGH_RISK = "high_risk"
+    CRITICAL  = "critical"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OperationalRecommendation — prescriptive output of the operational policy layer
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class OperationalRecommendation:
+    """A prescriptive recommendation surfaced to the coaching staff.
+
+    Produced exclusively by ``OperationalPolicyEngine.resolve()``.
+    Never derived directly from SHAP values or anomaly scores.
+
+    Attributes
+    ----------
+    action:
+        One of: ``"monitor"``, ``"reduce_load"``, ``"substitute_player"``.
+    urgency:
+        ``"low"``, ``"medium"``, ``"high"``, or ``"critical"``.
+    rationale:
+        Human-readable explanation fed directly to the coach card.
+        Written in plain language; no ML jargon.
+    confidence_gate:
+        Minimum model confidence that was required to produce this
+        recommendation.  Recorded for audit.
+    requires_confirmation:
+        When ``True``, the frontend must show a confirmation dialog before
+        surfacing the recommendation.  Always ``True`` for
+        ``"substitute_player"`` to prevent accidental tactical disruption.
+    """
+    action: str
+    urgency: str
+    rationale: str
+    confidence_gate: float = 0.0
+    requires_confirmation: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PolicyResolution — complete policy-layer output attached to AnomalyResult
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PolicyResolution:
+    """Complete output of the policy layer, attached to AnomalyResult by the
+    orchestrator after episodic context is available.
+
+    Replaces the flat ``recommendation_type: str`` field on ``AnomalyResult``.
+    Separates detection classification (``alert_type``) from operational
+    prescription (``recommendation``) so they can be consumed independently
+    by the coach card, the XAI drawer, and the recalibration pipeline.
+
+    Set exclusively by the orchestrator.  ``PatternAnalysisEngine`` must never
+    populate this object.
+
+    Attributes
+    ----------
+    alert_type:
+        Detection classification string from ``RecommendationPolicyEngine``,
+        e.g. ``"substitute"``, ``"recovery_intervention"``,
+        ``"performance_monitor"``.
+    priority:
+        ``"normal"``, ``"elevated"``, or ``"critical"``.
+    escalation:
+        Escalation level string from ``CompressedTemporalContext``.
+    trajectory_state:
+        Active pattern label from ``CompressedTemporalContext``, e.g.
+        ``"locomotor_suppression"``.
+    risk_state:
+        ``RiskState`` enum value synthesised by ``assess_risk_state()``.
+    recommendation:
+        ``OperationalRecommendation`` produced by
+        ``OperationalPolicyEngine.resolve()``.
+    """
+    alert_type: str
+    priority: str
+    escalation: str
+    trajectory_state: Optional[str] = None
+    risk_state: Optional[RiskState] = None
+    recommendation: Optional[OperationalRecommendation] = None
+
+
+
+@dataclass
 class AnomalyResult:
     """Structured output of a single anomaly-detection inference pass.
 
@@ -353,11 +537,17 @@ class AnomalyResult:
     workload_status:
         Human-readable ACWR category: ``"optimal"``, ``"high"``, ``"low"``,
         ``"very_high"``, etc.  Set by ``WorkloadTrendTracker``.
-    recommendation_type:
-        Highest-priority coaching action from ``PatternAnalysisEngine._recommend()``.
-        One of: ``"substitution"``, ``"fatigue_alert"``,
-        ``"positional_drift"``, ``"workload_warning"``,
-        ``"anomaly_flag"``, or ``None``.
+    signals:
+        Structured ML-layer signals emitted by ``PatternAnalysisEngine.analyze_window()``.
+        Each ``Signal`` carries category, subtype, severity, and confidence so
+        downstream policy does not need to reconstruct semantics from strings.
+        Use the ``signal_types`` property for backward-compatible string access.
+    policy_resolution:
+        **Set exclusively by the orchestrator** after the full episodic pipeline
+        runs (``RecommendationPolicyEngine`` + ``assess_risk_state()`` +
+        ``OperationalPolicyEngine``).  Never populated by
+        ``PatternAnalysisEngine``.  Contains both the detection classification
+        (``alert_type``) and the prescriptive ``OperationalRecommendation``.
     triggered_at:
         UTC wall-clock time the result object was created (for audit logs).
     model_type:
@@ -396,7 +586,14 @@ class AnomalyResult:
     workload_flag: bool = False
     workload_status: str = "optimal"
 
-    recommendation_type: Optional[str] = None
+    # ML-layer structured signals — populated by analyze_window(), never by policy.
+    # Each Signal carries category, subtype, severity, and confidence.
+    # Use the signal_types property for backward-compatible string-list access.
+    signals: List[Signal] = field(default_factory=list)
+
+    # Policy-layer output — set exclusively by the orchestrator after the full
+    # episodic pipeline has run.  PatternAnalysisEngine must NEVER write this.
+    policy_resolution: Optional[PolicyResolution] = None
     triggered_at: datetime = field(
         default_factory=lambda: datetime.now(tz=timezone.utc)
     )
@@ -430,6 +627,55 @@ class AnomalyResult:
     # Set instead of base_explanation when nlg_async=True so that all
     # 10 MPS forward passes happen off the SLA clock.
     _xai_kwargs: Optional[dict] = field(default=None, repr=False)
+
+    # ── Backward-compatibility properties ────────────────────────────────────
+
+    @property
+    def signal_types(self) -> List[str]:
+        """Backward-compatible flat list of signal category strings.
+
+        Derived from ``self.signals``.  New code should read ``self.signals``
+        directly to access subtype, severity, and confidence.
+        """
+        return [s.category for s in self.signals]
+
+    @property
+    def recommendation_type(self) -> Optional[str]:
+        """Backward-compatible access to the policy alert_type string.
+
+        Returns ``policy_resolution.alert_type`` when a resolution exists,
+        otherwise ``None``.  New code should read ``self.policy_resolution``
+        directly.
+        """
+        if self.policy_resolution is not None:
+            return self.policy_resolution.alert_type
+        return None
+
+    @recommendation_type.setter
+    def recommendation_type(self, value: Optional[str]) -> None:
+        """Backward-compatible setter kept for call-sites not yet migrated.
+
+        Prefer setting ``result.policy_resolution`` directly.  This setter
+        creates a minimal ``PolicyResolution`` shell when one does not yet
+        exist, preserving existing fields when one does.
+        """
+        if value is None:
+            return
+        if self.policy_resolution is None:
+            object.__setattr__(self, "policy_resolution", PolicyResolution(
+                alert_type=value,
+                priority="normal",
+                escalation="low",
+            ))
+        else:
+            object.__setattr__(self, "policy_resolution", PolicyResolution(
+                alert_type=value,
+                priority=self.policy_resolution.priority,
+                escalation=self.policy_resolution.escalation,
+                trajectory_state=self.policy_resolution.trajectory_state,
+                risk_state=self.policy_resolution.risk_state,
+                recommendation=self.policy_resolution.recommendation,
+            ))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4460,8 +4706,46 @@ class PatternAnalysisEngine:
         drift_alert      = drift_state in _ACTIVE_LEVELS
         workload_alert   = workload_state in _ACTIVE_LEVELS
 
-        # anomaly_state = self.alert_manager.get_state(player_id, "anomaly")
- 
+        # Build structured signals: typed ML-layer output with severity and confidence.
+        # signal_types (the flat list) is now a computed property on AnomalyResult.
+        # Operational recommendation resolution happens in the orchestrator after
+        # episodic context (CompressedTemporalContext) is available.
+        signals: List[Signal] = []
+        if is_anomaly_alert:
+            signals.append(Signal(
+                category="anomaly",
+                subtype=None,
+                severity="high" if confidence > 0.85 else "medium",
+                confidence=confidence,
+            ))
+        if fatigue_alert:
+            _fatigue_subtype = (
+                "speed_sprint_decline" if (speed_low and sprint_low)
+                else "speed_decline" if speed_low
+                else "sprint_decline"
+            )
+            signals.append(Signal(
+                category="fatigue",
+                subtype=_fatigue_subtype,
+                severity="high" if late_in_game else "medium",
+                confidence=confidence,
+            ))
+        if drift_alert:
+            signals.append(Signal(
+                category="drift",
+                subtype="positional_zone_violation",
+                severity="medium",
+                confidence=float(drift["drift_score"]),
+            ))
+        if workload_alert:
+            _workload_subtype = "acwr_overload" if acwr > 1.5 else "acwr_underload"
+            signals.append(Signal(
+                category="workload",
+                subtype=_workload_subtype,
+                severity="high" if acwr > 1.8 or acwr < 0.6 else "medium",
+                confidence=1.0,  # ACWR is deterministic, not probabilistic
+            ))
+
         return AnomalyResult(
             player_id=player_id,
             external_id=baseline.external_id,
@@ -4477,10 +4761,10 @@ class PatternAnalysisEngine:
             positional_drift_flag=drift_alert,
             workload_flag=workload_alert,
             workload_status=workload_status,
-            recommendation_type=self._recommend(
-                is_anomaly_alert, fatigue_alert,
-                drift_alert, workload_alert, confidence,
-            ),
+            signals=signals,
+            # policy_resolution intentionally omitted — set by orchestrator
+            # after assess_risk_state() + OperationalPolicyEngine run with
+            # full episodic context.
             model_type=model_type,
             alert_level=anomaly_state,
             persistence_windows=getattr(
@@ -4746,55 +5030,19 @@ class PatternAnalysisEngine:
             window_interval_s=window_interval_s,
         )
 
-    def _recommend(
-        self,
-        is_anomaly: bool,
-        fatigue:    bool,
-        drift:      bool,
-        workload:   bool,
-        conf:       float,
-    ) -> Optional[str]:
-        """Select the highest-priority coaching recommendation.
-
-        Implements a strict priority ladder so that the most urgent alert
-        is always surfaced first.  At most one recommendation is returned
-        per inference call.
-
-        Priority Order
-        --------------
-        1. ``"substitution"``    — anomaly + fatigue + confidence > 85 %.
-        2. ``"fatigue_alert"``   — fatigue flag only (without high confidence).
-        3. ``"positional_drift"`` — tactical zone violation.
-        4. ``"workload_warning"`` — ACWR outside safe band [0.8, 1.5].
-        5. ``"anomaly_flag"``    — model anomaly + confidence > 75 % (no fatigue).
-        6. ``None``              — no actionable signal.
-
-        Parameters
-        ----------
-        is_anomaly:
-            Whether the smoothed reconstruction loss exceeds the threshold.
-        fatigue:
-            Whether the fatigue flag was raised in ``analyze()``.
-        drift:
-            Whether the positional drift flag was raised.
-        workload:
-            Whether the ACWR workload flag was raised.
-        conf:
-            Confidence (empirical CDF percentile) of the anomaly score.
-
-        Returns
-        -------
-        str or None
-            The recommendation string, or ``None`` when no action is needed.
-        """
-        if fatigue and is_anomaly and conf > 0.85:
-            return "substitution"
-        if fatigue:
-            return "fatigue_alert"
-        if drift:
-            return "positional_drift"
-        if workload:
-            return "workload_warning"
-        if is_anomaly and conf > 0.75:
-            return "anomaly_flag"
-        return None
+    # _recommend() REMOVED — architectural violation.
+    #
+    # Recommendation policy MUST NOT run inside PatternAnalysisEngine because at
+    # this point in the pipeline the following signals are unavailable:
+    #   • episodic context (CompressedTemporalContext)
+    #   • cross-match recurrence / in-match recurrence counts
+    #   • escalation state from MatchStateManager
+    #   • compressed trajectory / CAG history
+    #
+    # The replacement is a two-step pipeline:
+    #   1. analyze_window() builds signal_types (ML layer output, raw signals only).
+    #   2. RecommendationPolicyEngine.determine() runs in the orchestrator AFTER
+    #      MatchStateManager and CompressedTemporalContext are built (Stage 3).
+    #
+    # Any call-site that still references _recommend() will now raise AttributeError
+    # (loud failure), not silently return under-informed recommendations.

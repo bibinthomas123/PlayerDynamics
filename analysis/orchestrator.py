@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
 from analysis.anomaly_detection import (
-    PatternAnalysisEngine, AnomalyResult
+    PatternAnalysisEngine, AnomalyResult, CoachDecision
 )
 from dataclasses import replace
 from analysis.match_state import MatchStateManager, MatchState, JsonFileCheckpointStore
@@ -29,6 +29,9 @@ from feedback.recalibration import (
 )
 from ingestion.pipeline import IngestionPipeline
 from config.settings import CONFIG
+from explainability.recommendation_policy import (
+    RecommendationPolicyEngine, build_policy_input
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -37,6 +40,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 
+
+_policy_engine = RecommendationPolicyEngine()
 
 # ─────────────────────────────────────────────
 # Player registry
@@ -352,53 +357,87 @@ class PlayersDataAnalysisPipeline:
     # Live inference
     # ──────────────────────────────────────────
     def process_live_event(
-        self,
-        normalized_event: dict,
-        segment_index: int = 0,
-    ) -> Optional[AnomalyResult]:
+    self,
+    normalized_event: dict,
+    segment_index: int = 0,
+) -> Optional[AnomalyResult]:
         """
         Process one raw normalised event from the ingestion pipeline.
-        Returns SHAPExplanation if an alert is triggered, None otherwise.
+        Returns AnomalyResult if inference succeeds.
         <200 ms latency target.
         """
         t0 = time.perf_counter()
 
         eid = normalized_event.get("player_external_id")
+
         if not eid:
             return None
 
         player = self.registry.get_by_external_id(eid)
+
         if player is None:
             return None
 
         pid = player["player_id"]
 
-        # ── Determinism Gate: Temporal Causality ───────────────────────────────
+        compressed_context = None
+        semantic_state = None
+        recommendation_type = None
+        explanation = None
+        compressed_context = None
+        semantic_state = None
+        recommendation_type = None
+
+        # ─────────────────────────────────────────────
+        # Determinism Gate
+        # ─────────────────────────────────────────────
         event_ts = normalized_event.get("timestamp")
+
         if event_ts:
             if not self.causality_guard.validate_sequence(pid, event_ts):
-                logger.error("Determinism Error: Out-of-order event for player %d. Rejecting.", pid)
+                logger.error(
+                    "Determinism Error: Out-of-order event for player %d. Rejecting.",
+                    pid,
+                )
                 return None
 
-        # ── Reliability Gate: Telemetry Validity ───────────────────────────────
+        # ─────────────────────────────────────────────
+        # Telemetry validity
+        # ─────────────────────────────────────────────
         from analysis.telemetry_validity import TelemetryStatus
         from utils.reliability.invariants import InvariantSeverity
+
         validity = self.tvl.validate_event(pid, normalized_event)
 
-        # Invariant: INVALID telemetry must NEVER generate physiological alerts.
         self.guard.check(
             "TELEMETRY_VALIDITY_GATE",
             condition=(validity.status != TelemetryStatus.INVALID),
-            severity=InvariantSeverity.WARNING if validity.status == TelemetryStatus.INVALID else InvariantSeverity.INFO,
-            message=f"Event rejected or flagged: status={validity.status.name} issues={validity.issues}",
-            context={"player_id": pid, "validity": validity}
+            severity=(
+                InvariantSeverity.WARNING
+                if validity.status == TelemetryStatus.INVALID
+                else InvariantSeverity.INFO
+            ),
+            message=(
+                f"Event rejected or flagged: "
+                f"status={validity.status.name} "
+                f"issues={validity.issues}"
+            ),
+            context={
+                "player_id": pid,
+                "validity": validity,
+            },
         )
 
         if validity.status == TelemetryStatus.INVALID:
-            logger.warning("Inference gated: INVALID telemetry for player %d", pid)
+            logger.warning(
+                "Inference gated: INVALID telemetry for player %d",
+                pid,
+            )
             return None
 
-        # Run sequence anomaly analysis
+        # ─────────────────────────────────────────────
+        # Main inference
+        # ─────────────────────────────────────────────
         result = self.pattern_engine.analyze(
             player_id=pid,
             live_event=normalized_event,
@@ -407,10 +446,6 @@ class PlayersDataAnalysisPipeline:
 
         if result is None:
             return None
-        
-       # ── SHAP/XAI Gating ───────────────────────────────────────────────────
-
-        explanation = None
 
         model = player.get("model")
 
@@ -421,30 +456,25 @@ class PlayersDataAnalysisPipeline:
                 SafeModeLevel,
             )
 
-            # Safe Mode suppression
             shap_allowed = safe_mode.is_feature_enabled(
                 "shap_explanation",
                 SafeModeLevel.LEVEL_1,
             )
 
-            # Only explain sustained operational alerts
             sustained_alert = result.alert_level in (
                 AlertLevel.WARNING,
                 AlertLevel.CRITICAL,
             )
 
-            # Require persistence before XAI
-            sufficient_persistence = result.persistence_windows >= 3
+            sufficient_persistence = (
+                result.persistence_windows >= 3
+            )
 
-            # Per-player cooldown
             now = time.time()
 
             last_xai_ts = self._last_xai_ts.get(pid, 0.0)
 
-            # cooldown_ok = (
-            #     now - last_xai_ts
-            # ) >= 60.0
-
+            # cooldown_ok = (now - last_xai_ts) >= 60.0
             cooldown_ok = True
 
             run_xai = (
@@ -453,213 +483,456 @@ class PlayersDataAnalysisPipeline:
                 and sufficient_persistence
                 and cooldown_ok
             )
-            # run_xai = True  # FOR TESTING - BYPASS ALL GATES
-
-            # print("\nXAI DEBUG")
-            # print("shap_allowed:", shap_allowed)
-            # print("sustained_alert:", sustained_alert)
-            # print("sufficient_persistence:", sufficient_persistence)
-            # print("cooldown_ok:", cooldown_ok)
-            # print("run_xai:", run_xai)
 
             xai_fv = self._build_xai_feature_vector(result)
 
-                # Get/create match state before explanation so context is current
             match_state = self._match_state.get_or_create(
-                    player_id=pid,
-                    player_name=player["name"],
-                    position=player.get("position", ""),
-                    match_id=self._active_match_id,
-                )
+                player_id=pid,
+                player_name=player["name"],
+                position=player.get("position", ""),
+                match_id=self._active_match_id,
+            )
 
             match_state.record_telemetry(
-                speed_ms=xai_fv.get("window_avg_speed_ms", 0.0),
-                hr_bpm=xai_fv.get("heart_rate_bpm", 0.0),
-                hr_recovery_rate=result.feature_vector.get("hr_recovery_rate", 0.0),
+                speed_ms=xai_fv.get(
+                    "window_avg_speed_ms",
+                    0.0,
+                ),
+                hr_bpm=xai_fv.get(
+                    "heart_rate_bpm",
+                    0.0,
+                ),
+                hr_recovery_rate=result.feature_vector.get(
+                    "hr_recovery_rate",
+                    0.0,
+                ),
                 anomaly_score=result.anomaly_score,
-                telemetry_confidence=self._effective_confidence(validity.confidence),
+                telemetry_confidence=self._effective_confidence(
+                    validity.confidence,
+                ),
             )
+
+            # ─────────────────────────────────────────
+            # XAI pipeline
+            # ─────────────────────────────────────────
+
+            # ── Risk trajectory update — every window ─────────────────────────
+            # Clean vs alert is determined by result.is_anomaly, NOT run_xai.
+            # run_xai is suppressed by XAI-layer gates (persistence threshold,
+            # safe mode, SHAP cooldown) — none of those mean the player has
+            # recovered.  A window with result.is_anomaly=True but run_xai=False
+            # (e.g. window 1 of a new alert, before persistence threshold is met)
+            # must still accumulate total_risk_windows, not decay them.
+            if not result.is_anomaly:
+                match_state.update_risk_trajectory(
+                    is_alert_window=False,
+                    dominant_finding=None,
+                )
+            # Alert-window update runs inside the run_xai block (after findings
+            # are available) so dominant_finding is correctly populated.
+            # For anomalous windows where run_xai is False (window 1, safe mode),
+            # we still need to accumulate total_risk_windows without a finding.
+            elif not run_xai:
+                match_state.update_risk_trajectory(
+                    is_alert_window=True,
+                    dominant_finding=None,
+                )
 
             if run_xai:
 
-    
-                # ─────────────────────────────────────────────
-                # Stage 1 — base explanation (NO LLM)
-                # ─────────────────────────────────────────────
-
-                base_explanation = self.xai_layer.build_base_explanation(
-                    player_id=pid,
-                    external_id=player["external_id"],
-                    player_name=player["name"],
-                    model=model,
-                    feature_vector=xai_fv,
-                    recommendation_type=result.recommendation_type,
-                    confidence=result.confidence,
-                    workload_status=result.workload_status,
-                    anomaly_score=result.anomaly_score,
-                    sequence=result.raw_sequence if hasattr(result, "raw_sequence") else None,
-                    mask=result.raw_mask if hasattr(result, "raw_mask") else None,
-                    sequence_background=player.get("sequence_background"),
-                    persistence_windows=result.persistence_windows,
+                # ------------------------------------------------
+                # Stage 1 — temporary SHAP explanation
+                # recommendation_type intentionally None here
+                # ------------------------------------------------
+                temp_explanation = (
+                    self.xai_layer.build_base_explanation(
+                        player_id=pid,
+                        external_id=player["external_id"],
+                        player_name=player["name"],
+                        model=model,
+                        feature_vector=xai_fv,
+                        recommendation_type=None,
+                        confidence=result.confidence,
+                        workload_status=result.workload_status,
+                        anomaly_score=result.anomaly_score,
+                        sequence=(
+                            result.raw_sequence
+                            if hasattr(result, "raw_sequence")
+                            else None
+                        ),
+                        mask=(
+                            result.raw_mask
+                            if hasattr(result, "raw_mask")
+                            else None
+                        ),
+                        sequence_background=player.get(
+                            "sequence_background"
+                        ),
+                        persistence_windows=result.persistence_windows,
+                    )
                 )
 
-                # logger.info(
-                #     "BASE SHAP FEATURES: %s",
-                #     list(base_explanation.shap_dict.keys())[:5],
-                # )
-                semantic_findings = self.xai_layer.build_semantic_findings(
-                    shap_dict=base_explanation.shap_values,
-                    feature_values=xai_fv,
-                    persistence_windows=result.persistence_windows,
+                semantic_findings = (
+                    self.xai_layer.build_semantic_findings(
+                        shap_dict=temp_explanation.shap_values,
+                        feature_values=xai_fv,
+                        persistence_windows=result.persistence_windows,
+                    )
                 )
 
-                base_explanation = replace(
-                    base_explanation,
-                    semantic_findings=tuple(
-                        f.to_dict() if hasattr(f, "to_dict") else f
-                        for f in semantic_findings
-                    ),
-                )
-                # ─────────────────────────────────────────────
-                # Stage 2 — update symbolic longitudinal memory
-                # ─────────────────────────────────────────────
+                findings_dicts = [
+                    (
+                        f.to_dict()
+                        if hasattr(f, "to_dict")
+                        else f
+                    )
+                    for f in semantic_findings
+                ]
 
+                # ------------------------------------------------
+                # Stage 2 — update memory BEFORE policy
+                # ------------------------------------------------
                 elapsed_s = int(
-                    # Same fix as process_window_direct: elapsed_seconds is a
-                    # raw event field absent from the model feature_vector.
-                    normalized_event.get("elapsed_seconds", 0)
+                    normalized_event.get(
+                        "elapsed_seconds",
+                        0,
+                    )
                 )
 
-                for finding_dict in base_explanation.semantic_findings:
+                for finding_dict in findings_dicts:
                     match_state.record_finding(
                         finding=finding_dict,
                         elapsed_seconds=elapsed_s,
                     )
 
+                # ── Risk trajectory update — alert window ─────────────────────
+                # Must run AFTER record_finding (findings_dicts populated) and
+                # BEFORE refresh_episodes (escalation current when compressor runs).
+                # Dominant finding ranked by explicit severity ordinal then
+                # confidence — never by string comparison or insertion order.
+                _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+                _ranked_findings_le = sorted(
+                    semantic_findings,
+                    key=lambda f: (
+                        _SEV_RANK.get(
+                            getattr(f, "severity", "low").lower(), 0
+                        ),
+                        float(getattr(f, "confidence", 0.0)),
+                    ),
+                    reverse=True,
+                )
+                _dominant_finding_le = (
+                    _ranked_findings_le[0].finding_type
+                    if _ranked_findings_le and hasattr(_ranked_findings_le[0], "finding_type")
+                    else (
+                        findings_dicts[0].get("finding_type")
+                        if findings_dicts
+                        else None
+                    )
+                )
+                match_state.update_risk_trajectory(
+                    is_alert_window=True,
+                    dominant_finding=_dominant_finding_le,
+                )
 
+                # Build semantic state AFTER findings
+                semantic_state = (
+                    match_state.build_semantic_state()
+                )
 
-                # Record alert AFTER findings so motif/trend/escalation
-                # reasoning sees current findings before this alert is stored.
+                current_min = (
+                    elapsed_s // 60
+                    if elapsed_s
+                    else None
+                )
+
+                match_state.refresh_episodes(
+                    current_minute=current_min,
+                    current_escalation=semantic_state.escalation_level,
+                    semantic_state=semantic_state,
+                )
+
+                current_finding_types = [
+                    fd.get("finding_type")
+                    or fd.get("type", "unknown")
+                    for fd in findings_dicts
+                ]
+
+                compressed_context = (
+                    match_state.build_compressed_context(
+                        current_finding_types=current_finding_types,
+                        current_minute=current_min,
+                        semantic_state=semantic_state,
+                    )
+                )
+
+                # ------------------------------------------------
+                # Stage 3 — policy
+                # ------------------------------------------------
+                policy_ctx = build_policy_input(
+                    semantic_findings=findings_dicts,
+                    compressed_context=compressed_context,
+                    feature_values=xai_fv,
+                )
+
+                recommendation_type = (
+                    _policy_engine.determine(policy_ctx)
+                )
+
+                result.recommendation_type = (
+                    recommendation_type
+                )
+
+                # Alert AFTER policy resolution
                 match_state.record_alert(
-                    recommendation_type=result.recommendation_type,
+                    recommendation_type=recommendation_type,
                     confidence=result.confidence,
                     anomaly_score=result.anomaly_score,
                     elapsed_seconds=elapsed_s,
                 )
 
-                # ─────────────────────────────────────────────
-                # Stage 3 — build CURRENT semantic state (once)
-                # ─────────────────────────────────────────────
-
-                semantic_state = match_state.build_semantic_state()
-
-                logger.info(
-                        "CURRENT WINDOW STATE | motifs=%s escalation=%s findings=%d",
-                        [m["type"] for m in semantic_state.motifs],
-                        semantic_state.escalation_level,
-                        len(match_state.recent_findings),
+                # ------------------------------------------------
+                # Stage 4 — final explanation
+                # ------------------------------------------------
+                base_explanation = (
+                    self.xai_layer.build_base_explanation(
+                        player_id=pid,
+                        external_id=player["external_id"],
+                        player_name=player["name"],
+                        model=model,
+                        feature_vector=xai_fv,
+                        recommendation_type=recommendation_type,
+                        confidence=result.confidence,
+                        workload_status=result.workload_status,
+                        anomaly_score=result.anomaly_score,
+                        sequence=(
+                            result.raw_sequence
+                            if hasattr(result, "raw_sequence")
+                            else None
+                        ),
+                        mask=(
+                            result.raw_mask
+                            if hasattr(result, "raw_mask")
+                            else None
+                        ),
+                        sequence_background=player.get(
+                            "sequence_background"
+                        ),
+                        persistence_windows=result.persistence_windows,
                     )
-
-
-                # ── Stage 3b — episodic memory update + compressed context ───────────────
-                current_min = elapsed_s // 60 if elapsed_s else None
-
-                match_state.refresh_episodes(
-                    current_minute=current_min,
-                    current_escalation=semantic_state.escalation_level,
-                    semantic_state=semantic_state,   # reuse, no recompute
                 )
 
-                logger.debug(
-                    "Window clock: elapsed_s=%d current_min=%s player=%d",
-                    elapsed_s, current_min, pid,
+                base_explanation = replace(
+                    base_explanation,
+                    semantic_findings=tuple(
+                        findings_dicts
+                    ),
                 )
 
-                current_finding_types = [
-                    fd.get("finding_type") or fd.get("type", "unknown")
-                    for fd in base_explanation.semantic_findings
-                ]
+                result._xai_kwargs = dict(
+                    player_id=pid,
+                    external_id=player["external_id"],
+                    player_name=player["name"],
+                    model=model,
+                    feature_vector=xai_fv,
+                    recommendation_type=recommendation_type,
+                    confidence=result.confidence,
+                    workload_status=result.workload_status,
+                    anomaly_score=result.anomaly_score,
+                    sequence=result.raw_sequence,
+                    mask=result.raw_mask,
+                    sequence_background=player.get(
+                        "sequence_background"
+                    ),
+                    persistence_windows=result.persistence_windows,
+                    compressed_context=compressed_context,
+                    semantic_state=semantic_state,
+                )
 
-                if base_explanation.semantic_findings:
-                    compressed_context = match_state.build_compressed_context(
-                        current_finding_types=current_finding_types,
-                        current_minute=current_min,
-                        semantic_state=semantic_state,   # reuse, no recompute
-                    )
-                else:
-                    compressed_context = None
-
-                # result.compressed_context = compressed_context
-                result._xai_kwargs["compressed_context"] = compressed_context
-                
-                # ── Stage 4 — async NLG dispatch ──────────────────────────────────────
-                # Alert is emitted immediately; narration is generated in a background
-                # thread and delivered via the alert callback when ready.
-                # Inference latency is never blocked by LLM generation time.
+                # ------------------------------------------------
+                # Stage 5 — async NLG
+                # ------------------------------------------------
                 t_nlg_start = time.perf_counter()
+
                 explanation = self._dispatch_nlg_async(
                     base=base_explanation,
                     semantic_state=semantic_state,
                     compressed_context=compressed_context,
                     result=result,
                 )
-                self._nlg_latency_ms.append((time.perf_counter() - t_nlg_start) * 1000)
+
+                self._nlg_latency_ms.append(
+                    (
+                        time.perf_counter()
+                        - t_nlg_start
+                    ) * 1000
+                )
 
                 self._last_xai_ts[pid] = now
 
-        # Log inference with observability fields
+        # ─────────────────────────────────────────────
+        # Observability
+        # ─────────────────────────────────────────────
         self._inference_id_counter += 1
 
-        # ── Observability metrics ─────────────────────────────────────────────
-        prompt_size     = len(compressed_context.to_prompt_block()) if compressed_context else 0
-        ep_count        = getattr(compressed_context, "episode_count", 0) if compressed_context else 0
-        hist_ep_count   = len(getattr(compressed_context, "historical_episodes", [])) if compressed_context else 0
-        raw_size        = len(list(getattr(self._match_state._state_map.get(pid, None), "recent_findings", [])) if hasattr(self._match_state, "_state_map") else [])
-        compression_ratio = round(raw_size / max(prompt_size, 1), 2) if raw_size else 0.0
+        prompt_size = (
+            len(compressed_context.to_prompt_block())
+            if compressed_context
+            else 0
+        )
+
+        ep_count = (
+            getattr(compressed_context, "episode_count", 0)
+            if compressed_context
+            else 0
+        )
+
+        hist_ep_count = (
+            len(
+                getattr(
+                    compressed_context,
+                    "historical_episodes",
+                    [],
+                )
+            )
+            if compressed_context
+            else 0
+        )
+
+        raw_size = len(
+            list(
+                getattr(
+                    self._match_state._state_map.get(
+                        pid,
+                        None,
+                    ),
+                    "recent_findings",
+                    [],
+                )
+            )
+            if hasattr(self._match_state, "_state_map")
+            else []
+        )
+
+        compression_ratio = (
+            round(raw_size / max(prompt_size, 1), 2)
+            if raw_size
+            else 0.0
+        )
+
+        # Derive escalation / priority from compressed_context when available.
+        _escalation = (
+            getattr(compressed_context, "current_escalation", "low")
+            if compressed_context is not None
+            else "low"
+        )
+        _trajectory = (
+            getattr(compressed_context, "active_pattern", None)
+            if compressed_context is not None
+            else None
+        )
+        _priority = (
+            "critical" if _escalation == "critical"
+            else "elevated" if getattr(compressed_context, "cross_match_recurrence", 0) >= 2
+            else "normal"
+        ) if compressed_context is not None else "normal"
 
         log_entry = {
-            "inference_id":        self._inference_id_counter,
-            "player_id":           pid,
+            "inference_id": self._inference_id_counter,
+            "player_id": pid,
+            # Structured alert schema — replaces the flat recommendation_type string.
+            # signal_types: raw ML-layer signals (no episodic context).
+            # recommendation_type: policy-resolved operational classification.
+            # priority / escalation / trajectory_state: episodic synthesis fields.
+            "signal_types": result.signal_types,
             "recommendation_type": result.recommendation_type,
-            "confidence":          result.confidence,
-            "triggered_at":        result.triggered_at.isoformat(),
-            "anomaly_score":       result.anomaly_score,
-            "model_type":          result.model_type,
-            "model_version":       getattr(model, "model_version", ""),
-            "is_anomaly":          result.is_anomaly,
-            "feature_values":      result.feature_vector,
-            "shap_values":         explanation.shap_values if explanation else {},
-            "nlg_summary":         explanation.nlg_summary if explanation else "",
-            # ── observability ────────────────────────────────────────────────
-            "obs_prompt_chars":       prompt_size,
+            "priority": _priority,
+            "escalation": _escalation,
+            "trajectory_state": _trajectory,
+            "confidence": result.confidence,
+            "triggered_at": result.triggered_at.isoformat(),
+            "anomaly_score": result.anomaly_score,
+            "model_type": result.model_type,
+            "model_version": getattr(
+                model,
+                "model_version",
+                "",
+            ),
+            "is_anomaly": result.is_anomaly,
+            "feature_values": result.feature_vector,
+            "shap_values": (
+                explanation.shap_values
+                if explanation
+                else {}
+            ),
+            "nlg_summary": (
+                explanation.nlg_summary
+                if explanation
+                else ""
+            ),
+            "obs_prompt_chars": prompt_size,
             "obs_retrieved_episodes": ep_count,
             "obs_historical_episodes": hist_ep_count,
-            "obs_compression_ratio":  compression_ratio,
-            "obs_nlg_engine":         explanation.nlg_engine if explanation else "none",
-            "obs_nlg_latency_ms":     round(self._nlg_latency_ms[-1], 1) if self._nlg_latency_ms else 0.0,
+            "obs_compression_ratio": compression_ratio,
+            "obs_nlg_engine": (
+                explanation.nlg_engine
+                if explanation
+                else "none"
+            ),
+            "obs_nlg_latency_ms": (
+                round(self._nlg_latency_ms[-1], 1)
+                if self._nlg_latency_ms
+                else 0.0
+            ),
         }
+
         self._inference_log.append(log_entry)
 
         if self._on_alert_callback and explanation:
             try:
                 self._on_alert_callback(explanation)
             except Exception as exc:
-                logger.exception("Alert callback error: %s", exc)
+                logger.exception(
+                    "Alert callback error: %s",
+                    exc,
+                )
 
-        t_ms = (time.perf_counter() - t0) * 1000
+        t_ms = (
+            time.perf_counter() - t0
+        ) * 1000
+
         if t_ms > CONFIG.inference.max_latency_ms:
-            logger.warning("Inference latency %.1f ms > 200 ms SLA (NLG async)", t_ms)
+            logger.warning(
+                "Inference latency %.1f ms > SLA",
+                t_ms,
+            )
 
         if explanation is not None:
-            result.nlg_summary = explanation.nlg_summary
-            result.counterfactual = explanation.counterfactual
-            result.shap_values = explanation.shap_values
-            result.top_contributions = explanation.top_contributions
+            result.nlg_summary = (
+                explanation.nlg_summary
+            )
+            result.counterfactual = (
+                explanation.counterfactual
+            )
+            result.shap_values = (
+                explanation.shap_values
+            )
+            result.top_contributions = (
+                explanation.top_contributions
+            )
 
-        is_alert = result is not None and result.alert_level in (
-            AlertLevel.WARNING, AlertLevel.CRITICAL
+        is_alert = (
+            result is not None
+            and result.alert_level in (
+                AlertLevel.WARNING,
+                AlertLevel.CRITICAL,
+            )
         )
-        self._match_state.mark_dirty(is_alert=is_alert)
+
+        self._match_state.mark_dirty(
+            is_alert=is_alert,
+        )
+
         return result
 
     def _dispatch_nlg_async(
@@ -921,8 +1194,11 @@ class PlayersDataAnalysisPipeline:
             )
 
             active_alert = (
-                result.recommendation_type is not None
-            )
+    result.alert_level in (
+        AlertLevel.WARNING,
+        AlertLevel.CRITICAL,
+    )
+)
 
             now = time.time()
 
@@ -942,9 +1218,6 @@ class PlayersDataAnalysisPipeline:
                 and active_alert
                 and sufficient_persistence
             )
-
-            if run_xai:
-                self._last_xai_ts[player_id] = now
 
             xai_fv = self._build_xai_feature_vector(
                 result
@@ -991,137 +1264,268 @@ class PlayersDataAnalysisPipeline:
             # The correct snapshot is taken inside the run_xai block below,
             # after both record calls complete.
             # ─────────────────────────────────────────
-            result._xai_kwargs = dict(
-                player_id=player_id,
-                external_id=player["external_id"],
-                player_name=player["name"],
-                model=model,
-                feature_vector=xai_fv,
-                recommendation_type=result.recommendation_type,
-                confidence=result.confidence,
-                workload_status=result.workload_status,
-                anomaly_score=result.anomaly_score,
-                sequence=result.raw_sequence,
-                mask=result.raw_mask,
-                sequence_background=player.get(
-                    "sequence_background"
-                ),
-                persistence_windows=result.persistence_windows,
-                elapsed_s=int(
-                    # elapsed_seconds is a raw event field — it is NOT part of
-                    # the model feature vector and will be 0 if read from xai_fv.
-                    # Read directly from the latest window event instead.
+            # result._xai_kwargs = dict(
+            #     player_id=player_id,
+            #     external_id=player["external_id"],
+            #     player_name=player["name"],
+            #     model=model,
+            #     feature_vector=xai_fv,
+            #     recommendation_type=recommendation_type,
+            #     confidence=result.confidence,
+            #     workload_status=result.workload_status,
+            #     anomaly_score=result.anomaly_score,
+            #     sequence=result.raw_sequence,
+            #     mask=result.raw_mask,
+            #     sequence_background=player.get(
+            #         "sequence_background"
+            #     ),
+            #     persistence_windows=result.persistence_windows,
+            #     elapsed_s=int(
+            #         # elapsed_seconds is a raw event field — it is NOT part of
+            #         # the model feature vector and will be 0 if read from xai_fv.
+            #         # Read directly from the latest window event instead.
+            #         latest_event.get(
+            #             "elapsed_seconds",
+            #             0,
+            #         )
+            #     ),
+            # )
+
+            # ── Risk trajectory update — every window ─────────────────────────
+            # Clean vs alert is determined by result.is_anomaly, NOT run_xai.
+            # run_xai is suppressed by XAI-layer gates (persistence threshold,
+            # safe mode) — none of those mean the player has recovered.
+            # A window with result.is_anomaly=True but run_xai=False (e.g. window 1
+            # of a new alert episode, before sufficient_persistence is met) must
+            # still accumulate total_risk_windows, not decay them.
+            if not result.is_anomaly:
+                match_state.update_risk_trajectory(
+                    is_alert_window=False,
+                    dominant_finding=None,
+                )
+            elif not run_xai:
+                # Anomalous but XAI suppressed — accumulate without a finding label
+                match_state.update_risk_trajectory(
+                    is_alert_window=True,
+                    dominant_finding=None,
+                )
+
+            if run_xai:
+
+                # ------------------------------------------------
+                # Stage 1 — temporary SHAP explanation
+                # recommendation_type intentionally None
+                # ------------------------------------------------
+                temp_explanation = (
+                    self.xai_layer.build_base_explanation(
+                        player_id=player_id,
+                        external_id=player["external_id"],
+                        player_name=player["name"],
+                        model=model,
+                        feature_vector=xai_fv,
+                        recommendation_type=None,
+                        confidence=result.confidence,
+                        workload_status=result.workload_status,
+                        anomaly_score=result.anomaly_score,
+                        sequence=result.raw_sequence,
+                        mask=result.raw_mask,
+                        sequence_background=player.get(
+                            "sequence_background"
+                        ),
+                        persistence_windows=result.persistence_windows,
+                    )
+                )
+
+                semantic_findings = (
+                    self.xai_layer.build_semantic_findings(
+                        shap_dict=temp_explanation.shap_values,
+                        feature_values=xai_fv,
+                        persistence_windows=result.persistence_windows,
+                    )
+                )
+
+                findings_dicts = [
+                    (
+                        f.to_dict()
+                        if hasattr(f, "to_dict")
+                        else f
+                    )
+                    for f in semantic_findings
+                ]
+
+                # ------------------------------------------------
+                # Stage 2 — update symbolic memory
+                # ------------------------------------------------
+                elapsed_s = int(
                     latest_event.get(
                         "elapsed_seconds",
                         0,
                     )
-                ),
-            )
+                )
 
-            # ─────────────────────────────────────────
-            # SHAP + NLG
-            # ─────────────────────────────────────────
-            if run_xai:
-                    # synchronous SHAP
-                    base_explanation = (
-                        self.xai_layer.build_base_explanation(
-                            player_id=player_id,
-                            external_id=player["external_id"],
-                            player_name=player["name"],
-                            model=model,
-                            feature_vector=xai_fv,
-                            recommendation_type=result.recommendation_type,
-                            confidence=result.confidence,
-                            workload_status=result.workload_status,
-                            anomaly_score=result.anomaly_score,
-                            sequence=result.raw_sequence,
-                            mask=result.raw_mask,
-                            sequence_background=player.get(
-                                "sequence_background"
-                            ),
-                            persistence_windows=result.persistence_windows,
-                        )
-                    )
-
-                    semantic_findings = (
-                        self.xai_layer.build_semantic_findings(
-                            shap_dict=base_explanation.shap_values,
-                            feature_values=xai_fv,
-                            persistence_windows=result.persistence_windows,
-                        )
-                    )
-
-                    base_explanation = replace(
-                        base_explanation,
-                        semantic_findings=tuple(
-                            (
-                                f.to_dict()
-                                if hasattr(f, "to_dict")
-                                else f
-                            )
-                            for f in semantic_findings
-                        ),
-                    )
-
-                    result.base_explanation = base_explanation
-
-                    # elapsed_seconds must come from the raw event, not xai_fv.
-                    # The model feature_vector does not carry this field, so
-                    # xai_fv.get("elapsed_seconds") is always 0 → minute=0.
-                    elapsed_s = int(latest_event.get("elapsed_seconds", 0))
-
-                    for finding_dict in base_explanation.semantic_findings:
-                        match_state.record_finding(
-                            finding=finding_dict,
-                            elapsed_seconds=elapsed_s,
-                        )
-                    
-                    match_state.record_alert(
-                        recommendation_type=result.recommendation_type,
-                        confidence=result.confidence,
-                        anomaly_score=result.anomaly_score,
+                for finding_dict in findings_dicts:
+                    match_state.record_finding(
+                        finding=finding_dict,
                         elapsed_seconds=elapsed_s,
                     )
 
-                    # Build semantic state ONCE after findings + alert are recorded.
-                    # Pass it into refresh_episodes and build_compressed_context so
-                    # neither method calls build_semantic_state() internally — that
-                    # would be the 2nd and 3rd polyfit pass per window.
-                    semantic_state = match_state.build_semantic_state()
-
-                    current_min = elapsed_s // 60 if elapsed_s else None
-
-                    match_state.refresh_episodes(
-                        current_minute=current_min,
-                        current_escalation=semantic_state.escalation_level,
-                        semantic_state=semantic_state,   # reuse, no recompute
+                # ── Risk trajectory update — alert window ─────────────────────
+                # Dominant finding ranked by explicit severity ordinal then
+                # confidence — never by string comparison or insertion order.
+                _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+                _ranked_findings = sorted(
+                    semantic_findings,
+                    key=lambda f: (
+                        _SEV_RANK.get(
+                            getattr(f, "severity", "low").lower(), 0
+                        ),
+                        float(getattr(f, "confidence", 0.0)),
+                    ),
+                    reverse=True,
+                )
+                _dominant_finding = (
+                    _ranked_findings[0].finding_type
+                    if _ranked_findings and hasattr(_ranked_findings[0], "finding_type")
+                    else (
+                        findings_dicts[0].get("finding_type")
+                        if findings_dicts
+                        else None
                     )
+                )
+                match_state.update_risk_trajectory(
+                    is_alert_window=True,
+                    dominant_finding=_dominant_finding,
+                )
 
-                    logger.debug(
-                        "Window clock: elapsed_s=%d current_min=%s player=%d",
-                        elapsed_s, current_min, player_id,
-                    )
+                semantic_state = match_state.build_semantic_state()
 
-                    current_finding_types = [
-                        fd.get("finding_type") or fd.get("type", "unknown")
-                        for fd in base_explanation.semantic_findings
-                    ]
+                current_min = (
+                    elapsed_s // 60
+                    if elapsed_s
+                    else None
+                )
 
-                    compressed_context = match_state.build_compressed_context(
+                match_state.refresh_episodes(
+                    current_minute=current_min,
+                    current_escalation=semantic_state.escalation_level,
+                    semantic_state=semantic_state,
+                )
+
+                current_finding_types = [
+                    fd.get("finding_type")
+                    or fd.get("type", "unknown")
+                    for fd in findings_dicts
+                ]
+
+                compressed_context = (
+                    match_state.build_compressed_context(
                         current_finding_types=current_finding_types,
                         current_minute=current_min,
-                        semantic_state=semantic_state,   # reuse, no recompute
+                        semantic_state=semantic_state,
                     )
+                )
 
-                    result.compressed_context = compressed_context
-                    result._xai_kwargs["compressed_context"] = compressed_context
+                # ------------------------------------------------
+                # Stage 3 — policy resolution
+                # ------------------------------------------------
+                policy_ctx = build_policy_input(
+                    semantic_findings=findings_dicts,
+                    compressed_context=compressed_context,
+                    feature_values=xai_fv,
+                )
 
-                    result.semantic_state = semantic_state
-                    result._xai_kwargs["semantic_state"] = semantic_state
+                recommendation_type = (
+                    _policy_engine.determine(policy_ctx)
+                )
 
-                    self._last_xai_ts[player_id] = now
+                result.recommendation_type = (
+                    recommendation_type
+                )
 
-        is_alert = result is not None and result.recommendation_type is not None
+                # Record resolved alert AFTER policy
+                match_state.record_alert(
+                    recommendation_type=recommendation_type,
+                    confidence=result.confidence,
+                    anomaly_score=result.anomaly_score,
+                    elapsed_seconds=elapsed_s,
+                )
+
+                # ------------------------------------------------
+                # Stage 4 — final explanation
+                # ------------------------------------------------
+                base_explanation = (
+                    self.xai_layer.build_base_explanation(
+                        player_id=player_id,
+                        external_id=player["external_id"],
+                        player_name=player["name"],
+                        model=model,
+                        feature_vector=xai_fv,
+                        recommendation_type=recommendation_type,
+                        confidence=result.confidence,
+                        workload_status=result.workload_status,
+                        anomaly_score=result.anomaly_score,
+                        sequence=result.raw_sequence,
+                        mask=result.raw_mask,
+                        sequence_background=player.get(
+                            "sequence_background"
+                        ),
+                        persistence_windows=result.persistence_windows,
+                    )
+                )
+
+                base_explanation = replace(
+                    base_explanation,
+                    semantic_findings=tuple(
+                        findings_dicts
+                    ),
+                )
+
+                result.base_explanation = (
+                    base_explanation
+                )
+
+                result.compressed_context = (
+                    compressed_context
+                )
+
+                result.semantic_state = (
+                    semantic_state
+                )
+
+                # ------------------------------------------------
+                # Stage 5 — stash async kwargs
+                # ------------------------------------------------
+                result._xai_kwargs = dict(
+                    player_id=player_id,
+                    external_id=player["external_id"],
+                    player_name=player["name"],
+                    model=model,
+                    feature_vector=xai_fv,
+                    recommendation_type=recommendation_type,
+                    confidence=result.confidence,
+                    workload_status=result.workload_status,
+                    anomaly_score=result.anomaly_score,
+                    sequence=result.raw_sequence,
+                    mask=result.raw_mask,
+                    sequence_background=player.get(
+                        "sequence_background"
+                    ),
+                    persistence_windows=result.persistence_windows,
+                    elapsed_s=elapsed_s,
+                    compressed_context=compressed_context,
+                    semantic_state=semantic_state,
+                )
+
+                self._last_xai_ts[player_id] = now
+
+
+
+        # is_alert: true when either the policy engine resolved a recommendation
+        # (episodic path ran) OR the ML layer detected raw signals (signal_types).
+        is_alert = result is not None and (
+            result.recommendation_type is not None
+            or bool(result.signal_types)
+        )
         self._match_state.mark_dirty(is_alert=is_alert)
         return result
 

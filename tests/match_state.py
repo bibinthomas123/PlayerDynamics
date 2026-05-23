@@ -348,7 +348,7 @@ class TestOrchestratorMatchStateWiring:
             patch("analysis.orchestrator.FairnessMonitor"),
             patch("analysis.orchestrator.TelemetryValidityLayer"),
             patch("analysis.orchestrator.SystemInvariantGuard"),
-            patch("utils.reliability.determinism.MutationJournal"),
+            patch("utils.reliability.determinism.f"),
             patch("utils.reliability.determinism.TemporalCausalityGuard"),
         ):
             from analysis.orchestrator import PlayersDataAnalysisPipeline

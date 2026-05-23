@@ -280,7 +280,23 @@ class CompressedTemporalContext:
     episode_count:          int                  # total episodes this match
     # Persistence of the current ongoing episode (window count).
     # Set by the compressor so to_prompt_block() never parses strings to recover it.
+    # LOCKED SEMANTICS: persistence_windows == total_risk_windows whenever
+    # trajectory data is available (i.e. after the first window of a match).
+    # The only exception is the very first window before ActiveRiskTrajectory
+    # has been updated — in that case both fields are 0.
+    # Do NOT use this field for pattern-specific persistence; use
+    # pattern_persistence_windows for that.  This field exists for backward
+    # compatibility with existing consumers; new code should read
+    # total_risk_windows directly.  Will be removed in a future version.
     persistence_windows:    int = 0
+    # ── Dual persistence counters (from ActiveRiskTrajectory) ─────────────────
+    # pattern_persistence_windows: consecutive windows the *exact* current pattern
+    #   has been active.  Resets when semantic subtype changes.
+    # total_risk_windows: cumulative alert windows since last clean reset.
+    #   Never resets on subtype transitions.  Used for escalation.
+    # Both are 0 when no trajectory data is available (first window).
+    pattern_persistence_windows: int = 0
+    total_risk_windows:          int = 0
     # Cross-match historical episodes retrieved from EpisodeStore (optional).
     # Scored and filtered before compression so only salient episodes reach the prompt.
     historical_episodes:    List[dict] = field(default_factory=list)
@@ -380,13 +396,21 @@ class CompressedTemporalContext:
 
         # ── Envelope ──────────────────────────────────────────────────────────
         envelope = {
-            "active_pattern":         active_pattern,
-            "trend":                  trend,
-            "persistence_windows":    persistence_w,
-            "in_match_recurrence":    in_match_recurrence,
-            "cross_match_recurrence": cross_match_recurrence,
-            "last_similar_outcome":   last_similar_outcome,
-            "current_escalation":     self.current_escalation,
+            "active_pattern":              active_pattern,
+            "trend":                       trend,
+            # pattern_persistence_windows: how long the *current subtype* has been active.
+            # total_risk_windows: how long the player has been in ANY degraded state.
+            # The LLM should use both: "Recovery degradation for 2 windows within
+            # an 8-window sustained degradation trajectory."
+            "pattern_persistence_windows": self.pattern_persistence_windows,
+            "total_risk_windows":          self.total_risk_windows,
+            # Kept for backward compatibility with existing prompt consumers.
+            # Equals total_risk_windows when trajectory data is available.
+            "persistence_windows":         persistence_w,
+            "in_match_recurrence":         in_match_recurrence,
+            "cross_match_recurrence":      cross_match_recurrence,
+            "last_similar_outcome":        last_similar_outcome,
+            "current_escalation":          self.current_escalation,
         }
 
         if self.state_transitions:
@@ -1020,6 +1044,13 @@ class TemporalContextCompressor:
         current_escalation: str,
         current_finding_types: Optional[List[str]] = None,
         historical_episodes: Optional[List[dict]] = None,
+        # ── Risk trajectory overrides (from ActiveRiskTrajectory) ─────────────
+        # When provided, these replace the episode-derived persistence_windows
+        # and active_pattern so that cross-subtype risk accumulation is visible
+        # to downstream policy even when semantic subtypes fluctuate.
+        trajectory_total_risk_windows: Optional[int] = None,
+        trajectory_pattern_persistence: Optional[int] = None,
+        trajectory_active_pattern: Optional[str] = None,
     ) -> CompressedTemporalContext:
         """
         Build CompressedTemporalContext from all available symbolic memory.
@@ -1055,17 +1086,40 @@ class TemporalContextCompressor:
         # Never infer persistence or active_pattern from string parsing.
         # Both values come directly from the ongoing episode object.
         ongoing_ep    = next((ep for ep in reversed(episodes) if ep.is_ongoing()), None)
-        persistence_w = ongoing_ep.persistence_duration if ongoing_ep else 0
 
-        # active_pattern: the dominant finding of the current ongoing episode,
-        # human-readable (underscores → spaces).  None when no episode is active.
+        # ── persistence_windows: prefer trajectory total_risk_windows ─────────
+        # ongoing_ep.persistence_duration counts only the current same-type group.
+        # trajectory_total_risk_windows accumulates across all alert windows
+        # this match, surviving subtype transitions.  This is the value that
+        # feeds policy rules (substitute requires ≥ 8, reduce_load ≥ 4, etc.)
+        if trajectory_total_risk_windows is not None:
+            persistence_w = trajectory_total_risk_windows
+        else:
+            # Fallback for callers that don't yet supply the trajectory
+            persistence_w = ongoing_ep.persistence_duration if ongoing_ep else 0
+
+        # ── active_pattern: prefer trajectory when available ──────────────────
+        # trajectory_active_pattern is the current pattern of the risk trajectory
+        # (blanks when the player is clean).  Fall back to episode-derived value.
         active_pattern: Optional[str] = None
-        if ongoing_ep and ongoing_ep.dominant_findings:
+        if trajectory_active_pattern:
+            active_pattern = trajectory_active_pattern.replace("_", " ")
+        elif ongoing_ep and ongoing_ep.dominant_findings:
             active_pattern = ongoing_ep.dominant_findings[0].replace("_", " ")
         elif current_finding_types:
-            # Fallback: use the first finding type from the current window when
-            # there is no ongoing episode yet (first window of a new pattern).
             active_pattern = current_finding_types[0].replace("_", " ")
+
+        logger.warning(
+            "CTX BUILD DEBUG | active_pattern=%r "
+            "pattern_persistence=%d total_risk_windows=%d "
+            "escalation=%s episodes=%d",
+            active_pattern,
+            trajectory_pattern_persistence if trajectory_pattern_persistence is not None
+                else (ongoing_ep.persistence_duration if ongoing_ep else 0),
+            trajectory_total_risk_windows if trajectory_total_risk_windows is not None else 0,
+            current_escalation,
+            len(episodes),
+        )
 
         return CompressedTemporalContext(
             trajectory_narrative=trajectory,
@@ -1078,6 +1132,16 @@ class TemporalContextCompressor:
             current_escalation=current_escalation,
             episode_count=len(episodes),
             persistence_windows=persistence_w,
+            pattern_persistence_windows=(
+                trajectory_pattern_persistence
+                if trajectory_pattern_persistence is not None
+                else (ongoing_ep.persistence_duration if ongoing_ep else 0)
+            ),
+            total_risk_windows=(
+                trajectory_total_risk_windows
+                if trajectory_total_risk_windows is not None
+                else 0
+            ),
             active_pattern=active_pattern,
             historical_episodes=historical_episodes or []
         )

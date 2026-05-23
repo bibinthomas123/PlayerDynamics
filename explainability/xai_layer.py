@@ -1373,7 +1373,7 @@ class XAILayer:
             )
 
         shap_dict["positional_drift_score"] = positional_effect
-
+ 
         shap_dict["window_avg_speed_ms"] += seq_shap.get("acceleration_ms2", 0.0)
 
         last_step = sequence[-1]

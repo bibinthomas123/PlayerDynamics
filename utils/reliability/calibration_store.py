@@ -40,11 +40,20 @@ class HardenedRollingThresholdStore:
 
         # Hyper-parameters
         self.max_windows = 500
-        self.quarantine_threshold = 20 # Windows to vet before merging
+        self.quarantine_threshold = 20  # Windows to vet before merging
         self.drift_threshold = 0.15     # KS-test statistic limit
-        self.adaptation_cooldown_s = 3600 # 1 hour cooldown between updates
+        self.adaptation_cooldown_s = 3600  # 1 hour cooldown between updates
+
+        # Stability bounds — prevent oscillation and deviance normalization
+        self.threshold_floor: float = 0.0    # set to gold-set p99.5 at init time
+        self.threshold_ceiling: float = float("inf")  # set by operator; hard upper cap
+        self.max_upward_step_fraction: float = 0.20   # threshold may not rise >20% per commit
+        self.max_downward_step_fraction: float = 0.50 # threshold may not fall >50% per commit
+        self._consecutive_upward_adaptations: int = 0
+        self.max_consecutive_upward: int = 3  # circuit-breaker: freeze after N rising commits
 
         self._last_update_at = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        self._last_committed_threshold: Optional[float] = None
 
     def add_window(self, window_id: str, loss: float, confidence: float, timestamp: datetime):
         """Adds a window to the quarantine buffer for vetting."""
@@ -105,7 +114,57 @@ class HardenedRollingThresholdStore:
         losses = np.array([w.loss for w in merged])
         cutoff = np.quantile(losses, 0.95)
         clean  = losses[losses <= cutoff]
-        return float(np.quantile(clean, quantile))
+        proposed = float(np.quantile(clean, quantile))
+
+        # ── Stability gate ─────────────────────────────────────────────
+        # 1. Hard absolute bounds
+        if proposed < self.threshold_floor:
+            logger.warning(
+                "Proposed threshold %.4f is below floor %.4f — clamping.",
+                proposed, self.threshold_floor,
+            )
+            proposed = self.threshold_floor
+
+        if proposed > self.threshold_ceiling:
+            logger.warning(
+                "Proposed threshold %.4f exceeds ceiling %.4f — rejecting.",
+                proposed, self.threshold_ceiling,
+            )
+            return None  # reject entirely; do not adapt
+
+        # 2. Rate-of-change cap (only enforceable once we have a prior commit)
+        prior = self._last_committed_threshold
+        if prior is not None and prior > 0.0:
+            rise_limit = prior * (1.0 + self.max_upward_step_fraction)
+            fall_limit = prior * (1.0 - self.max_downward_step_fraction)
+
+            if proposed > rise_limit:
+                logger.warning(
+                    "Proposed threshold %.4f rises >%.0f%% from prior %.4f — rejecting "
+                    "to prevent oscillatory inflation.",
+                    proposed, self.max_upward_step_fraction * 100, prior,
+                )
+                return None
+
+            if proposed < fall_limit:
+                logger.warning(
+                    "Proposed threshold %.4f falls >%.0f%% from prior %.4f — rejecting "
+                    "to prevent over-correction.",
+                    proposed, self.max_downward_step_fraction * 100, prior,
+                )
+                return None
+
+        # 3. Consecutive-upward-adaptation circuit-breaker
+        if prior is not None and proposed > prior:
+            if self._consecutive_upward_adaptations >= self.max_consecutive_upward:
+                logger.warning(
+                    "Circuit breaker: %d consecutive upward adaptations reached. "
+                    "Freezing threshold at %.4f until a downward or neutral commit occurs.",
+                    self._consecutive_upward_adaptations, prior,
+                )
+                return None
+
+        return proposed
 
     # ------------------------------------------------------------------
     # Write path — called ONLY by DeterministicCalibrationManager
@@ -145,6 +204,15 @@ class HardenedRollingThresholdStore:
         self.quarantine.clear()
         self.calibration_version += 1
         self._last_update_at = now
+
+        # Update stability tracking counters
+        new_threshold = self.get_threshold()
+        if self._last_committed_threshold is not None and new_threshold > self._last_committed_threshold:
+            self._consecutive_upward_adaptations += 1
+        else:
+            self._consecutive_upward_adaptations = 0  # reset on neutral or downward move
+        self._last_committed_threshold = new_threshold
+
         return True
 
     def attempt_adaptation(self) -> bool:
@@ -220,3 +288,72 @@ class HardenedRollingThresholdStore:
             "losses": [w.loss for w in self.windows],
             "last_update": self._last_update_at.isoformat()
         }
+    
+    def full_state_dict(self) -> dict:
+        """Complete serialization of all distribution state needed for replay recovery.
+
+        Unlike state_dict(), this captures every field required to reproduce
+        future adaptation timing, KS-test baselines, and quarantine contents
+       exactly — so recovery is truly deterministic.
+        """
+        return {
+            "calibration_version": self.calibration_version,
+            "last_update_at": self._last_update_at.isoformat(),
+            "last_committed_threshold": self._last_committed_threshold,
+            "consecutive_upward_adaptations": self._consecutive_upward_adaptations,
+            "windows": [
+                {
+                    "window_id": w.window_id,
+                    "loss":      w.loss,
+                    "timestamp": w.timestamp.isoformat(),
+                    "confidence": w.confidence,
+                    "is_healthy": w.is_healthy,
+                    "is_quarantined": w.is_quarantined,
+                }
+                for w in self.windows
+            ],
+            "quarantine": [
+                {
+                    "window_id": w.window_id,
+                    "loss":      w.loss,
+                    "timestamp": w.timestamp.isoformat(),
+                    "confidence": w.confidence,
+                    "is_healthy": w.is_healthy,
+                    "is_quarantined": w.is_quarantined,
+                }
+                for w in self.quarantine
+            ],
+        }
+
+    @classmethod
+    def from_state_dict(cls, player_id: int, data: dict) -> "HardenedRollingThresholdStore":
+        """Reconstruct a store from a full_state_dict() snapshot.
+
+        This is the only correct recovery path. Reconstructing from a partial
+        snapshot (e.g. version number only) leaves distributions blank and
+        causes KS-test divergence on the first post-recovery adaptation.
+        """
+        store = cls(player_id)
+        store.calibration_version = data["calibration_version"]
+        store._last_update_at = datetime.fromisoformat(data["last_update_at"])
+        store._last_committed_threshold = data.get("last_committed_threshold")       
+        store._consecutive_upward_adaptations = data.get(                            
+            "consecutive_upward_adaptations", 0
+        )
+
+        def _deserialize(raw: list) -> list[CalibrationWindow]:
+            return [
+                CalibrationWindow(
+                    window_id=r["window_id"],
+                    loss=r["loss"],
+                    timestamp=datetime.fromisoformat(r["timestamp"]),
+                    confidence=r["confidence"],
+                    is_healthy=r["is_healthy"],
+                    is_quarantined=r["is_quarantined"],
+                )
+                for r in raw
+            ]
+
+        store.windows     = _deserialize(data.get("windows", []))
+        store.quarantine  = _deserialize(data.get("quarantine", []))
+        return store

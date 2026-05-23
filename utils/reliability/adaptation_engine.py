@@ -87,6 +87,7 @@ class DeterministicCalibrationManager:
                 "model_version":  model_version,
                 "version_before": version_before,
                 "version_after":  new_version,
+                "store":  self.store.full_state_dict() #  full distribution state
             },
             event_id=window_id,  # causal link: which inference window triggered this
         )
@@ -121,14 +122,49 @@ class DeterministicCalibrationManager:
         return self.store.get_threshold(quantile)
 
     def recover_from_journal(self):
-        """Restores the calibration state from the mutation journal."""
+        """Restores the calibration state from the mutation journal.
+
+        Recovery replays to the LAST committed mutation and restores the full
+        store snapshot embedded in that mutation's change_set.  This means:
+          - rolling distributions (windows list)              ✓ restored
+          - quarantine buffer                                  ✓ restored
+          - last_update_at (controls cooldown timing)         ✓ restored
+          - calibration_version                               ✓ restored
+          - KS-test baseline (derived from windows list)      ✓ restored
+
+        Post-recovery adaptation timing is therefore identical to what it would
+        have been without the crash.
+        """
         history = self.journal.get_history(f"calibration_{self.player_id}")
         if not history:
             return
 
-        # Replay all mutations in order
-        for mutation in history:
-            self._current_version = mutation.new_version
-            # In a real system, we'd update the store's internal state
-            # For this implementation, we'll simulate the recovery
-        logger.info("Calibration recovered for player %d to version %d", self.player_id, self._current_version)
+        # Sort by version so we always replay to the latest committed state
+        history_sorted = sorted(history, key=lambda m: m.new_version)
+        latest = history_sorted[-1]
+
+        snapshot = latest.change_set.get("store_snapshot")
+        if snapshot is None:
+            # Journal entries written before this patch lack a snapshot.
+            # Fall back to version-only recovery (old behaviour) with a warning.
+            logger.warning(
+                "Player %d: journal entry v%d has no store_snapshot — "
+                "distribution state cannot be recovered. Adaptation timing "
+                "will diverge until enough new windows accumulate.",
+                self.player_id, latest.new_version,
+            )
+            self._current_version = latest.new_version
+            return
+
+        self.store = HardenedRollingThresholdStore.from_state_dict(
+            self.player_id, snapshot
+        )
+        self._current_version = latest.new_version
+        logger.info(
+            "Calibration recovered for player %d to version %d "
+            "(%d active windows, %d quarantined)",
+            self.player_id,
+            self._current_version,
+            len(self.store.windows),
+            len(self.store.quarantine),
+        )
