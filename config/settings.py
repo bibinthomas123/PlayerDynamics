@@ -104,6 +104,14 @@ class SequenceWindowConfig:
     event_interval_s: int = 15   # Must match DT_OUT=15 in data_generator.py
     # NOTE: for real GPS hardware at 1 Hz or 5 Hz, change both to 1 or 5.
 
+    # Minimum real-world gap (seconds) between consecutive events for the same
+    # player before SequenceWindowBuilder.add_event() treats it as a
+    # substitution/bench gap and resets that player's buffer, instead of
+    # silently mixing pre-gap and post-gap ticks into the same window.
+    # Placeholder default (4x event_interval_s) — not yet calibrated against
+    # real substitution patterns; see HANDBALL_CALIBRATION.md.
+    gap_threshold_s: float = 60.0
+
     @property
     def window_steps(self) -> int:
         return self.window_seconds // self.event_interval_s   # = 8 steps at 15 s/tick
@@ -191,6 +199,12 @@ class BaselineConfig:
     short_window_days: int             = 7
     min_sessions_for_baseline: int     = 5
     zscore_anomaly_threshold: float    = 2.5
+
+    # Pilot mode: minimum number of valid within-session windows required to
+    # build a PROVISIONAL baseline (BaselineBuilder.compute_provisional()) when
+    # fewer than min_sessions_for_baseline historical sessions exist yet.
+    # Does not affect the historical (>= min_sessions_for_baseline) path.
+    min_windows_for_provisional: int  = 5
 
 
 @dataclass

@@ -331,35 +331,3 @@ C1 hr = 0.0 in feature vector (None→safe_float→0.0)
        └─► ALL 6 SemanticFinding types suppressed
             incl. locomotor_overload, tactical_instability, fatigue_accumulation
 ```
-
----
-
-## Recommended Fix Order
-
-Fix dependencies must be respected:
-
-```
-Phase A — prerequisite geometry (unblocks everything downstream)
-  [1] D2: PITCH_LENGTH_M = 40.0, PITCH_WIDTH_M = 20.0
-  [2] D1: SPRINT_THRESHOLD_MS = 5.5
-  [3] D3: late_in_game threshold → 1800 s
-  [4] D4: baseline_speed denominator → 3600 s
-  Retrain LSTM on corrected-geometry handball sessions.
-
-Phase B — refine once geometry is correct
-  [5] B1: TVL acceleration: align key to "acceleration_ms2", raise threshold to 25.0
-  [6] B4: Feature-space accel clamp ±10 → ±25
-  [7] C1: Add hr_sensor_absent to fv dict in analyze_window() to unblock semantics
-
-Phase C — validate with real match data (post-Phase A)
-  [8] C5: Re-derive fatigue_residual_high from corrected sessions
-  [9] C2: Measure goalkeeper std_r in pitch units; adjust zone_radius floor if needed
-  [10] C3: Evaluate regime territory 33/67 vs 50 split against handball match tapes
-  [11] B3: Confirm Kinexon adapter downsampling rate; evaluate window_seconds for handball
-```
-
-Items [1]–[4] are hard prerequisites. Without them, any LSTM calibration or semantic threshold tuning is calibrated against wrong geometry and wrong sprint classification.
-
----
-
-*No code was modified during this audit.*

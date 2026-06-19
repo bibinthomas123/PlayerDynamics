@@ -589,6 +589,14 @@ class AnomalyResult:
     workload_flag: bool = False
     workload_status: str = "optimal"
 
+    # "historical" or "provisional" — copied from the PlayerBaselineProfile
+    # used for this window (see analysis/baseline.py). Provisional means the
+    # baseline was built from this player's own within-session statistics
+    # because fewer than min_sessions_for_baseline historical sessions exist
+    # yet (pilot mode) — z-scores and drift figures should be read with that
+    # in mind.
+    baseline_mode: str = "historical"
+
     # ML-layer structured signals — populated by analyze_window(), never by policy.
     # Each Signal carries category, subtype, severity, and confidence.
     # Use the signal_types property for backward-compatible string-list access.
@@ -1131,6 +1139,14 @@ class SequenceWindowBuilder:
         self.event_interval_s = cfg.event_interval_s
         self.stride = self.window_steps
         self._tick_counters: Dict[str, int] = {}
+        # Gap detection — see add_event(). Tracks the last seen timestamp per
+        # player so a substitution/bench gap can be detected and the buffer
+        # reset, instead of silently mixing pre-gap and post-gap ticks into
+        # the same window (corrupts LSTM input, regime classification,
+        # semantic findings, and fatigue logic identically, since all four
+        # consume this same emitted window).
+        self.gap_threshold_s = cfg.gap_threshold_s
+        self._last_ts: Dict[str, pd.Timestamp] = {}
 
     def add_event(
         self, event: dict
@@ -1144,7 +1160,21 @@ class SequenceWindowBuilder:
             ``player_external_id`` (str), ``speed_ms`` (float or None),
             ``heart_rate_bpm`` (float or None), ``x_pitch`` (float),
             ``y_pitch`` (float).  Missing/None sensor readings mark the
-            tick as padded (``mask = False``).
+            tick as padded (``mask = False``).  ``ts`` (ISO timestamp string),
+            if present, is used for gap detection (see below).
+
+        Gap detection
+        -------------
+        If ``ts`` is present and parseable, and more than ``gap_threshold_s``
+        seconds have elapsed since the last event seen for this player, the
+        player's buffer is cleared before this event is processed. This
+        prevents a window from spanning a substitution/bench gap — without
+        it, a player's first tick back after being off the court would be
+        appended to a buffer still holding stale pre-gap ticks, and a
+        contaminated window would be emitted immediately (the buffer is
+        already full, so the very next append triggers emission). Events
+        without a parseable ``ts`` skip the gap check (no reset, same
+        behaviour as before this fix).
 
         Returns
         -------
@@ -1154,9 +1184,37 @@ class SequenceWindowBuilder:
             ``(window_steps, N_SEQUENCE_FEATURES)`` (float32) and mask
             has shape ``(window_steps,)`` (bool).
 
-            Returns ``None`` for every event before the buffer is full.
+            Returns ``None`` for every event before the buffer is full —
+            including for ``window_steps`` ticks immediately after a
+            gap-triggered reset, since the buffer must refill from scratch.
         """
         pid = event.get("player_external_id", "")
+
+        cur_ts = None
+        ts_raw = event.get("ts")
+        if ts_raw is not None:
+            try:
+                cur_ts = pd.to_datetime(ts_raw, utc=True)
+            except Exception:
+                cur_ts = None  # unparseable — skip gap check this tick
+
+        if cur_ts is not None:
+            last_ts = self._last_ts.get(pid)
+            if last_ts is not None:
+                gap_s = (cur_ts - last_ts).total_seconds()
+                if gap_s > self.gap_threshold_s:
+                    logger.info(
+                        "SequenceWindowBuilder: gap=%.0fs for player=%s exceeds "
+                        "gap_threshold_s=%.0f — clearing buffer to prevent "
+                        "pre/post-gap window contamination",
+                        gap_s, pid, self.gap_threshold_s,
+                    )
+                    self._buffers.pop(pid, None)
+                    self._mask_buffers.pop(pid, None)
+                    self._prev_events.pop(pid, None)
+                    self._tick_counters.pop(pid, None)
+            self._last_ts[pid] = cur_ts
+
         buf = self._buffers.setdefault(
             pid,      deque(maxlen=self.window_steps))
         mbuf = self._mask_buffers.setdefault(
@@ -4757,6 +4815,7 @@ class PatternAnalysisEngine:
             positional_drift_flag=drift_alert,
             workload_flag=workload_alert,
             workload_status=workload_status,
+            baseline_mode=baseline.baseline_mode,
             signals=signals,
             # policy_resolution intentionally omitted — set by orchestrator
             # after assess_risk_state() + OperationalPolicyEngine run with

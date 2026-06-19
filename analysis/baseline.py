@@ -64,6 +64,16 @@ class PlayerBaselineProfile:
     avg_y: Optional[float]
     position_std_radius: Optional[float]
 
+    # "historical"  — built by compute() from >= min_sessions_for_baseline
+    #                 cross-session aggregates (existing, unchanged behaviour).
+    # "provisional" — built by compute_provisional() from this single
+    #                 session's own within-session window statistics, used
+    #                 only when historical data is insufficient (pilot mode).
+    # Defaults to "historical" so every existing call site that builds a
+    # PlayerBaselineProfile without naming this field keeps its current,
+    # correct meaning without any code change.
+    baseline_mode: str = "historical"
+
     def zscore(self, metric: str, value: float) -> float:
         """Z-score a value against this player's baseline."""
         mean = getattr(self, f"{metric}_mean", None)
@@ -216,6 +226,159 @@ class BaselineBuilder:
             avg_x=avg_x,
             avg_y=avg_y,
             position_std_radius=pos_std,
+        )
+
+    # ── Pilot mode ──────────────────────────────────────────────────────────
+
+    def compute_with_fallback(
+        self,
+        player_id: int,
+        external_id: str,
+        sessions_df: pd.DataFrame,
+        events_df: pd.DataFrame,
+        window_days: int = 28,
+    ) -> Optional[PlayerBaselineProfile]:
+        """
+        Pilot-mode entry point. Tries the existing historical baseline first
+        (compute(), completely unchanged — still requires
+        cfg.min_sessions_for_baseline sessions and returns that result
+        untouched when available). Falls back to a provisional within-session
+        baseline only when historical data is insufficient.
+
+        Existing callers that use compute() directly are entirely unaffected
+        by this method's existence — it is purely additive.
+        """
+        historical = self.compute(player_id, external_id, sessions_df, events_df, window_days)
+        if historical is not None:
+            return historical
+        return self.compute_provisional(player_id, external_id, events_df)
+
+    def compute_provisional(
+        self,
+        player_id: int,
+        external_id: str,
+        events_df: pd.DataFrame,
+        window_seconds: int = 120,
+    ) -> Optional[PlayerBaselineProfile]:
+        """
+        Build a provisional, within-session baseline when fewer than
+        cfg.min_sessions_for_baseline historical sessions exist (pilot mode:
+        e.g. a single Kinexon session with no prior match history).
+
+        Splits this player's own current-session telemetry into
+        window_seconds-sized buckets (matching the live window size) and
+        computes mean/std of per-WINDOW distance, sprint count, top speed,
+        and high-speed distance directly from those buckets. This is the
+        same granularity _build_xai_feature_vector() actually compares
+        against (z_distance, z_sprint_count, etc. are computed per-window) —
+        unlike the historical baseline's match-total statistics, so a
+        provisional baseline's z-scores are internally consistent even
+        though it has no cross-session history yet.
+
+        fatigue_alpha/beta/r_squared are left None: a fatigue decay curve
+        needs multiple sessions' worth of segments to fit meaningfully and
+        is not approximated here.
+
+        Returns None if there are fewer than cfg.min_windows_for_provisional
+        valid windows — i.e. even a within-session estimate isn't reliable
+        yet (e.g. a player with only a few minutes of tracked telemetry).
+        """
+        if events_df.empty or "ts" not in events_df.columns or "speed_ms" not in events_df.columns:
+            return None
+
+        events_df = events_df.copy()
+        events_df["ts"] = pd.to_datetime(events_df["ts"], utc=True)
+        events_df = events_df.sort_values("ts")
+
+        start_ts = events_df["ts"].min()
+        events_df["elapsed_s"] = (events_df["ts"] - start_ts).dt.total_seconds()
+
+        sprint_threshold = CONFIG.kinexon.sprint_threshold_ms
+        hi_threshold = CONFIG.kinexon.high_intensity_threshold_ms
+        speed_cap = CONFIG.kinexon.max_speed_ms
+
+        MIN_EVENTS_PER_WINDOW = 30  # consistent with _compute_fatigue_curve's filter
+        max_window = int(events_df["elapsed_s"].max() // window_seconds) + 1
+
+        window_distances: List[float] = []
+        window_sprints: List[float] = []
+        window_top_speeds: List[float] = []
+        window_hi_dists: List[float] = []
+
+        for w in range(max_window):
+            w_start = w * window_seconds
+            w_end = (w + 1) * window_seconds
+            seg = events_df[
+                (events_df["elapsed_s"] >= w_start) & (events_df["elapsed_s"] < w_end)
+            ]
+            if len(seg) < MIN_EVENTS_PER_WINDOW:
+                continue
+
+            speeds = seg["speed_ms"].fillna(0).clip(lower=0, upper=speed_cap).values
+            if len(seg) < 2:
+                continue
+            # .dt.total_seconds() is resolution-agnostic (datetime64[us]/[ns]/etc.) —
+            # do not convert via .astype("int64") and a hardcoded 1e9 divisor,
+            # which silently assumes nanosecond resolution and is wrong on
+            # pandas versions/inputs that produce microsecond-resolution dtype.
+            dt = seg["ts"].diff().dt.total_seconds().values[1:]
+            dt = np.clip(dt, 0, 5)
+            dist = float(np.sum(speeds[:-1] * dt))
+            if not np.isfinite(dist) or dist < 0:
+                continue
+
+            if "is_sprint" in seg.columns:
+                sprint_count = float(seg["is_sprint"].fillna(0).astype(bool).sum())
+            else:
+                sprint_count = float((speeds >= sprint_threshold).sum())
+
+            top_speed = float(speeds.max())
+            hi_mask = speeds[:-1] >= hi_threshold
+            hi_dist = float(np.sum(speeds[:-1][hi_mask] * dt[hi_mask])) if hi_mask.any() else 0.0
+
+            window_distances.append(dist)
+            window_sprints.append(sprint_count)
+            window_top_speeds.append(top_speed)
+            window_hi_dists.append(hi_dist)
+
+        if len(window_distances) < self.cfg.min_windows_for_provisional:
+            logger.info(
+                "Player %s: only %d valid within-session windows — need %d "
+                "for a provisional baseline",
+                external_id, len(window_distances), self.cfg.min_windows_for_provisional,
+            )
+            return None
+
+        def _mean_std(values: List[float]) -> Tuple[float, float]:
+            arr = np.array(values, dtype=float)
+            return float(arr.mean()), float(arr.std()) if len(arr) > 1 else 1.0
+
+        d_mean, d_std = _mean_std(window_distances)
+        s_mean, s_std = _mean_std(window_sprints)
+        t_mean, t_std = _mean_std(window_top_speeds)
+        h_mean, h_std = _mean_std(window_hi_dists)
+
+        avg_x, avg_y, pos_std = self._compute_positional_norms(events_df)
+
+        logger.info(
+            "Player %s: provisional baseline built from %d within-session "
+            "windows (no historical sessions available)",
+            external_id, len(window_distances),
+        )
+
+        return PlayerBaselineProfile(
+            player_id=player_id,
+            external_id=external_id,
+            window_days=0,  # not applicable -- within-session only
+            computed_at=datetime.now(tz=timezone.utc),
+            n_sessions=1,
+            distance_mean=d_mean, distance_std=d_std,
+            sprint_count_mean=s_mean, sprint_count_std=s_std,
+            top_speed_mean=t_mean, top_speed_std=t_std,
+            high_speed_dist_mean=h_mean, high_speed_dist_std=h_std,
+            fatigue_alpha=None, fatigue_beta=None, fatigue_r_squared=None,
+            avg_x=avg_x, avg_y=avg_y, position_std_radius=pos_std,
+            baseline_mode="provisional",
         )
 
     def _compute_fatigue_curve(
