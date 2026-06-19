@@ -49,6 +49,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from config.settings import CONFIG
+
 logger = logging.getLogger(__name__)
 
 
@@ -375,8 +377,12 @@ class SemanticInterpreter:
                 f"(max plausible={_max_plausible_distance:.0f} m — stale accumulator suspected)"
             )
 
-        # 2. HR dropout during movement
-        if hr == 0.0 and speed > 0.5:
+        # 2. HR dropout during movement — only fires when HR sensor is equipped.
+        # When CONFIG.kinexon.hr_sensor_present is False, heart_rate_bpm=0.0 means
+        # "sensor not worn", not "malfunction". Suppress this check for HR-less
+        # Kinexon exports so movement-based findings are not blocked. Set to True
+        # once wearables are integrated and HR=0 implies a faulty sensor.
+        if hr == 0.0 and speed > 0.5 and CONFIG.kinexon.hr_sensor_present:
             reasons.append(
                 f"HR=0 bpm while speed={speed:.1f} m/s — HR sensor dropout during movement"
             )

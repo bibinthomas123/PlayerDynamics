@@ -73,7 +73,6 @@ class TelemetryValidityLayer:
 
         # 2. Physical Plausibility
         spd = event.get("speed_ms", 0.0)
-        hr = event.get("heart_rate_bpm", 0.0)
         accel = abs(event.get("accel", 0.0))
 
         if accel > 12.0:
@@ -89,9 +88,17 @@ class TelemetryValidityLayer:
                 issues.append(f"borderline_speed_{spd:.2f}")
                 confidence = max(0.0, confidence - 0.25)
 
-        if hr > self.MAX_HR_BPM or hr < self.MIN_HR_BPM:
-            issues.append(f"implausible_hr_{hr}")
-            confidence = 0.0
+        hr_raw = event.get("heart_rate_bpm")
+        if hr_raw is None:
+            # Sensor absent (wearable not worn/synced) — not a bad reading.
+            # Reduce confidence but stay VALID; movement-based inference proceeds.
+            confidence = max(0.0, confidence - 0.20)
+            issues.append("hr_sensor_absent")
+        else:
+            hr = float(hr_raw)
+            if hr > self.MAX_HR_BPM or hr < self.MIN_HR_BPM:
+                issues.append(f"implausible_hr_{hr:.0f}")
+                confidence = 0.0
 
         # 3. Temporal Monotonicity (if timestamp present)
         ts_raw = event.get("ts") or event.get("timestamp")

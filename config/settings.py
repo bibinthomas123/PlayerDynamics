@@ -84,7 +84,7 @@ SEQUENCE_FEATURE_NAMES = [
     "speed_ms",           # Raw speed (m/s)
     "acceleration_ms2",   # delta_speed / delta_t
     "heart_rate_bpm",     # HR normalised per player
-    "sprint_flag",        # Binary: 1 if speed >= 7.0 m/s
+    "sprint_flag",        # Binary: 1 if speed >= KinexonConfig.sprint_threshold_ms
     "x_pitch",            # Pitch X [0, 100]
     "y_pitch",            # Pitch Y [0, 100]
     "distance_delta_m",   # Distance covered since last tick
@@ -229,6 +229,55 @@ class SHAPConfig:
 
 
 # ─────────────────────────────────────────────
+# Kinexon UWB Tracking Adapter
+# ─────────────────────────────────────────────
+@dataclass
+class KinexonConfig:
+    """
+    Configuration for the Kinexon UWB tracking adapter.
+
+    Kinexon uses Ultra-Wideband positioning, not GPS. All positions arrive
+    in metres in a pitch-centred coordinate system where (0, 0) = court centre.
+
+    Player identity: Kinexon 'mapped id' (int) is used directly as player_id
+    in PlayerDynamics. It is NOT the same as the backend DB Player.id.
+    A cross-system mapping table is required for backend integration.
+    """
+    sport: str                    = "handball"
+    pitch_length_m: float         = 40.0    # long axis (m)
+    pitch_width_m: float          = 20.0    # short axis (m)
+    source: str                   = "kinexon"
+
+    # IHF high-intensity sprint threshold for handball (lower than football's 7.0)
+    sprint_threshold_ms: float    = 5.5     # m/s  ≈ 19.8 km/h
+    high_intensity_threshold_ms: float = 4.17  # m/s  ≈ 15.0 km/h
+
+    # Match timing — IHF handball: 2 × 30 min halves, 60 min total
+    match_half_duration_s: int    = 1800   # 30 min; used for late_in_game gate
+    match_duration_s: int         = 3600   # 60 min; used for baseline speed normalisation
+
+    # Sample rates
+    positions_sample_rate_hz: float  = 20.0   # positions.csv — continuous 20 Hz
+    inertial_sample_rate_hz: float   = 91.0   # Inertial.csv  — variable ~91 Hz
+
+    # Plausibility caps; readings above these are sensor artefacts
+    max_speed_ms: float           = 12.0    # m/s  ≈ 43 km/h; top handball < 11 m/s
+    max_accel_ms2: float          = 25.0    # m/s²
+
+    # Source file names relative to the data directory
+    positions_file: str           = "positions.csv"
+    inertial_file: str            = "Inertial.csv"
+    events_file: str              = "events.csv"
+    statistics_file: str          = "statistics.csv"
+
+    # HR wearable availability — set True when HR sensors are integrated.
+    # Currently False: session 3387 and all known SC Magdeburg Kinexon exports
+    # contain heart_rate_bpm=None throughout (wearable not worn / not synced).
+    # When False, heart_rate_bpm=0.0 means "sensor absent", NOT "malfunction".
+    hr_sensor_present: bool       = False
+
+
+# ─────────────────────────────────────────────
 # Feedback / Recalibration
 # ─────────────────────────────────────────────
 @dataclass
@@ -261,6 +310,7 @@ class PlayersDataConfig:
     sportradar:  SportRadarConfig             = field(default_factory=SportRadarConfig)
     live_ws:     LiveEventWSConfig            = field(default_factory=LiveEventWSConfig)
     wearable:    WearableSensorConfig         = field(default_factory=WearableSensorConfig)
+    kinexon:     KinexonConfig                = field(default_factory=KinexonConfig)
     window:      SequenceWindowConfig         = field(default_factory=SequenceWindowConfig)
     lstm:        LSTMAutoencoderConfig        = field(default_factory=LSTMAutoencoderConfig)
     transformer: TransformerAutoencoderConfig = field(default_factory=TransformerAutoencoderConfig)

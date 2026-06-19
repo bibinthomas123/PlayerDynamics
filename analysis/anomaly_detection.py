@@ -58,7 +58,7 @@ Index  Name                Description
 0      speed_ms            Instantaneous speed in m/s
 1      accel               Acceleration in m/s², clamped to ±10 m/s²
 2      heart_rate_bpm      Heart rate in beats per minute
-3      sprint_flag         Binary; 1 if speed_ms ≥ SPRINT_THRESHOLD_MS
+3      sprint_flag         Binary; 1 if speed_ms ≥ SPRINT_THRESHOLD_MS (from KinexonConfig)
 4      x_pitch             Normalised x coordinate [0, 100]
 5      y_pitch             Normalised y coordinate [0, 100]
 6      distance_delta      True Euclidean displacement since last tick (metres)
@@ -160,14 +160,17 @@ logger = logging.getLogger(__name__)
 MODEL_STORE = Path("./models")
 MODEL_STORE.mkdir(parents=True, exist_ok=True)
 
-SPRINT_THRESHOLD_MS = 7.0
+# Sport-specific constants sourced from KinexonConfig so that handball values
+# replace the football defaults that were previously hard-coded here.
+# Module-level names are preserved so that any existing imports still resolve.
+SPRINT_THRESHOLD_MS = CONFIG.kinexon.sprint_threshold_ms   # 5.5 m/s (handball IHF); was 7.0 (football)
 
-# Standard FIFA pitch dimensions used for coordinate → metre conversion.
+# Pitch dimensions for coordinate → metre conversion in _extract().
 # x_pitch and y_pitch are normalised [0, 100]; these scale each axis back to metres
 # so that distance_delta is geometrically correct and unit-consistent with
 # drift thresholds and workload metrics that are expressed in metres.
-PITCH_LENGTH_M = 105.0   # y-axis (goal-to-goal)
-PITCH_WIDTH_M = 68.0    # x-axis (touchline-to-touchline)
+PITCH_LENGTH_M = CONFIG.kinexon.pitch_length_m   # 40.0 m (handball long axis); was 105.0 (FIFA)
+PITCH_WIDTH_M  = CONFIG.kinexon.pitch_width_m    # 20.0 m (handball short axis); was 68.0 (FIFA)
 
 
 def safe_float(v, default: float) -> float:
@@ -1160,8 +1163,7 @@ class SequenceWindowBuilder:
             pid, deque(maxlen=self.window_steps))
         prev = self._prev_events.get(pid)
 
-        is_real = (event.get("speed_ms") is not None
-                   and event.get("heart_rate_bpm") is not None)
+        is_real = event.get("speed_ms") is not None
         fv = (self._extract(event, prev)
               if is_real
               else np.zeros(N_SEQUENCE_FEATURES, dtype=np.float32))
@@ -1307,10 +1309,7 @@ class SequenceWindowBuilder:
 
         for row in rows:
 
-            is_real = (
-                row.get("speed_ms") is not None
-                and row.get("heart_rate_bpm") is not None
-            )
+            is_real = row.get("speed_ms") is not None
 
             if is_real:
                 fv = self._extract(
@@ -1412,10 +1411,7 @@ class SequenceWindowBuilder:
         prev_real: Optional[dict] = prev_event
     
         for event in events:
-            is_real = (
-                event.get("speed_ms")        is not None
-                and event.get("heart_rate_bpm") is not None
-            )
+            is_real = event.get("speed_ms") is not None
             if is_real:
                 fv = self._extract(event, prev_real)   # (N_SEQUENCE_FEATURES,)
                 prev_real = event
@@ -4667,12 +4663,12 @@ class PatternAnalysisEngine:
         else:
             is_anomaly, confidence = False, 0.0
  
-        baseline_speed = (baseline.distance_mean / (90 * 60)
+        baseline_speed = (baseline.distance_mean / CONFIG.kinexon.match_duration_s
                           if baseline.distance_mean > 0 else 3.5)
         speed_ratio = fv.get("speed_ms", 999) / max(baseline_speed, 0.1)
         speed_low = speed_ratio < 0.55
         sprint_low = fv.get("sprint_flag", 1) == 0
-        late_in_game = elapsed > 2700
+        late_in_game = elapsed > CONFIG.kinexon.match_half_duration_s
         fatigue_flag = is_anomaly and (speed_low or sprint_low) and late_in_game
  
         _ACTIVE_LEVELS = (AlertLevel.WARNING, AlertLevel.SUSTAINED, AlertLevel.CRITICAL)
