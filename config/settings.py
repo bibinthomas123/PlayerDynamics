@@ -221,6 +221,99 @@ class PositionalDriftConfig:
 
 
 # ─────────────────────────────────────────────
+# TeamState aggregation (built on TacticalEvent stream)
+# ─────────────────────────────────────────────
+@dataclass
+class TeamStateConfig:
+    """
+    Rolling-window lengths for TeamStateBuilder (analysis/team_state.py).
+
+    Windows are wall-clock ticks anchored to the first event timestamp in the
+    stream, NOT tied to individual event arrival times -- this keeps the
+    snapshot cadence regular even though event density varies hugely by type
+    (e.g. exertion_event fires far more often than shot).
+
+    step_seconds_* defaults to the matching window length (tumbling/
+    non-overlapping windows) when left as None; set explicitly for an
+    overlapping/sliding cadence instead.
+    """
+    short_window_seconds: int            = 60
+    short_step_seconds: Optional[int]    = None
+    long_window_seconds: int             = 300
+    long_step_seconds: Optional[int]     = None
+
+    # confidence = min(1.0, n_events_in_window / scaled_min_events), where
+    # scaled_min_events = min_events_for_full_confidence_per_60s * (window_seconds / 60)
+    min_events_for_full_confidence_per_60s: float = 10.0
+
+
+# ─────────────────────────────────────────────
+# TeamStateTrend (temporal layer over TeamState snapshots)
+# ─────────────────────────────────────────────
+@dataclass
+class TeamStateTrendConfig:
+    """
+    Fixed thresholds for TeamStateTrendBuilder (analysis/team_state_trend.py).
+
+    attack_activity / physical_load / fatigue_burden are already rate-
+    normalised (events/min or events/min/active-player -- see TeamState's
+    docstring), so a single absolute threshold is comparable across both the
+    60s and 300s windows.
+
+    Calibration: set to roughly half the mean |consecutive-snapshot delta|
+    observed across both real teams over the full session 3387 match
+    (attack_activity ~3.0-6.5, physical_load ~8.5-14, fatigue_burden
+    ~0.9-1.75 depending on window length) -- below the threshold, a swing is
+    treated as within-window noise ("stable"); at or above it, as a genuine
+    directional change.
+    """
+    attack_activity_threshold: float  = 3.0
+    physical_load_threshold: float    = 8.0
+    fatigue_burden_threshold: float   = 1.0
+
+
+# ─────────────────────────────────────────────
+# CoachInsightEngine (deterministic observation layer over TeamStateTrend)
+# ─────────────────────────────────────────────
+@dataclass
+class CoachInsightConfig:
+    """
+    Fixed insight-firing thresholds for CoachInsightEngine
+    (analysis/coach_insight.py).
+
+    These are deliberately set HIGHER than the underlying
+    TeamStateTrendConfig thresholds -- not every "increasing"/"decreasing"
+    trend label is significant enough to surface as a coach-facing
+    observation. Calibrated to roughly the 75th percentile of |delta|
+    observed across both real teams in session 3387's 60s-window trends, so
+    only the most notable ~quarter of swings qualify as an insight:
+
+        attack_activity_delta   75th pct (60s) ~= 9.0
+        physical_load_delta     75th pct (60s) ~= 19.0
+        possession_pressure_delta  ~between 75th (0.17) and 90th (0.30) pct
+
+    severity = "high" / "medium" / "low" from ratio = |delta| / threshold
+    (always >= 1.0 once an insight has fired):
+        ratio >= severity_high_ratio    -> "high"
+        ratio >= severity_medium_ratio  -> "medium"
+        otherwise                       -> "low"
+
+    confidence = min(1.0, confidence_base + confidence_slope * (ratio - 1.0))
+    -- a bare threshold crossing (ratio=1.0) gets confidence_base; confidence
+    rises linearly with how far past the threshold the delta is, capped at 1.0.
+    """
+    attack_activity_insight_threshold: float    = 9.0
+    physical_load_insight_threshold: float      = 19.0
+    possession_pressure_insight_threshold: float = 0.25
+
+    severity_high_ratio: float   = 2.0
+    severity_medium_ratio: float = 1.5
+
+    confidence_base: float  = 0.4
+    confidence_slope: float = 0.2
+
+
+# ─────────────────────────────────────────────
 # Inference SLA
 # ─────────────────────────────────────────────
 @dataclass
@@ -332,6 +425,9 @@ class PlayersDataConfig:
     baseline:    BaselineConfig               = field(default_factory=BaselineConfig)
     fatigue:     FatigueCurveConfig           = field(default_factory=FatigueCurveConfig)
     positional:  PositionalDriftConfig        = field(default_factory=PositionalDriftConfig)
+    team_state:  TeamStateConfig              = field(default_factory=TeamStateConfig)
+    team_state_trend: TeamStateTrendConfig    = field(default_factory=TeamStateTrendConfig)
+    coach_insight: CoachInsightConfig         = field(default_factory=CoachInsightConfig)
     inference:   InferenceConfig              = field(default_factory=InferenceConfig)
     shap:        SHAPConfig                   = field(default_factory=SHAPConfig)
     feedback:    FeedbackConfig               = field(default_factory=FeedbackConfig)
