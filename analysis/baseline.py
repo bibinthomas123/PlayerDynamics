@@ -297,7 +297,15 @@ class BaselineBuilder:
         hi_threshold = CONFIG.kinexon.high_intensity_threshold_ms
         speed_cap = CONFIG.kinexon.max_speed_ms
 
-        MIN_EVENTS_PER_WINDOW = 30  # consistent with _compute_fatigue_curve's filter
+        # NOTE: intentionally NOT consistent with _compute_fatigue_curve's
+        # MIN_EVENTS_PER_SEGMENT=30 -- that filter applies to 900s (15-minute)
+        # fatigue segments, while this window is window_seconds=120s. The two
+        # were previously set to the same literal (30), which silently
+        # rejected every window at the real event_interval_s=15 resampled
+        # cadence (max 8 rows/window, always < 30). See
+        # config.settings.BaselineConfig.min_events_per_provisional_window
+        # for the derivation of this value.
+        MIN_EVENTS_PER_WINDOW = self.cfg.min_events_per_provisional_window
         max_window = int(events_df["elapsed_s"].max() // window_seconds) + 1
 
         window_distances: List[float] = []

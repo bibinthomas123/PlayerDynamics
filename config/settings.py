@@ -189,6 +189,46 @@ class AnomalyScoringConfig:
     mad_multiplier: float           = 5.0    # for small calib sets (< 150 windows)
     calib_contamination_pct: float  = 0.05
 
+    # Pilot mode: per-player calibration (the default, untouched above) needs
+    # >= min_calibration_windows REAL calibration-split losses for ONE player
+    # before tracker.is_calibrated goes True. A single real session split
+    # 21 ways gives each player only 1-6 calibration windows -- nowhere near
+    # 30 -- so every per-player tracker stays permanently uncalibrated
+    # (threshold=inf, confidence=0, is_anomaly=False for every window,
+    # regardless of actual loss). Pooling all eligible players' calibration
+    # losses into one shared RegimeAwareThresholdStore reaches ~70-80 samples
+    # for a 21-player single session, clearing the same min_calibration_windows
+    # gate. Inert by default (False): production behaviour with many
+    # sessions/player is completely unaffected. When True, InferenceEngine
+    # builds the pooled store in addition to (not instead of) each player's
+    # own store, and get_tracker() only reaches for it as a fallback when a
+    # given player's own tracker still isn't calibrated -- per-player
+    # calibration remains authoritative whenever it's actually available.
+    pilot_mode: bool = False
+
+    # Pilot mode, alert-persistence half: AlertManager (utils/alert_manager.py)
+    # defaults to min_persistence=3 -- a player's anomaly SIGNAL (smoothed_loss
+    # > threshold, computed in analyze_window()) must repeat on 3 CONSECUTIVE
+    # windows before AnomalyResult.is_anomaly ever goes True.
+    #
+    # Measured on real session 3387 (scripts/compare_persistence.py, model
+    # trained once, only this value varied across replays): min_persistence
+    # 1, 2, and 3 are INDISTINGUISHABLE on this data -- all three produce 0
+    # alerts. Root cause is NOT persistence: analyze_window()'s EMA smoothing
+    # (score_ema_alpha=0.25) already suppresses the signal a step earlier --
+    # the smoothed_loss never crosses threshold_for(regime) for any of the
+    # 319 windows, even though the RAW loss does for 18 of them (confirmed by
+    # direct trace: e.g. player 2057 window 4, raw_loss=0.837 vs
+    # threshold=0.498, but smoothed_loss=0.492 -- just under). Persistence
+    # logic is never even reached. Kept at 1 (the value that gives every
+    # other live anomaly system the fastest possible response, and the only
+    # one of the three that is NOT redundant with the production default)
+    # so this override is ready to use once the EMA-smoothing layer is
+    # addressed -- but on its own, changing this value does nothing on this
+    # dataset. Only takes effect when pilot_mode=True; production
+    # (pilot_mode=False) keeps AlertManager's own default of 3 untouched.
+    pilot_alert_min_persistence: int = 1
+
 
 # ─────────────────────────────────────────────
 # Personal baseline
@@ -205,6 +245,29 @@ class BaselineConfig:
     # fewer than min_sessions_for_baseline historical sessions exist yet.
     # Does not affect the historical (>= min_sessions_for_baseline) path.
     min_windows_for_provisional: int  = 5
+
+    # Minimum telemetry rows a single 120s provisional window must contain to
+    # count as "valid" (BaselineBuilder.compute_provisional()'s own internal
+    # window_seconds=120 binning). Was hardcoded to 30 directly in
+    # compute_provisional(), copied from _compute_fatigue_curve's
+    # MIN_EVENTS_PER_SEGMENT=30 -- which operates on 900s (FatigueCurveConfig.
+    # window_minutes=15) segments, not 120s ones. At
+    # SequenceWindowConfig.event_interval_s=15, a 120s window contains AT
+    # MOST window_steps=8 rows by construction (one per resampled bucket) --
+    # 30 rejected every real-data window unconditionally, regardless of data
+    # quality. Re-derived empirically against real session 3387 (resampled
+    # via ingestion/kinexon_resampler.py): swept {4,6,8,10,12,15,20,30} rows
+    # of real telemetry per window. 6 ties 4's maximum player coverage
+    # (21/27 reach a provisional baseline, the ceiling among all thresholds
+    # tested) while producing tighter per-window distance estimates (mean
+    # relative SEM 0.068 vs 0.074) -- consistent with the already-existing,
+    # independently-set SequenceWindowConfig.min_events=5 for this exact
+    # cadence (off by one, plausibly because that field gates raw mask
+    # validity in the live accumulator, not provisional-baseline window
+    # acceptance) and with proportionally rescaling
+    # MIN_EVENTS_PER_SEGMENT=30 from a 900s to a 120s window (30 * 120/900
+    # ≈ 4). See scripts/baseline_threshold_audit.py for the full sweep.
+    min_events_per_provisional_window: int = 6
 
 
 @dataclass

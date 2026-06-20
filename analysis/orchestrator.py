@@ -102,9 +102,17 @@ class PlayersDataAnalysisPipeline:
     pipeline.process_live_event(event_dict)
     """
 
-    def __init__(self, model_type: str = None, replay_mode: bool = False):
+    def __init__(self, model_type: str = None, replay_mode: bool = False, redis_producer=None):
         self.model_type = model_type or CONFIG.active_model
         self.replay_mode = replay_mode
+        # Optional config.redis_client.RedisStreamProducer. When provided,
+        # every alert-callback firing also publishes a PlayerAnalyticsEvent
+        # onto analytics.players (see _publish_player_analytics below) --
+        # reuses the exact same Redis Streams infrastructure
+        # MatchOrchestrator already uses for Possession/TeamState/CoachInsight/
+        # CoachSituation. None (the default) keeps this pipeline's existing
+        # behaviour byte-for-byte unchanged -- nothing is published anywhere.
+        self._redis_producer = redis_producer
         self.registry = PlayerRegistry()
         self.baseline_builder = BaselineBuilder()
         self.pattern_engine = PatternAnalysisEngine()
@@ -161,13 +169,33 @@ class PlayersDataAnalysisPipeline:
     # ──────────────────────────────────────────
     # Baseline computation
     # ──────────────────────────────────────────
-    def compute_baselines(self, window_days: int = 28) -> Dict[int, PlayerBaselineProfile]:
+    def compute_baselines(
+        self, window_days: int = 28, use_provisional_fallback: bool = False
+    ) -> Dict[int, PlayerBaselineProfile]:
+        """
+        use_provisional_fallback=False (default): unchanged behaviour — every
+        existing caller (e.g. main.py's synthetic multi-season path) gets
+        exactly the same historical-only compute() result as before.
+
+        use_provisional_fallback=True: routes through BaselineBuilder's
+        already-existing compute_with_fallback() instead of compute() —
+        still tries the historical path first; only falls back to a
+        within-session provisional baseline when fewer than
+        min_sessions_for_baseline historical sessions exist (e.g. a single
+        real Kinexon session). Does not change compute()'s own behaviour or
+        any other call site.
+        """
         baselines = {}
         for pid in self.registry.all_player_ids():
             p = self.registry.get(pid)
             if p["sessions_df"].empty:
                 continue
-            baseline = self.baseline_builder.compute(
+            builder_fn = (
+                self.baseline_builder.compute_with_fallback
+                if use_provisional_fallback
+                else self.baseline_builder.compute
+            )
+            baseline = builder_fn(
                 player_id=pid,
                 external_id=p["external_id"],
                 sessions_df=p["sessions_df"],
@@ -190,12 +218,26 @@ class PlayersDataAnalysisPipeline:
     # ──────────────────────────────────────────
     # Model training 
     # ──────────────────────────────────────────
-    def train_all_models(self) -> dict:
+    def train_all_models(self, use_gap_aware_windowing: bool = False) -> dict:
         """
         Collects sliding-window sequences from all players, then trains ONE
         shared backbone model across all players simultaneously.
         Per-player thresholds are calibrated from each player's held-out slice.
         XAI background is registered per-player from their own windows.
+
+        use_gap_aware_windowing=False (default): unchanged behaviour — calls
+        PatternAnalysisEngine.build_training_sequences() exactly as before,
+        for every existing caller (e.g. main.py's synthetic path, where
+        sessions never contain mid-session tracking gaps).
+
+        use_gap_aware_windowing=True: routes through the already-validated
+        analysis.gap_aware_windowing.build_training_sequences_gap_aware()
+        wrapper instead — drops windows whose source rows span a real
+        tracking discontinuity (e.g. a substitution) exceeding
+        CONFIG.window.gap_threshold_s, which matters for real Kinexon
+        sessions (synthetic sessions have none). Does not duplicate
+        build_from_session()'s windowing logic — the wrapper calls the
+        same, unmodified SequenceWindowBuilder.build_from_session().
         """
 
         # ── Phase 1: build sequences for every eligible player ──────────────
@@ -211,10 +253,18 @@ class PlayersDataAnalysisPipeline:
                 logger.warning("Player %d: no events — skipped", pid)
                 continue
 
-            sequences = self.pattern_engine.build_training_sequences(
-                events_df=p["events_df"],
-                sessions_df=p["sessions_df"],
-            )
+            if use_gap_aware_windowing:
+                from analysis.gap_aware_windowing import build_training_sequences_gap_aware
+                sequences, _audits = build_training_sequences_gap_aware(
+                    pattern_engine=self.pattern_engine,
+                    events_df=p["events_df"],
+                    sessions_df=p["sessions_df"],
+                )
+            else:
+                sequences = self.pattern_engine.build_training_sequences(
+                    events_df=p["events_df"],
+                    sessions_df=p["sessions_df"],
+                )
 
             if len(sequences) == 0:
                 logger.warning("Player %d: 0 sequences built — skipped", pid)
@@ -887,6 +937,14 @@ class PlayersDataAnalysisPipeline:
         }
 
         self._inference_log.append(log_entry)
+
+        # Gated on is_anomaly, not on explanation -- explanation only exists
+        # for SUSTAINED+ alerts (XAI is comparatively expensive), but
+        # analytics.players should mirror CoachInsight's own restraint
+        # (publish on a notable signal, not on every routine window) without
+        # being limited to only the rarer, XAI-explained subset.
+        if result.is_anomaly:
+            self._publish_player_analytics(result)
 
         if self._on_alert_callback and explanation:
             try:
@@ -1590,6 +1648,24 @@ class PlayersDataAnalysisPipeline:
     def set_alert_callback(self, cb: Callable) -> None:
         self._on_alert_callback = cb
 
+    def _publish_player_analytics(self, result) -> None:
+        """
+        Fire-and-forget projection of one AnomalyResult onto analytics.players,
+        if a redis_producer was supplied at construction time. Mirrors the
+        existing alert-callback call sites' own try/except-and-log pattern --
+        a publish failure must never interrupt inference or the operational
+        alert callback that runs alongside it.
+        """
+        if self._redis_producer is None:
+            return
+        try:
+            from analysis.player_analytics_event import to_player_analytics_event
+            from config.redis_client import StreamTopics
+            event = to_player_analytics_event(result, match_id=self._active_match_id)
+            self._redis_producer.publish_dataclass(StreamTopics.ANALYTICS_PLAYERS, event)
+        except Exception as exc:
+            logger.exception("PlayerAnalyticsEvent publish failed: %s", exc)
+
     # ──────────────────────────────────────────
     # Match lifecycle 
     # ──────────────────────────────────────────
@@ -1758,6 +1834,9 @@ class PlayersDataAnalysisPipeline:
             except Exception as exc:
                 logger.warning("run_live inference error for %s: %s", ext_id, exc)
                 return
+
+            if result is not None and result.is_anomaly:
+                self._publish_player_analytics(result)
 
             if result is not None and self._on_alert_callback:
                 try:

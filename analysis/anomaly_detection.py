@@ -1959,13 +1959,27 @@ class InferenceEngine:
     def __init__(self):
         self._shared_model: Optional[SharedBackboneAutoencoder] = None
         self._threshold_trackers: Dict[int, RegimeAwareThresholdStore] = {}
+        # Pilot mode only (CONFIG.scoring.pilot_mode) -- see train() and
+        # _resolve_tracker(). None in production mode; always None unless
+        # pilot_mode was True at train() time.
+        self._pooled_tracker: Optional[RegimeAwareThresholdStore] = None
 
     @property
     def is_ready(self) -> bool:
         return self._shared_model is not None and self._shared_model.is_trained
 
     def train(self, all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]]) -> dict:
-        """Train the shared backbone and calibrate per-player thresholds."""
+        """Train the shared backbone and calibrate per-player thresholds.
+
+        Per-player calibration (below) is unconditional and unchanged --
+        every player still gets their own RegimeAwareThresholdStore, fed
+        only their own calibration-split losses, exactly as before.
+
+        When CONFIG.scoring.pilot_mode is True, an ADDITIONAL pooled store
+        is built alongside the per-player ones (not instead of them),
+        fed every eligible player's calibration losses. get_tracker() only
+        ever reaches for it as a fallback -- see _resolve_tracker().
+        """
         player_ids = list(all_windows.keys())
         self._shared_model = SharedBackboneAutoencoder(
             n_players=len(player_ids))
@@ -1973,6 +1987,9 @@ class InferenceEngine:
         result = self._shared_model.train(all_windows)
 
         alpha = CONFIG.scoring.score_ema_alpha
+        pilot_mode = CONFIG.scoring.pilot_mode
+        pooled_store = RegimeAwareThresholdStore() if pilot_mode else None
+
         for pid, windows in all_windows.items():
             calib = windows[int(len(windows) * 0.80):]
             store = RegimeAwareThresholdStore()
@@ -1982,9 +1999,20 @@ class InferenceEngine:
                 ema_val = smoother.update(raw_loss)
                 regime_key = _REGIME_CLASSIFIER.classify(seq).key
                 store.update(ema_val, regime_key)
+                if pooled_store is not None:
+                    pooled_store.update(ema_val, regime_key)
             self._threshold_trackers[pid] = store
             logger.debug("InferenceEngine p%d calibration:\n%s",
                          pid, store.summary())
+
+        if pooled_store is not None:
+            self._pooled_tracker = pooled_store
+            logger.info(
+                "Pilot-mode pooled calibration store built: %d total samples "
+                "across %d players, calibrated=%s",
+                sum(pooled_store.regime_coverage().values()),
+                len(player_ids), pooled_store.is_calibrated,
+            )
 
         try:
             saved_path = self._shared_model.save()
@@ -2047,8 +2075,47 @@ class InferenceEngine:
 
         return float(raw_loss), self._shared_model.MODEL_TYPE
 
+    def _resolve_tracker(
+        self, player_id: int
+    ) -> Tuple[Optional[RegimeAwareThresholdStore], str]:
+        """Single source of truth for which tracker a player should use.
+
+        Returns (tracker, source) where source is "per_player" (the
+        player's own, calibrated, tracker), "pilot_pooled" (pilot-mode
+        fallback used), or "none" (no calibrated tracker available --
+        caller falls back to is_anomaly=False/confidence=0.0, same as
+        today).
+
+        Per-player calibration is always tried first and is the only
+        source ever used when CONFIG.scoring.pilot_mode is False --
+        production behaviour is byte-identical to before this method
+        existed in that case.
+        """
+        per_player = self._threshold_trackers.get(player_id)
+        if per_player is not None and per_player.is_calibrated:
+            return per_player, "per_player"
+
+        if (
+            CONFIG.scoring.pilot_mode
+            and self._pooled_tracker is not None
+            and self._pooled_tracker.is_calibrated
+        ):
+            return self._pooled_tracker, "pilot_pooled"
+
+        return per_player, "none"
+
     def get_tracker(self, player_id: int) -> Optional[RegimeAwareThresholdStore]:
-        return self._threshold_trackers.get(player_id)
+        tracker, _source = self._resolve_tracker(player_id)
+        return tracker
+
+    def get_tracker_source(self, player_id: int) -> str:
+        """Diagnostic: which calibration source get_tracker() is actually
+        using for this player right now -- "per_player", "pilot_pooled",
+        or "none". Not read by analyze_window() itself; for evaluation/
+        telemetry callers that want to know whether pilot mode is
+        load-bearing for a given player."""
+        _tracker, source = self._resolve_tracker(player_id)
+        return source
 
     def get_model(self) -> Optional[SharedBackboneAutoencoder]:
         return self._shared_model
@@ -4443,7 +4510,18 @@ class PatternAnalysisEngine:
         self._ema_smoothers:     Dict[int, EMASmoother] = {}
         self._ema_scores:        Dict[int, float] = {}
         self._threshold_trackers: Dict[int, RegimeAwareThresholdStore] = {}
-        self.alert_manager = AlertManager()
+        # Pilot mode (CONFIG.scoring.pilot_mode) overrides AlertManager's own
+        # min_persistence=3 default with cfg.pilot_alert_min_persistence.
+        # When pilot_mode is False (production default), this constructs
+        # AlertManager(min_persistence=3) -- identical to the previous
+        # unconditional AlertManager() call, since 3 is AlertManager's own
+        # default too.
+        _alert_min_persistence = (
+            CONFIG.scoring.pilot_alert_min_persistence
+            if CONFIG.scoring.pilot_mode
+            else 3
+        )
+        self.alert_manager = AlertManager(min_persistence=_alert_min_persistence)
         self._shared_model: Optional[SharedBackboneAutoencoder] = None
 
     def reset_ema_state(
