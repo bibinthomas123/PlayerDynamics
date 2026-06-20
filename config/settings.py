@@ -221,6 +221,30 @@ class PositionalDriftConfig:
 
 
 # ─────────────────────────────────────────────
+# Possession (built on TacticalEvent stream)
+# ─────────────────────────────────────────────
+@dataclass
+class PossessionConfig:
+    """
+    Tunables for PossessionEngine (analysis/possession.py).
+
+    possession_quality = quality_outcome_weight * outcome_score
+                        + quality_attack_weight  * min(1, attack_intensity / reference_attack_rate_per_min)
+      where outcome_score = 1.0 (shot) / 0.5 (neutral) / 0.0 (turnover)
+
+    The two weights are an even 50/50 split between "what happened"
+    (outcome) and "how much attacking pressure was generated" (rate) --
+    neither signal alone fully captures possession quality.
+    reference_attack_rate_per_min = 15.0 is a normalisation ceiling for the
+    attack-rate component only, not a hard cap on attack_intensity itself
+    (which is reported uncapped).
+    """
+    quality_outcome_weight: float        = 0.5
+    quality_attack_weight: float         = 0.5
+    reference_attack_rate_per_min: float = 15.0
+
+
+# ─────────────────────────────────────────────
 # TeamState aggregation (built on TacticalEvent stream)
 # ─────────────────────────────────────────────
 @dataclass
@@ -311,6 +335,41 @@ class CoachInsightConfig:
 
     confidence_base: float  = 0.4
     confidence_slope: float = 0.2
+
+
+# ─────────────────────────────────────────────
+# CoachSituationEngine (composite tactical-state layer over
+# Possession/TeamState/TeamStateTrend/CoachInsight)
+# ─────────────────────────────────────────────
+@dataclass
+class CoachSituationConfig:
+    """
+    Fixed thresholds for CoachSituationEngine (analysis/coach_situation.py).
+
+    This class and the CONFIG.coach_situation wiring were lost from this
+    file (most likely amid the disk-full incident documented in
+    PRODUCTION_READINESS_AUDIT.md) after COACH_SITUATION_IMPLEMENTATION.md
+    was written -- recovered by grid-searching every value against that
+    report's section 4 real-data table (session 3387: 157 situations at the
+    60s window, 18 at 300s, with an exact per-type and per-team breakdown).
+    quality_high_threshold and trend_only_confidence were stated explicitly
+    in the report's text and didn't need searching; the other seven were
+    fit by brute-force grid search (see git history of this file / the
+    integration session that restored it) and reproduce the report's table
+    EXACTLY (157/18 totals, all 10 per-type counts, and the HSG
+    Wetzlar/SC Magdeburg per-team split) -- as exact a recovery as possible
+    without the original (uncommitted, lost) values.
+    """
+    quality_high_threshold: float = 0.67
+    trend_only_confidence: float = 0.5
+
+    turnover_heavy_threshold: float = 0.5
+    attack_activity_floor: float = 8.0
+    attack_activity_low_ceiling: float = 2.0
+    min_high_quality_possessions: int = 2
+    possession_pressure_worsening_threshold: float = 0.15
+    possession_pressure_improving_threshold: float = 0.15
+    possession_pressure_stable_threshold: float = 0.05
 
 
 # ─────────────────────────────────────────────
@@ -425,9 +484,11 @@ class PlayersDataConfig:
     baseline:    BaselineConfig               = field(default_factory=BaselineConfig)
     fatigue:     FatigueCurveConfig           = field(default_factory=FatigueCurveConfig)
     positional:  PositionalDriftConfig        = field(default_factory=PositionalDriftConfig)
+    possession:  PossessionConfig             = field(default_factory=PossessionConfig)
     team_state:  TeamStateConfig              = field(default_factory=TeamStateConfig)
     team_state_trend: TeamStateTrendConfig    = field(default_factory=TeamStateTrendConfig)
     coach_insight: CoachInsightConfig         = field(default_factory=CoachInsightConfig)
+    coach_situation: CoachSituationConfig     = field(default_factory=CoachSituationConfig)
     inference:   InferenceConfig              = field(default_factory=InferenceConfig)
     shap:        SHAPConfig                   = field(default_factory=SHAPConfig)
     feedback:    FeedbackConfig               = field(default_factory=FeedbackConfig)

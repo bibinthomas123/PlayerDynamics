@@ -1,71 +1,3 @@
-"""
-Players Data — IBM CIC Germany
-Redis Configuration — Production Backend
-
-Provides three things:
-
-1. RedisConnectionPool
-   Singleton connection pool shared across all stores and pub/sub clients.
-   Configured for production: TLS, auth, connection-level health checks,
-   and exponential-backoff retry on transient failures.
-
-2. RedisCheckpointStore
-   Drop-in replacement for JsonFileCheckpointStore.
-   Implements the CheckpointStore protocol from match_state.py so the
-   MatchStateManager can be switched to Redis with a one-line change:
-
-       # Before
-       store = JsonFileCheckpointStore("session")
-
-       # After
-       store = RedisCheckpointStore.from_env()
-
-   Uses SET ... NX EX for atomic single-key writes.
-   TTL is tied to MAX_CHECKPOINT_AGE_HOURS so orphaned keys from unclean
-   shutdowns self-expire — no separate cleanup job needed.
-
-3. PubSubConfig + RedisPubSubClient
-   Publisher and subscriber wrappers for future production pub/sub use cases:
-   — Alert fan-out to dashboards / coaching tablets
-   — Multi-worker broadcast of match state invalidation signals
-   — Replay mode event streaming
-
-   Channels are namespaced by match_id so independent matches never interfere.
-   Messages are JSON-serialised so any language can subscribe.
-
-Usage
-─────
-    from config.redis_config import RedisCheckpointStore, RedisPubSubClient
-
-    # Checkpoint store (pass to MatchStateManager)
-    store = RedisCheckpointStore.from_env()
-
-    # Publisher (call from orchestrator on alert)
-    pub = RedisPubSubClient.publisher()
-    pub.publish_alert(match_id="match_20260517", payload=alert_dict)
-
-    # Subscriber (run in a separate thread / process)
-    sub = RedisPubSubClient.subscriber()
-    sub.subscribe_alerts(match_id="match_20260517", callback=my_handler)
-    sub.listen()   # blocking loop
-
-Environment variables
-─────────────────────
-    REDIS_HOST          default: localhost
-    REDIS_PORT          default: 6379
-    REDIS_DB            default: 0
-    REDIS_PASSWORD      default: (none)
-    REDIS_TLS           default: false   ("true" / "1" to enable)
-    REDIS_TLS_CERTFILE  path to client certificate (mTLS, optional)
-    REDIS_TLS_KEYFILE   path to client key         (mTLS, optional)
-    REDIS_TLS_CA        path to CA bundle           (mTLS, optional)
-    REDIS_SOCKET_TIMEOUT_S      default: 2.0
-    REDIS_CONNECT_TIMEOUT_S     default: 5.0
-    REDIS_MAX_CONNECTIONS       default: 20
-    REDIS_CHECKPOINT_TTL_HOURS  default: 6  (matches MAX_CHECKPOINT_AGE_HOURS)
-    REDIS_RETRY_MAX_ATTEMPTS    default: 3
-    REDIS_RETRY_BACKOFF_S       default: 0.5
-"""
 from __future__ import annotations
 
 import json
@@ -166,12 +98,12 @@ class RedisConnectionPool:
     @classmethod
     def _build_pool(cls) -> "ConnectionPool":
         host     = os.getenv("REDIS_HOST", "localhost")
-        port     = _env_int("REDIS_PORT", 6380)
+        port     = _env_int("REDIS_PORT", 6379)
         db       = _env_int("REDIS_DB", 0)
         password = os.getenv("REDIS_PASSWORD") or None
         use_tls  = _env_bool("REDIS_TLS", False)
 
-        socket_timeout  = _env_float("REDIS_SOCKET_TIMEOUT_S", 2.0)
+        socket_timeout  = _env_float("REDIS_SOCKET_TIMEOUT_S", 30.0)
         connect_timeout = _env_float("REDIS_CONNECT_TIMEOUT_S", 5.0)
         max_connections = _env_int("REDIS_MAX_CONNECTIONS", 20)
 
@@ -1101,6 +1033,332 @@ class RedisPubSubClient:
             return self._listener_thread
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Redis Streams — production communication backbone (Backend <-> PlayerDynamics)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StreamTopics:
+    """
+    Fixed Redis Stream names — see REDIS_STREAM_CONTRACTS.md and
+    BACKEND_INTEGRATION_IMPLEMENTATION.md for the ownership rules these
+    follow.
+
+    Ownership (strict — see BACKEND_INTEGRATION_IMPLEMENTATION.md §1):
+      Backend is the source of truth for match actions and match metadata
+      (shot/goal/save/turnover/timeout/substitution/card/coach annotation,
+      score, clock, period state) and publishes them:
+        match.events    -- discrete coach/match actions
+        match.context   -- running match state (score, clock, period)
+      PlayerDynamics is the source of truth for analytics and owns Kinexon
+      ingestion directly (Kinexon never flows through Backend) -- it
+      consumes match.events/match.context, combines them with its own
+      Kinexon-derived TacticalEvent stream, and publishes:
+        analytics.possessions, analytics.teamstate, analytics.trends,
+        analytics.insights, analytics.situations, analytics.players
+
+    tracking.events is NOT Backend-facing: it exists only as a possible
+    PlayerDynamics-internal hand-off (a Kinexon-ingestion worker process to
+    a MatchOrchestrator worker process), should those ever be split into
+    separate processes. Nothing outside PlayerDynamics should ever publish
+    or consume it.
+
+    Not namespaced by match_id (unlike PubSubConfig's channels) — match_id
+    travels inside each entry's fields (see ingestion/stream_codec.py),
+    consistent with REDIS_STREAM_CONTRACTS.md's wire format.
+    """
+    MATCH_EVENTS           = "match.events"
+    MATCH_CONTEXT           = "match.context"
+    TRACKING_EVENTS        = "tracking.events"  # PlayerDynamics-internal only, see docstring
+    ANALYTICS_POSSESSIONS  = "analytics.possessions"
+    ANALYTICS_TEAMSTATE    = "analytics.teamstate"
+    ANALYTICS_TRENDS       = "analytics.trends"
+    ANALYTICS_INSIGHTS     = "analytics.insights"
+    ANALYTICS_SITUATIONS  = "analytics.situations"
+    ANALYTICS_PLAYERS      = "analytics.players"
+
+    # Backend <-> PlayerDynamics boundary streams (excludes tracking.events,
+    # which never crosses that boundary).
+    FROM_BACKEND = (MATCH_EVENTS, MATCH_CONTEXT)
+    TO_BACKEND   = (
+        ANALYTICS_POSSESSIONS, ANALYTICS_TEAMSTATE, ANALYTICS_TRENDS,
+        ANALYTICS_INSIGHTS, ANALYTICS_SITUATIONS, ANALYTICS_PLAYERS,
+    )
+
+    INBOUND  = (MATCH_EVENTS, MATCH_CONTEXT, TRACKING_EVENTS)
+    OUTBOUND = TO_BACKEND
+    ALL      = INBOUND + OUTBOUND
+
+
+def _flatten_xreadgroup(result: Optional[list]) -> "list[tuple[str, Dict[str, str]]]":
+    """
+    redis-py's xreadgroup() returns [[stream_name, [(entry_id, fields), ...]]]
+    (one inner list per stream requested). This client always reads one
+    stream at a time, so flatten to a plain [(entry_id, fields), ...] list.
+    """
+    if not result:
+        return []
+    entries: "list[tuple[str, Dict[str, str]]]" = []
+    for _stream_name, stream_entries in result:
+        entries.extend(stream_entries)
+    return entries
+
+
+class RedisStreamProducer:
+    """
+    XADD wrapper — the Backend/PlayerDynamics outbound publishing side.
+
+    Reuses RedisConnectionPool (shared pool) and the same retry-with-backoff
+    helper already used by RedisCheckpointStore, so transient connection
+    drops are retried transparently ("reconnect" requirement) rather than
+    surfacing as a publish failure on the first hiccup.
+    """
+
+    def __init__(self, max_attempts: int = 3, backoff_s: float = 0.5) -> None:
+        if not _REDIS_AVAILABLE:
+            raise RuntimeError(
+                "redis-py is not installed. Install with: pip install redis[hiredis]"
+            )
+        self._max_attempts = max_attempts
+        self._backoff_s = backoff_s
+
+    def ensure_stream(self, stream: str) -> None:
+        """
+        Create `stream` if it does not exist yet ("stream creation"
+        requirement), without requiring a real consumer group to exist.
+
+        XGROUP CREATE ... MKSTREAM is the only Redis primitive that creates
+        an empty stream outright (XADD also creates it, but only as a side
+        effect of writing real data). A throwaway group name is used purely
+        to force creation; BUSYGROUP (group/stream already exists) is
+        swallowed since this call is meant to be idempotent.
+        """
+        def _do() -> None:
+            client = RedisConnectionPool.client()
+            try:
+                client.xgroup_create(stream, "_bootstrap", id="0", mkstream=True)
+            except RedisError as exc:
+                if "BUSYGROUP" not in str(exc):
+                    raise
+
+        try:
+            _with_retry(_do, self._max_attempts, self._backoff_s)
+            logger.debug("RedisStreamProducer.ensure_stream: stream=%s ready", stream)
+        except RedisError:
+            logger.exception("RedisStreamProducer.ensure_stream: failed for stream=%s", stream)
+            raise
+
+    def publish(self, stream: str, fields: Dict[str, str]) -> Optional[str]:
+        """
+        XADD fields onto stream. Returns the new entry ID, or None if the
+        publish ultimately failed after retries (caller decides whether
+        that is fatal — fire-and-forget callers may choose to log and continue).
+
+        `fields` must be a flat str -> str mapping — see
+        ingestion/stream_codec.encode() for the canonical envelope
+        ({"schema_version", "type", "match_id", "payload"}) used by
+        publish_dataclass() below.
+        """
+        def _do() -> str:
+            client = RedisConnectionPool.client()
+            return client.xadd(stream, fields)
+
+        try:
+            entry_id = _with_retry(_do, self._max_attempts, self._backoff_s)
+            logger.debug("RedisStreamProducer.publish: stream=%s id=%s", stream, entry_id)
+            return entry_id
+        except RedisError:
+            logger.exception("RedisStreamProducer.publish: failed for stream=%s", stream)
+            return None
+
+    def publish_dataclass(self, stream: str, obj: Any) -> Optional[str]:
+        """Encode obj via ingestion.stream_codec.encode() and XADD it onto stream."""
+        from ingestion.stream_codec import encode
+        return self.publish(stream, encode(obj))
+
+
+class RedisStreamConsumer:
+    """
+    XREADGROUP + XACK wrapper with consumer-group semantics, crash-safe
+    replay, and an extra duplicate-protection layer on top of Streams' own
+    delivery guarantees.
+
+    consumer_name MUST be stable across process restarts (e.g. derived from
+    a fixed worker id, not a random UUID per process) — Redis tracks each
+    consumer's Pending Entries List (PEL) by this name, and read_pending()
+    below depends on it to find work that was in flight when the previous
+    process died.
+
+    Reliability
+    -----------
+    reconnect              : every Redis call goes through the same
+                              _with_retry exponential-backoff helper used by
+                              RedisCheckpointStore.
+    consumer group creation : _ensure_group() is called in __init__ and is
+                              idempotent (BUSYGROUP swallowed), satisfying
+                              "consumer group creation" + "stream creation"
+                              even when this is the very first consumer ever
+                              attached to a brand-new stream (mkstream=True).
+    duplicate protection    : is_duplicate() does an atomic SETNX-with-TTL
+                              check BEFORE a caller processes an entry. This
+                              is an EXTRA layer beyond Streams' own at-most-
+                              once-per-group delivery via XACK — it also
+                              catches a misbehaving producer re-publishing
+                              the same logical event as a new stream entry
+                              (different entry_id, e.g. after a retry that
+                              actually succeeded), which XACK alone cannot
+                              detect since XACK only dedupes redelivery of
+                              the SAME entry_id.
+    replay after restart   : read_pending() (XREADGROUP ... '0') returns
+                              every entry already delivered to this exact
+                              consumer_name that was never XACKed — exactly
+                              what was "in flight" before a crash/restart.
+                              Call this once at startup, before read_new(),
+                              to drain it.
+    """
+
+    _DEDUP_NAMESPACE = "players_data:stream:seen"
+
+    def __init__(
+        self,
+        stream: str,
+        group: str,
+        consumer_name: str,
+        max_attempts: int = 3,
+        backoff_s: float = 0.5,
+        block_ms: int = 5000,
+        dedup_ttl_hours: float = 24.0,
+    ) -> None:
+        if not _REDIS_AVAILABLE:
+            raise RuntimeError(
+                "redis-py is not installed. Install with: pip install redis[hiredis]"
+            )
+        self.stream = stream
+        self.group = group
+        self.consumer_name = consumer_name
+        self._max_attempts = max_attempts
+        self._backoff_s = backoff_s
+        self._block_ms = block_ms
+        self._dedup_ttl_s = int(dedup_ttl_hours * 3600)
+        self._ensure_group()
+
+    def _ensure_group(self) -> None:
+        def _do() -> None:
+            client = RedisConnectionPool.client()
+            try:
+                client.xgroup_create(self.stream, self.group, id="0", mkstream=True)
+            except RedisError as exc:
+                if "BUSYGROUP" not in str(exc):
+                    raise
+
+        _with_retry(_do, self._max_attempts, self._backoff_s)
+        logger.info(
+            "RedisStreamConsumer: group ready | stream=%s group=%s consumer=%s",
+            self.stream, self.group, self.consumer_name,
+        )
+
+    def read_new(self, count: int = 10) -> "list[tuple[str, Dict[str, str]]]":
+        """
+        XREADGROUP ... '>' — only entries never delivered to this group
+        before. Returns [(entry_id, fields), ...], oldest first.
+        """
+        def _do():
+            client = RedisConnectionPool.client()
+            return client.xreadgroup(
+                self.group, self.consumer_name, {self.stream: ">"},
+                count=count, block=self._block_ms,
+            )
+
+        try:
+            result = _with_retry(_do, self._max_attempts, self._backoff_s)
+            return _flatten_xreadgroup(result)
+        except RedisError:
+            logger.exception("RedisStreamConsumer.read_new: failed stream=%s group=%s",
+                              self.stream, self.group)
+            return []
+
+    def read_pending(self, count: int = 10) -> "list[tuple[str, Dict[str, str]]]":
+        """
+        XREADGROUP ... '0' — entries already delivered to THIS consumer_name
+        but never XACKed (this consumer's own Pending Entries List). Call
+        this once at startup, before read_new(), to replay work that was in
+        flight when the previous process instance died — see class
+        docstring's "replay after restart" note.
+        """
+        def _do():
+            client = RedisConnectionPool.client()
+            return client.xreadgroup(
+                self.group, self.consumer_name, {self.stream: "0"}, count=count,
+            )
+
+        try:
+            result = _with_retry(_do, self._max_attempts, self._backoff_s)
+            return _flatten_xreadgroup(result)
+        except RedisError:
+            logger.exception("RedisStreamConsumer.read_pending: failed stream=%s group=%s",
+                              self.stream, self.group)
+            return []
+
+    def ack(self, entry_id: str) -> None:
+        """XACK entry_id — call only after the entry has been fully processed."""
+        def _do() -> None:
+            client = RedisConnectionPool.client()
+            client.xack(self.stream, self.group, entry_id)
+
+        try:
+            _with_retry(_do, self._max_attempts, self._backoff_s)
+            logger.debug("RedisStreamConsumer.ack: stream=%s id=%s", self.stream, entry_id)
+        except RedisError:
+            logger.exception("RedisStreamConsumer.ack: failed stream=%s id=%s",
+                              self.stream, entry_id)
+
+    def is_duplicate(self, entry_id: str) -> bool:
+        """
+        Atomic check-and-mark: returns True if entry_id has already been
+        seen by this (stream, group) within the dedup TTL window, False the
+        first time (and immediately marks it seen for next time). Call this
+        BEFORE processing an entry's payload; if it returns True, ack and
+        skip rather than re-applying the entry's effects.
+        """
+        key = f"{self._DEDUP_NAMESPACE}:{self.stream}:{self.group}:{entry_id}"
+
+        def _do() -> bool:
+            client = RedisConnectionPool.client()
+            was_set = client.set(key, "1", nx=True, ex=self._dedup_ttl_s)
+            return not bool(was_set)
+
+        try:
+            return _with_retry(_do, self._max_attempts, self._backoff_s)
+        except RedisError:
+            logger.exception("RedisStreamConsumer.is_duplicate: failed for id=%s", entry_id)
+            return False  # fail open -- never block processing on a dedup-check error
+
+    def decode(self, fields: Dict[str, str]) -> Any:
+        """Decode a raw stream entry's fields back into its original dataclass."""
+        from ingestion.stream_codec import decode
+        return decode(fields)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience: verify connectivity at import time (non-fatal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_redis_connection() -> bool:
+    """
+    Ping Redis and return True if reachable.
+
+    Call during application startup to surface misconfiguration early.
+    Does NOT raise — returns False so callers can decide whether to abort
+    or fall back to JsonFileCheckpointStore.
+    """
+    if not _REDIS_AVAILABLE:
+        logger.info("check_redis_connection: redis-py not installed — skipping")
+        return False
+    try:
+        client = RedisConnectionPool.client()
+        return client.ping()
+    except Exception as exc:
+        logger.warning("check_redis_connection: Redis unreachable — %s", exc)
+        return False
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience: verify connectivity at import time (non-fatal)
 # ─────────────────────────────────────────────────────────────────────────────
