@@ -141,6 +141,37 @@ class PilotPlayerAnalyticsEvent:
     # InferenceEngine._resolve_tracker(). Purely informational.
     tracker_source: str = "none"
 
+    # ── Real per-window telemetry (added for the coach-facing workload/
+    # baseline-deviation dashboard panels) ─────────────────────────────────
+    # All four below are computed by SUMMING/AVERAGING the real per-tick
+    # values already present across this window's own sequence array
+    # (SEQUENCE_FEATURE_NAMES columns over window_steps timesteps) -- not a
+    # new model output, not a new measurement. distance_delta_m and
+    # sprint_flag are read at every timestep and aggregated by the caller
+    # (scripts/publish_pilot_analytics.py); previously
+    # analysis/orchestrator.py's _build_xai_feature_vector() only read the
+    # LAST timestep and multiplied/scaled it as an approximation -- this
+    # event uses the genuine sum/mean across the real window instead, which
+    # is strictly more accurate and still introduces no new computation
+    # beyond arithmetic over already-real values.
+    window_distance_m: float = 0.0
+    window_avg_speed_ms: float = 0.0
+    window_sprint_ticks: int = 0  # count of the window's own ticks at/above sprint threshold (0..window_steps)
+
+    # Baseline z-scores (PlayerBaselineProfile.zscore(), unmodified) for this
+    # window's own aggregates against the player's own (historical or
+    # provisional-fallback) baseline -- "how far this window is from this
+    # player's own normal", purely descriptive, no new threshold or model.
+    baseline_distance_z: float = 0.0
+    baseline_speed_z: float = 0.0
+    baseline_sprint_z: float = 0.0
+
+    # Session-level real totals (KinexonResampler._session_summary_row()),
+    # repeated on every event for this player+session -- a session-wide
+    # context number, not a new per-window measurement.
+    session_total_distance_m: float = 0.0
+    session_high_speed_distance_m: float = 0.0
+
 
 def to_pilot_player_analytics_event(
     result: "AnomalyResult",
@@ -153,16 +184,30 @@ def to_pilot_player_analytics_event(
     regime: str,
     tracker_source: str,
     match_id: Optional[str] = None,
+    window_distance_m: float = 0.0,
+    window_avg_speed_ms: float = 0.0,
+    window_sprint_ticks: int = 0,
+    baseline_distance_z: float = 0.0,
+    baseline_speed_z: float = 0.0,
+    baseline_sprint_z: float = 0.0,
+    session_total_distance_m: float = 0.0,
+    session_high_speed_distance_m: float = 0.0,
 ) -> PilotPlayerAnalyticsEvent:
     """
     Pure projection of an AnomalyResult (plus the small set of pilot-only
     diagnostics not carried on AnomalyResult itself -- threshold, SHAP,
-    player identity) onto the wire-safe PilotPlayerAnalyticsEvent shape.
+    player identity, real per-window telemetry) onto the wire-safe
+    PilotPlayerAnalyticsEvent shape.
 
     threshold may be float("inf") on input (player never reached a usable
     calibration source) -- converted to None on the output dataclass
     (JSON has no Infinity literal) and raw_threshold_breach is forced
     False in that case rather than evaluating a comparison against infinity.
+
+    The window_*/baseline_*/session_* parameters default to 0.0/0 rather
+    than being required, so any existing caller built before these fields
+    existed keeps working unchanged -- this projection function's signature
+    change is purely additive.
     """
     is_calibrated = threshold != float("inf")
     raw_breach = bool(result.anomaly_score > threshold) if is_calibrated else False
@@ -181,4 +226,12 @@ def to_pilot_player_analytics_event(
         model_version=model_version,
         regime=regime,
         tracker_source=tracker_source,
+        window_distance_m=window_distance_m,
+        window_avg_speed_ms=window_avg_speed_ms,
+        window_sprint_ticks=window_sprint_ticks,
+        baseline_distance_z=baseline_distance_z,
+        baseline_speed_z=baseline_speed_z,
+        baseline_sprint_z=baseline_sprint_z,
+        session_total_distance_m=session_total_distance_m,
+        session_high_speed_distance_m=session_high_speed_distance_m,
     )

@@ -1,21 +1,25 @@
 """
 publish_pilot_analytics.py
 
-Publishes real PlayerDynamics pilot outputs (session 3387, model_version
-shared_*) onto the analytics.players Redis Stream as PilotPlayerAnalyticsEvent
-entries, for Backend's existing AnalyticsBridgeService / SSE relay /
-Frontend "Player Analytics" tab to consume -- no Backend or Frontend-side
-publishing code involved; this is the sole producer.
+Publishes real PlayerDynamics pilot outputs (session 3387, the PROMOTED
+checkpoint at models/shared_backbone.pt) onto the analytics.players Redis
+Stream as PilotPlayerAnalyticsEvent entries, for Backend's existing
+AnalyticsBridgeService / SSE relay / Frontend "Player Analytics" tab to
+consume -- no Backend or Frontend-side publishing code involved; this is
+the sole producer.
 
 Does NOT publish is_anomaly or alert_level (see PilotPlayerAnalyticsEvent's
 docstring) -- those remain experimental. Publishes, per real window, per
 eligible player: reconstruction_loss, confidence, threshold,
 raw_threshold_breach, and the real top-3 SHAP features for that window.
 
-Reuses the exact training/scoring path validated over the last several
-turns (scripts/evaluate_pilot_model.py) -- trains the model once, computes
-nothing new, introduces no new threshold or calibration logic. This script
-is a pure publisher: AnomalyResult/SHAP -> PilotPlayerAnalyticsEvent -> XADD.
+LOADS the promoted checkpoint (scripts/evaluate_pilot_model.py's
+_build_pipeline_and_load(), which calls PlayersDataAnalysisPipeline.
+load_shared_model() -> SharedBackboneAutoencoder.load() -- no fitting).
+Per-player threshold calibration is still recomputed against the loaded
+model, since that state is not persisted to disk, but the backbone's
+weights are the promoted checkpoint's, unmodified. This script remains a
+pure publisher: AnomalyResult/SHAP -> PilotPlayerAnalyticsEvent -> XADD.
 
 Run:
     python scripts/publish_pilot_analytics.py
@@ -33,7 +37,7 @@ from config.redis_client import RedisStreamProducer, StreamTopics
 from analysis.gap_aware_windowing import build_training_sequences_gap_aware
 from analysis.regime import SessionRegimeClassifier
 from analysis.player_analytics_event import to_pilot_player_analytics_event
-from evaluate_pilot_model import _build_pipeline_and_train, _windows_with_elapsed, _IDX  # noqa: E402
+from evaluate_pilot_model import _build_pipeline_and_load, _windows_with_elapsed, _IDX  # noqa: E402
 
 LINE = "=" * 90
 SUB = "-" * 90
@@ -46,10 +50,11 @@ def main() -> None:
     print("Publishing PILOT player analytics to analytics.players -- real session 3387")
     print(LINE)
 
-    pipeline, events_by_player, sessions_df, meta, eligible, train_result = _build_pipeline_and_train()
+    pipeline, events_by_player, sessions_df, meta, eligible, load_result = _build_pipeline_and_load()
     engine = pipeline.pattern_engine
     model_version = engine._shared_model.model_version if engine._shared_model else "unknown"
-    print(f"\nTrained: {train_result['shared_model']} (model_version={model_version})")
+    print(f"\nLoaded promoted checkpoint (not retrained): {load_result['shared_model']} "
+          f"(model_version={model_version})")
 
     producer = RedisStreamProducer()
     producer.ensure_stream(StreamTopics.ANALYTICS_PLAYERS)
@@ -74,6 +79,17 @@ def main() -> None:
 
         p_record = pipeline.registry.get(pid)
         background = p_record.get("sequence_background") if p_record else None
+        baseline = engine._baselines.get(pid)
+
+        # Real session-level totals (KinexonResampler._session_summary_row()),
+        # constant across this player's events for this session -- not a
+        # per-window measurement, just session context repeated on the wire.
+        session_total_distance_m = 0.0
+        session_high_speed_distance_m = 0.0
+        if not player_sessions.empty:
+            session_row = player_sessions.iloc[0]
+            session_total_distance_m = float(session_row.get("total_distance_m", 0.0))
+            session_high_speed_distance_m = float(session_row.get("high_speed_distance_m", 0.0))
 
         for w_idx, ((seq, mask, _sid), elapsed) in enumerate(zip(windows, elapsed_starts)):
             last = seq[-1]
@@ -83,6 +99,19 @@ def main() -> None:
                 "elapsed_seconds": float(elapsed) if elapsed is not None else 0.0,
                 "_tvl_confidence": 1.0,
             }
+
+            # Real per-window telemetry: sum/mean of the REAL per-tick values
+            # across all window_steps timesteps of this window's own sequence
+            # array (not just the last tick, and not a new model output --
+            # plain arithmetic over already-real window data).
+            window_distance_m = float(seq[:, _IDX["distance_delta_m"]].sum())
+            window_avg_speed_ms = float(seq[:, _IDX["speed_ms"]].mean())
+            window_sprint_ticks = int(seq[:, _IDX["sprint_flag"]].sum())
+
+            baseline_distance_z = baseline.zscore("distance", window_distance_m) if baseline else 0.0
+            baseline_speed_z = baseline.zscore("top_speed", window_avg_speed_ms) if baseline else 0.0
+            baseline_sprint_z = baseline.zscore("sprint_count", window_sprint_ticks) if baseline else 0.0
+
             try:
                 result = engine.analyze_window(
                     player_id=pid, sequence=seq, mask=mask,
@@ -121,6 +150,14 @@ def main() -> None:
                     regime=regime_key,
                     tracker_source=tracker_source,
                     match_id=SESSION_MATCH_ID,
+                    window_distance_m=window_distance_m,
+                    window_avg_speed_ms=window_avg_speed_ms,
+                    window_sprint_ticks=window_sprint_ticks,
+                    baseline_distance_z=baseline_distance_z,
+                    baseline_speed_z=baseline_speed_z,
+                    baseline_sprint_z=baseline_sprint_z,
+                    session_total_distance_m=session_total_distance_m,
+                    session_high_speed_distance_m=session_high_speed_distance_m,
                 )
                 producer.publish_dataclass(StreamTopics.ANALYTICS_PLAYERS, event)
                 n_published += 1

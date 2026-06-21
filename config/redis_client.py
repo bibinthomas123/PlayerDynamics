@@ -1075,6 +1075,15 @@ class StreamTopics:
     ANALYTICS_INSIGHTS     = "analytics.insights"
     ANALYTICS_SITUATIONS  = "analytics.situations"
     ANALYTICS_PLAYERS      = "analytics.players"
+    # Coach-facing observable workload metrics (currentLoad, loadTrend, ...).
+    # Deliberately a SEPARATE topic from ANALYTICS_PLAYERS: that stream
+    # carries the PlayerDynamics pilot model's output (reconstruction_loss,
+    # confidence, SHAP) for the "PlayerDynamics Pilot" page. This one carries
+    # zero model internals -- pure Kinexon positions.csv/events.csv
+    # aggregates -- for the "Player Analytics" coach dashboard. Publishing
+    # both under the same name would silently merge two incompatible
+    # payload shapes onto one consumer.
+    ANALYTICS_PLAYER_WORKLOAD = "analytics.player_workload"
 
     # Backend <-> PlayerDynamics boundary streams (excludes tracking.events,
     # which never crosses that boundary).
@@ -1082,6 +1091,7 @@ class StreamTopics:
     TO_BACKEND   = (
         ANALYTICS_POSSESSIONS, ANALYTICS_TEAMSTATE, ANALYTICS_TRENDS,
         ANALYTICS_INSIGHTS, ANALYTICS_SITUATIONS, ANALYTICS_PLAYERS,
+        ANALYTICS_PLAYER_WORKLOAD,
     )
 
     INBOUND  = (MATCH_EVENTS, MATCH_CONTEXT, TRACKING_EVENTS)

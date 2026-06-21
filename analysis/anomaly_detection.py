@@ -1238,7 +1238,7 @@ class SequenceWindowBuilder:
         return None
 
     def _extract(self, event: dict, prev: Optional[dict]) -> np.ndarray:
-        """Extract an 8-dimensional feature vector from one telemetry tick.
+        """Extract an N_SEQUENCE_FEATURES-dimensional feature vector from one tick.
 
         Computes instantaneous and delta features from the current event
         and the previous real event.  All derived features default to 0.0
@@ -1247,7 +1247,14 @@ class SequenceWindowBuilder:
         Parameters
         ----------
         event:
-            Current telemetry event dictionary.
+            Current telemetry event dictionary. For the original 8 signals,
+            values come from the named keys read below. Any additional
+            name in ``SEQUENCE_FEATURE_NAMES`` (e.g. the event-derived
+            window aggregates from ingestion/kinexon_events_features.py)
+            is read directly from ``event[name]`` with no delta/derivation
+            logic — those are already per-window aggregates, not per-tick
+            deltas. Missing keys (e.g. on the synthetic regression path,
+            which never populates them) default to 0.0.
         prev:
             Previous real telemetry event dictionary, or ``None`` if this
             is the first tick for the player.
@@ -1298,16 +1305,24 @@ class SequenceWindowBuilder:
             hr_recovery = 0.0
             distance_delta = 0.0
 
+        # Original 8 signals, computed exactly as before — keyed by name so
+        # the final array below stays correctly ordered regardless of where
+        # SEQUENCE_FEATURE_NAMES places them.
+        base = {
+            "speed_ms": speed,
+            "acceleration_ms2": accel,
+            "heart_rate_bpm": hr,
+            "sprint_flag": sprint,
+            "x_pitch": x,
+            "y_pitch": y,
+            "distance_delta_m": distance_delta,
+            "hr_recovery_rate": hr_recovery,
+        }
+
         features = np.array(
             [
-                speed,
-                accel,
-                hr,
-                sprint,
-                x,
-                y,
-                distance_delta,
-                hr_recovery,
+                base[name] if name in base else safe_float(event.get(name), 0.0)
+                for name in SEQUENCE_FEATURE_NAMES
             ],
             dtype=np.float32,
         )
@@ -1986,6 +2001,58 @@ class InferenceEngine:
         self._shared_model.register_players(player_ids)
         result = self._shared_model.train(all_windows)
 
+        self._calibrate(all_windows)
+
+        try:
+            saved_path = self._shared_model.save()
+            logger.info("Shared backbone saved → %s", saved_path)
+        except Exception as exc:
+            logger.warning("Model save failed (non-fatal): %s", exc)
+
+        return result
+
+    def load_and_calibrate(
+        self,
+        backbone_path,
+        all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]],
+    ) -> dict:
+        """Loads an already-trained checkpoint (no fitting) and reproduces
+        per-player threshold calibration against it.
+
+        Calibration state (RegimeAwareThresholdStore) is NOT persisted by
+        SharedBackboneAutoencoder.save()/load() -- see those methods -- so it
+        must be recomputed here from the loaded model's own predict() calls,
+        exactly as train() recomputes it after fitting. This recomputation is
+        calibration, not training: it never touches the backbone's weights,
+        and the checkpoint is not re-saved (it is already on disk unchanged).
+        """
+        shared = SharedBackboneAutoencoder.load(backbone_path)
+        if shared is None or not shared.is_trained:
+            raise RuntimeError(
+                f"Checkpoint at {backbone_path} is missing or not trained")
+        self._shared_model = shared
+
+        self._calibrate(all_windows)
+
+        n_windows = sum(len(w) for w in all_windows.values())
+        return {
+            "status": "loaded",
+            "n_players": shared.n_players,
+            "n_windows": n_windows,
+            "model_version": shared.model_version,
+        }
+
+    def _calibrate(
+        self,
+        all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]],
+    ) -> None:
+        """Per-player threshold calibration against self._shared_model.
+
+        Shared by train() (calibrating a freshly fit backbone) and
+        load_and_calibrate() (calibrating a loaded checkpoint) -- the
+        calibration procedure itself is identical either way.
+        """
+        player_ids = list(all_windows.keys())
         alpha = CONFIG.scoring.score_ema_alpha
         pilot_mode = CONFIG.scoring.pilot_mode
         pooled_store = RegimeAwareThresholdStore() if pilot_mode else None
@@ -2013,14 +2080,6 @@ class InferenceEngine:
                 sum(pooled_store.regime_coverage().values()),
                 len(player_ids), pooled_store.is_calibrated,
             )
-
-        try:
-            saved_path = self._shared_model.save()
-            logger.info("Shared backbone saved → %s", saved_path)
-        except Exception as exc:
-            logger.warning("Model save failed (non-fatal): %s", exc)
-
-        return result
 
     # @profile_inference
     # def score_window(
@@ -4597,6 +4656,18 @@ class PatternAnalysisEngine:
     ) -> dict:
         """Train the shared backbone and calibrate per-player thresholds."""
         result = self.inference_engine.train(all_windows)
+        self._shared_model = self.inference_engine._shared_model
+        return result
+
+    def load_player_model(
+        self,
+        backbone_path,
+        all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]]
+    ) -> dict:
+        """Load an already-trained shared backbone (no fitting) and
+        calibrate per-player thresholds against it. See
+        InferenceEngine.load_and_calibrate()."""
+        result = self.inference_engine.load_and_calibrate(backbone_path, all_windows)
         self._shared_model = self.inference_engine._shared_model
         return result
 

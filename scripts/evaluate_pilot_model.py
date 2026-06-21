@@ -60,9 +60,25 @@ GAP_THRESHOLD_S = CONFIG.window.gap_threshold_s
 _IDX = {n: i for i, n in enumerate(_SFN)}
 
 
-def _build_pipeline_and_train():
-    """Mirrors scripts/train_pilot_session_3387.py Phase 2 exactly -- same
-    data, same flags -- to obtain a live, trained pipeline object."""
+def _load_session_data_and_pipeline(use_event_features: bool = False):
+    """Shared by _build_pipeline_and_train() and _build_pipeline_and_load():
+    loads session 3387's real Kinexon data, computes baselines, determines
+    eligible players, and returns a pipeline with players/historical data
+    registered but no shared model trained or loaded yet.
+
+    use_event_features=False (default, unchanged): events_by_player has only
+    the 8 columns KinexonResampler.resample() produces directly -- exactly
+    what every existing caller of this function already gets, so neither
+    _build_pipeline_and_train() nor _build_pipeline_and_load() (and therefore
+    publish_pilot_analytics.py) change behaviour.
+
+    use_event_features=True: additionally merges the 24 window-aggregated
+    events.csv features (ingestion/kinexon_events_features.py), matching the
+    full 32-feature input the model was actually trained on (train_summary.
+    json: use_event_features=true) and what scripts/publish_player_workload.py
+    already loads via main.py's _load_kinexon_frames(). Opt-in only -- no
+    existing caller is affected unless it explicitly passes True.
+    """
     from analysis.orchestrator import PlayersDataAnalysisPipeline
 
     adapter = KinexonAdapter()
@@ -72,6 +88,15 @@ def _build_pipeline_and_train():
     )
     resampler = KinexonResampler()
     events_by_player, sessions_df = resampler.resample(observations, session_id=SESSION_ID)
+
+    if use_event_features:
+        from ingestion.kinexon_events_features import merge_event_features
+        events_by_player = merge_event_features(
+            events_by_player=events_by_player,
+            events_csv_path=DATA_DIR / "events.csv",
+            real_player_ids=meta.keys(),
+            bucket_seconds=resampler.bucket_seconds,
+        )
 
     from analysis.baseline import BaselineBuilder
     builder = BaselineBuilder()
@@ -104,8 +129,38 @@ def _build_pipeline_and_train():
         pipeline.load_historical_data(player_id=pid, sessions_df=player_sessions, events_df=events_by_player[pid])
 
     pipeline.compute_baselines(window_days=28, use_provisional_fallback=True)
-    result = pipeline.train_all_models(use_gap_aware_windowing=True)
 
+    return pipeline, events_by_player, sessions_df, meta, eligible
+
+
+def _build_pipeline_and_train():
+    """Mirrors scripts/train_pilot_session_3387.py Phase 2 exactly -- same
+    data, same flags -- to obtain a live, FRESHLY TRAINED pipeline object.
+    Retained for genuine retrain-and-evaluate comparisons; the production
+    publisher (scripts/publish_pilot_analytics.py) uses
+    _build_pipeline_and_load() instead -- see that function below."""
+    pipeline, events_by_player, sessions_df, meta, eligible = _load_session_data_and_pipeline()
+    result = pipeline.train_all_models(use_gap_aware_windowing=True)
+    return pipeline, events_by_player, sessions_df, meta, eligible, result
+
+
+def _build_pipeline_and_load(backbone_path=None, use_event_features: bool = False):
+    """Loads the promoted shared backbone checkpoint (analysis.anomaly_
+    detection.SharedBackboneAutoencoder.load(), no fitting) instead of
+    retraining. Per-player threshold calibration is still recomputed against
+    the loaded model -- it is genuinely not retraining: the backbone's
+    weights come unmodified from backbone_path (default
+    models/shared_backbone.pt, the promoted checkpoint), only the per-player
+    RegimeAwareThresholdStore calibration state is (re)computed, exactly as
+    it would have to be even right after a real train() call -- see
+    InferenceEngine.load_and_calibrate()'s docstring.
+
+    use_event_features defaults to False so publish_pilot_analytics.py's
+    existing behaviour/values are unaffected -- the live pipeline
+    (scripts/run_live_player_analytics.py) explicitly passes True instead."""
+    backbone_path = Path(backbone_path) if backbone_path else _ROOT / "models" / "shared_backbone.pt"
+    pipeline, events_by_player, sessions_df, meta, eligible = _load_session_data_and_pipeline(use_event_features)
+    result = pipeline.load_shared_model(backbone_path, use_gap_aware_windowing=True)
     return pipeline, events_by_player, sessions_df, meta, eligible, result
 
 

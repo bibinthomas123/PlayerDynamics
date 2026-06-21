@@ -49,6 +49,7 @@ from typing import Any, Dict, Tuple, Type
 from analysis.coach_insight import CoachInsight
 from analysis.coach_situation import CoachSituation
 from analysis.player_analytics_event import PlayerAnalyticsEvent, PilotPlayerAnalyticsEvent
+from analysis.player_workload_event import PlayerWorkloadEvent
 from analysis.possession import Possession
 from analysis.team_state import TeamState
 from analysis.team_state_trend import TeamStateTrend
@@ -69,6 +70,7 @@ _REGISTRY: Dict[str, Tuple[Type, Tuple[str, ...]]] = {
     "MatchContext": (MatchContext, ("timestamp",)),
     "PlayerAnalyticsEvent": (PlayerAnalyticsEvent, ("timestamp",)),
     "PilotPlayerAnalyticsEvent": (PilotPlayerAnalyticsEvent, ("timestamp",)),
+    "PlayerWorkloadEvent": (PlayerWorkloadEvent, ("timestamp",)),
 }
 
 

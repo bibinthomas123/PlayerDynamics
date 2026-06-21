@@ -90,7 +90,31 @@ SEQUENCE_FEATURE_NAMES = [
     "distance_delta_m",   # Distance covered since last tick
     "hr_recovery_rate",   # delta_HR / delta_t (positive = recovering)
 ]
-N_SEQUENCE_FEATURES = len(SEQUENCE_FEATURE_NAMES)   # 8
+
+# ─────────────────────────────────────────────
+# Event-derived sequence features (ingestion/kinexon_events_features.py)
+# 24 window-level aggregates from Kinexon events.csv (discrete event log:
+# Acceleration/Deceleration/Sprint/Jump/Change of Direction/Ball Possession/
+# Pass/Shots). Appended AFTER the original 8 so any code relying on those
+# 8 being first (e.g. SequenceWindowBuilder._extract()'s delta computations)
+# keeps working unchanged. Populated only when KinexonResampler's bucket-
+# aligned event-feature merge is opted into (--use-event-features); absent
+# otherwise, so SequenceWindowBuilder._extract()'s generic event.get(name, 0.0)
+# fallback yields 0.0 for every one of these on the synthetic regression path.
+# ─────────────────────────────────────────────
+EVENT_DERIVED_FEATURE_NAMES = [
+    "accel_event_count", "accel_mean_ms2", "accel_max_ms2",
+    "decel_event_count", "decel_mean_ms2", "decel_max_ms2",
+    "sprint_event_count", "sprint_distance_m", "sprint_duration_s", "sprint_max_speed_ms",
+    "jump_event_count", "jump_avg_height_m", "jump_max_height_m",
+    "cod_event_count", "cod_angle_sum_deg", "cod_angle_mean_deg",
+    "possession_event_count", "possession_duration_s",
+    "pass_event_count", "pass_avg_distance_m", "pass_avg_ball_speed_ms",
+    "shot_event_count", "shot_avg_speed_ms", "shot_avg_distance_m",
+]
+
+SEQUENCE_FEATURE_NAMES = SEQUENCE_FEATURE_NAMES + EVENT_DERIVED_FEATURE_NAMES
+N_SEQUENCE_FEATURES = len(SEQUENCE_FEATURE_NAMES)   # 32 (8 original + 24 event-derived)
 
 
 # ─────────────────────────────────────────────

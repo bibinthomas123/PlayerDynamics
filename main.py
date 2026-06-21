@@ -239,7 +239,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        dg.save_dataset(data, apply_corruption=not args.no_corruption)
+        dg.save_dataset(data, apply_corruption=not args.no_corruption, output_dir=data_dir)
     except Exception as exc:
         _exit(1, f"Save failed: {exc}")
 
@@ -273,9 +273,201 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Kinexon (real-data) loading — shared by train/evaluate --data-source kinexon
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_kinexon_frames(data_dir: Path, session_id: str, use_event_features: bool = False):
+    """
+    Load one Kinexon session via the validated real-data path:
+    KinexonAdapter.stream_positions() -> KinexonResampler.resample().
+
+    Consolidates loading logic that was previously duplicated between
+    scripts/train_pilot_session_3387.py and scripts/evaluate_pilot_model.py
+    (both standalone validation scripts; neither is modified by this
+    function's introduction). Used by both _cmd_train_kinexon and
+    _cmd_evaluate_kinexon below so the production CLI has exactly one
+    Kinexon-loading code path.
+
+    use_event_features=False (default): unchanged behaviour -- returns
+    exactly the 8-column-feature events_by_player KinexonResampler produces.
+
+    use_event_features=True: additionally merges the 24 window-aggregated
+    events.csv features (ingestion/kinexon_events_features.py) onto each
+    player's events_df, bucket-aligned to KinexonResampler's own elapsed_s
+    boundaries. Does not change KinexonResampler's own output or behaviour.
+
+    Returns (events_by_player, sessions_df, meta). Exits 1 if required
+    Kinexon export files are missing or produce zero usable data.
+    """
+    from ingestion.kinexon_adapter import KinexonAdapter
+    from ingestion.kinexon_resampler import KinexonResampler
+    from config.settings import CONFIG
+
+    positions_path = data_dir / CONFIG.kinexon.positions_file
+    statistics_path = data_dir / CONFIG.kinexon.statistics_file
+    if not positions_path.exists():
+        _exit(1, f"Required file missing: {positions_path}")
+    if not statistics_path.exists():
+        _exit(1, f"Required file missing: {statistics_path}")
+
+    adapter = KinexonAdapter()
+    meta = adapter.load_player_meta(statistics_path)
+    observations = list(
+        adapter.stream_positions(positions_path, meta, session_id=session_id, match_id=session_id)
+    )
+    if not observations:
+        _exit(1, f"No valid position observations parsed from {positions_path}")
+
+    resampler = KinexonResampler()
+    events_by_player, sessions_df = resampler.resample(observations, session_id=session_id)
+    if not events_by_player:
+        _exit(1, "KinexonResampler produced 0 players with usable resampled events")
+
+    logger.info(
+        "Loaded Kinexon session %s: %d players, %d raw positions",
+        session_id, len(events_by_player), len(observations),
+    )
+
+    if use_event_features:
+        from ingestion.kinexon_events_features import merge_event_features
+
+        events_csv_path = data_dir / CONFIG.kinexon.events_file
+        events_by_player = merge_event_features(
+            events_by_player=events_by_player,
+            events_csv_path=events_csv_path,
+            real_player_ids=meta.keys(),
+            bucket_seconds=resampler.bucket_seconds,
+        )
+        logger.info(
+            "Merged events.csv window features onto %d players' events_df "
+            "(events_csv=%s)", len(events_by_player), events_csv_path,
+        )
+
+    return events_by_player, sessions_df, meta
+
+
+def _register_and_load_kinexon_players(pipeline, events_by_player, sessions_df, meta) -> None:
+    """Shared player-registration loop for the Kinexon train/evaluate paths."""
+    for pid, df in events_by_player.items():
+        m = meta.get(pid)
+        pipeline.register_player(
+            player_id=pid,
+            external_id=str(pid),
+            name=m.player_name if m else f"player_{pid}",
+            position=m.position_label if m else "unknown",
+            age=25,
+        )
+        player_sessions = sessions_df[sessions_df["player_id"] == pid]
+        pipeline.load_historical_data(player_id=pid, sessions_df=player_sessions, events_df=df)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Subcommand: train
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_train(args: argparse.Namespace) -> None:
+    """
+    Dispatches to the synthetic or real-data (Kinexon) training path based
+    on --data-source. Both paths produce the same artifacts (shared_backbone.pt,
+    train_summary.json, serve_state.json) so cmd_serve and downstream
+    consumers are unaffected by which path trained the model.
+    """
+    if args.data_source == "kinexon":
+        _cmd_train_kinexon(args)
+    else:
+        _cmd_train_synthetic(args)
+
+
+def _cmd_train_kinexon(args: argparse.Namespace) -> None:
+    """
+    Real-data training path, preferred for production runs:
+
+        KinexonAdapter -> KinexonResampler -> gap-aware windowing ->
+        BaselineBuilder.compute_with_fallback() -> train_all_models()
+
+    This is the validated path from scripts/train_pilot_session_3387.py,
+    wired into the production CLI contract (exit codes, train_summary.json,
+    serve_state.json) instead of a standalone print-only script. Does not
+    touch model architecture, thresholds, EMA, or alert logic -- it only
+    selects the existing use_gap_aware_windowing=True /
+    use_provisional_fallback=True opt-in flags that orchestrator.py's
+    compute_baselines()/train_all_models() already support, exactly as the
+    validated standalone script does.
+
+    Exits 1 on missing/empty Kinexon data, 2 on training failure.
+    """
+    data_dir = Path(args.data_dir)
+    model_dir = Path(args.model_dir)
+    session_id = args.session_id
+    use_event_features = getattr(args, "use_event_features", False)
+
+    logger.info(
+        "train | data_source=kinexon  data=%s  model=%s  session_id=%s  use_event_features=%s",
+        data_dir, model_dir, session_id, use_event_features,
+    )
+
+    events_by_player, sessions_df, meta = _load_kinexon_frames(
+        data_dir, session_id, use_event_features=use_event_features
+    )
+    n_raw_players = len(events_by_player)
+
+    pipeline = _build_pipeline(model_dir)
+    _register_and_load_kinexon_players(pipeline, events_by_player, sessions_df, meta)
+    logger.info("Registered + loaded %d players into pipeline", n_raw_players)
+
+    logger.info("Computing baselines (historical-first, provisional fallback)...")
+    baselines = pipeline.compute_baselines(window_days=28, use_provisional_fallback=True)
+    logger.info("Baselines computed for %d / %d players", len(baselines), n_raw_players)
+    if len(baselines) == 0:
+        _exit(1, "All baselines failed — compute_with_fallback() produced 0 profiles")
+
+    logger.info("Training shared LSTM backbone (gap-aware windowing)...")
+    t0 = time.perf_counter()
+    result = pipeline.train_all_models(use_gap_aware_windowing=True)
+    elapsed = time.perf_counter() - t0
+    logger.info("Training complete in %.1f s | status=%s", elapsed, result.get("status"))
+
+    top_status = result.get("status", "")
+    if not top_status or top_status.startswith("error") or top_status.startswith("fail"):
+        _exit(2, f"Training returned error status: {result}")
+
+    shared_info = result.get("shared_model", {})
+    n_windows = shared_info.get("n_windows", 0)
+    n_players_trained = shared_info.get("n_players", len(baselines))
+    model_version = shared_info.get("model_version", "unknown")
+
+    if n_windows == 0:
+        _exit(2, "Training produced 0 sequence windows — model is empty")
+
+    backbone_path = model_dir / "shared_backbone.pt"
+    if not backbone_path.exists():
+        _exit(2, f"Expected checkpoint not found at {backbone_path}")
+
+    from config.settings import N_SEQUENCE_FEATURES as _n_feat
+
+    summary = {
+        "status": "ok",
+        "data_source": "kinexon",
+        "session_id": session_id,
+        "use_event_features": use_event_features,
+        "n_sequence_features": _n_feat,
+        "trained_at": datetime.now(tz=timezone.utc).isoformat(),
+        "model_dir": str(model_dir.resolve()),
+        "n_players": n_players_trained,
+        "n_windows": n_windows,
+        "n_baselines": len(baselines),
+        "elapsed_s": round(elapsed, 2),
+        "backbone_path": str(backbone_path),
+        "model_version": model_version,
+    }
+    summary_path = model_dir / "train_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+    logger.info("Summary written → %s", summary_path)
+    print(json.dumps(summary))
+
+    serve_state_path = model_dir / "serve_state.json"
+    _save_serve_state(pipeline, serve_state_path)
+
+
+def _cmd_train_synthetic(args: argparse.Namespace) -> None:
     """
     Fit the shared LSTM backbone + per-player calibration thresholds.
 
@@ -439,6 +631,165 @@ def cmd_train(args: argparse.Namespace) -> None:
 # Subcommand: evaluate
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_evaluate(args: argparse.Namespace) -> None:
+    """Dispatches to the synthetic or real-data (Kinexon) evaluation path."""
+    if args.data_source == "kinexon":
+        _cmd_evaluate_kinexon(args)
+    else:
+        _cmd_evaluate_synthetic(args)
+
+
+def _cmd_evaluate_kinexon(args: argparse.Namespace) -> None:
+    """
+    Real-data evaluation path.
+
+    Real Kinexon sessions carry no ground_truth_labels — no human or system
+    has ever labeled a window as anomalous for session 3387 (or any other
+    real session collected so far). Computing ROC-AUC / PR-AUC /
+    precision@k against labels that do not exist would mean fabricating
+    them, which this task explicitly rules out ("do not invent metrics that
+    are not supported by the available data"). This path instead reports
+    the descriptive statistics that ARE honestly computable from real model
+    output: loss/confidence distributions, calibration coverage (per-player
+    vs pilot-pooled-fallback vs uncalibrated), and the raw (pre-EMA,
+    pre-persistence) threshold-breach rate.
+
+    Reuses the exact validated procedure from scripts/evaluate_pilot_model.py:
+    retrains once (SharedBackboneAutoencoder.train() does not persist
+    per-player calibration state to shared_backbone.pt — see that script's
+    module docstring — so calibration state must be reproduced via training,
+    not loaded from a checkpoint) and scores every real window through the
+    real PatternAnalysisEngine.analyze_window().
+
+    --min-auc is ignored on this path (logged, not silently dropped) — there
+    is no AUC to gate on without ground truth.
+    """
+    data_dir = Path(args.data_dir)
+    session_id = args.session_id
+
+    logger.info("evaluate | data_source=kinexon  data=%s  session_id=%s", data_dir, session_id)
+    if args.min_auc != 0.60:  # the argparse default; a non-default value means the caller set it
+        logger.warning("--min-auc has no effect for --data-source kinexon (no ground truth labels exist)")
+
+    # Pilot-mode pooled calibration: a single real session gives most
+    # players far too few windows for their OWN RegimeAwareThresholdStore
+    # to reach min_calibration_windows, which otherwise leaves confidence at
+    # 0.0 / tracker_source "none" for everyone (the exact issue solved by
+    # pilot_mode earlier in this project -- see AnomalyScoringConfig in
+    # config/settings.py). scripts/evaluate_pilot_model.py sets this same
+    # flag for the same reason; omitting it here would silently diverge
+    # from "the exact validated procedure" this function's docstring claims
+    # to reuse.
+    from config.settings import CONFIG as _CONFIG
+    _CONFIG.scoring.pilot_mode = True
+
+    use_event_features = getattr(args, "use_event_features", False)
+    events_by_player, sessions_df, meta = _load_kinexon_frames(
+        data_dir, session_id, use_event_features=use_event_features
+    )
+
+    pipeline = _build_pipeline(Path(args.model_dir))
+    _register_and_load_kinexon_players(pipeline, events_by_player, sessions_df, meta)
+
+    baselines = pipeline.compute_baselines(window_days=28, use_provisional_fallback=True)
+    if not baselines:
+        _exit(3, "No baselines computed — nothing to evaluate")
+
+    result = pipeline.train_all_models(use_gap_aware_windowing=True)
+    if result.get("status") != "success" or result.get("shared_model", {}).get("n_windows", 0) == 0:
+        _exit(2, f"Training (required to reproduce calibration state) failed: {result}")
+
+    engine = pipeline.pattern_engine
+    from analysis.gap_aware_windowing import build_training_sequences_gap_aware
+    from analysis.regime import SessionRegimeClassifier
+    from config.settings import SEQUENCE_FEATURE_NAMES as _SFN
+
+    idx = {n: i for i, n in enumerate(_SFN)}
+    classifier = SessionRegimeClassifier()
+
+    rows: List[dict] = []
+    for pid in baselines:
+        df = events_by_player[pid].sort_values("ts").reset_index(drop=True)
+        player_sessions = sessions_df[sessions_df["player_id"] == pid]
+        windows, _audit = build_training_sequences_gap_aware(
+            pattern_engine=engine, events_df=df, sessions_df=player_sessions,
+        )
+        for seq, mask, _sid in windows:
+            last = seq[-1]
+            live_event = {
+                "x_pitch": float(last[idx["x_pitch"]]),
+                "y_pitch": float(last[idx["y_pitch"]]),
+                "elapsed_seconds": 0.0,
+                "_tvl_confidence": 1.0,
+            }
+            res = engine.analyze_window(
+                player_id=pid, sequence=seq, mask=mask,
+                live_event=live_event, sessions_df=player_sessions,
+            )
+            tracker = engine.inference_engine.get_tracker(pid)
+            tracker_source = engine.inference_engine.get_tracker_source(pid)
+            regime_key = classifier.classify(seq).key
+            eff_threshold = float("inf")
+            raw_breach = None
+            if tracker and tracker.is_calibrated:
+                eff_threshold = tracker.threshold_for(regime_key)
+                raw_breach = bool(res.anomaly_score > eff_threshold)
+            rows.append({
+                "player_id": pid,
+                "anomaly_score": res.anomaly_score,
+                "confidence": res.confidence,
+                "tracker_source": tracker_source,
+                "raw_threshold_breach": raw_breach,
+            })
+
+    if not rows:
+        _exit(3, "0 evaluable windows — check gap-aware windowing output")
+
+    df_rows = pd.DataFrame(rows)
+    n_calibrated = sum(
+        1 for pid in baselines
+        if (t := engine.inference_engine._threshold_trackers.get(pid)) and t.is_calibrated
+    )
+    breach = df_rows["raw_threshold_breach"]
+
+    def _dist(s: pd.Series) -> dict:
+        return {
+            "min": float(s.min()), "p25": float(s.quantile(.25)), "median": float(s.median()),
+            "p75": float(s.quantile(.75)), "p90": float(s.quantile(.90)), "max": float(s.max()),
+            "mean": float(s.mean()),
+        }
+
+    aggregate = {
+        "status": "ok",
+        "data_source": "kinexon",
+        "session_id": session_id,
+        "use_event_features": use_event_features,
+        "n_sequence_features": len(_SFN),
+        "evaluated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "n_players_evaluated": len(baselines),
+        "n_windows_evaluated": len(df_rows),
+        "anomaly_score_distribution": _dist(df_rows["anomaly_score"]),
+        "confidence_distribution": _dist(df_rows["confidence"]),
+        "tracker_source_counts": df_rows["tracker_source"].value_counts().to_dict(),
+        "n_players_with_own_calibration": n_calibrated,
+        "raw_threshold_breach_rate": (
+            float(breach.dropna().mean()) if breach.notna().any() else None
+        ),
+        "raw_threshold_breach_count": int(breach.fillna(False).sum()),
+        "note": (
+            "No roc_auc/pr_auc/precision_at_k: real Kinexon sessions carry no "
+            "ground_truth_labels. These are descriptive statistics over real "
+            "model output, not a classification-accuracy evaluation."
+        ),
+    }
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(aggregate, indent=2))
+    logger.info("Metrics written → %s", out_path)
+    print(json.dumps(aggregate, indent=2))
+
+
+def _cmd_evaluate_synthetic(args: argparse.Namespace) -> None:
     """
     Score the trained model against ground_truth_labels.csv.
 
@@ -1511,6 +1862,45 @@ def _save_serve_state(pipeline, path: Path) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Subcommand: ingest
+# ─────────────────────────────────────────────────────────────────────────────
+def cmd_ingest(args: argparse.Namespace) -> None:
+    """
+    Multi-match dataset pipeline: scan --data-dir for match_<id>/ subdirectories,
+    validate each export, build the match metadata index, and write/update
+    matches.parquet, players.parquet, events.parquet, positions.parquet under
+    --output-dir. Incremental: a match directory whose files are unchanged
+    since the last run is not re-parsed.
+
+    Does not touch model code, training, or calibration. Writes three JSON
+    reports (dataset_summary.json, data_quality_report.json,
+    match_inventory.json) into --output-dir and prints the dataset summary.
+
+    Exits 1 if 0 match_* directories are found.
+    """
+    from ingestion.multi_match_pipeline import MultiMatchDatasetBuilder
+    from analysis.player_trends import build_and_write_player_trends
+
+    data_root = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+
+    builder = MultiMatchDatasetBuilder(data_root=data_root, output_dir=output_dir)
+    match_dirs = builder.scan()
+    if not match_dirs:
+        _exit(1, f"No match_* directories found under {data_root}")
+
+    result = builder.run()
+
+    trends = build_and_write_player_trends(output_dir)
+    logger.info(
+        "Player trends written -> %s (n_matches_in_dataset=%d, n_players=%d)",
+        output_dir / "player_trends.json", trends["n_matches_in_dataset"], len(trends["players"]),
+    )
+
+    print(json.dumps(result["dataset_summary"], indent=2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Subcommand: audit
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_audit(args: argparse.Namespace) -> None:
@@ -1557,13 +1947,34 @@ def cmd_audit(args: argparse.Namespace) -> None:
     # Load player metadata for protected attributes
     data_dir = Path(args.data_dir)
     players_path = data_dir / "players.csv"
-    if not players_path.exists():
-        _exit(1, f"players.csv not found at {data_dir}")
-    players_df = pd.read_csv(players_path)
-
-    # Rename to match FairnessMonitor expectation
-    if "full_name" in players_df.columns and "name" not in players_df.columns:
-        players_df = players_df.rename(columns={"full_name": "name"})
+    if players_path.exists():
+        players_df = pd.read_csv(players_path)
+        # Rename to match FairnessMonitor expectation
+        if "full_name" in players_df.columns and "name" not in players_df.columns:
+            players_df = players_df.rename(columns={"full_name": "name"})
+    else:
+        # Real Kinexon sessions have no players.csv roster export (that file
+        # is synthetic-only). Fall back to statistics.csv via KinexonAdapter
+        # instead of failing outright -- this gives FairnessMonitor a real
+        # player_id/name/position frame. age_group and nationality are
+        # genuinely absent from the Kinexon export; left out rather than
+        # fabricated, so FairnessMonitor simply finds no groups for those
+        # attributes instead of being fed invented values.
+        from config.settings import CONFIG as _CONFIG
+        stats_path = data_dir / _CONFIG.kinexon.statistics_file
+        if not stats_path.exists():
+            _exit(1, f"Neither players.csv nor {stats_path.name} found at {data_dir}")
+        from ingestion.kinexon_adapter import KinexonAdapter
+        kinexon_meta = KinexonAdapter().load_player_meta(stats_path)
+        players_df = pd.DataFrame([
+            {"player_id": pid, "name": m.player_name, "position": m.position_label}
+            for pid, m in kinexon_meta.items()
+        ])
+        logger.warning(
+            "players.csv not found — built player metadata from %s instead "
+            "(position only; age_group/nationality unavailable for real Kinexon data)",
+            stats_path.name,
+        )
 
     from feedback.recalibration import (
         FairnessMonitor,
@@ -1694,7 +2105,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── train ─────────────────────────────────────────────────────────────────
     p_tr = sub.add_parser("train", help="Train model and save checkpoint")
-    p_tr.add_argument("--data-dir", default="data", help="CSV source directory")
+    p_tr.add_argument(
+        "--data-source",
+        choices=["synthetic", "kinexon"],
+        default="synthetic",
+        help="synthetic: five-CSV generated dataset (regression-testing path, "
+             "unchanged default). kinexon: real UWB tracking export via "
+             "KinexonAdapter -> KinexonResampler -> gap-aware windowing -> "
+             "BaselineBuilder.compute_with_fallback() (preferred for production "
+             "runs against real session data).",
+    )
+    p_tr.add_argument("--data-dir", default="data", help="CSV/Kinexon-export source directory")
     p_tr.add_argument(
         "--model-dir", default="models", help="Checkpoint output directory"
     )
@@ -1702,7 +2123,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sessions-per-player",
         type=int,
         default=60,
-        help="Max sessions per player loaded for training",
+        help="Max sessions per player loaded for training (synthetic path only)",
+    )
+    p_tr.add_argument(
+        "--session-id",
+        default="3387",
+        help="Kinexon session identifier to train on (kinexon path only; "
+             "validated against the real session 3387 export so far)",
+    )
+    p_tr.add_argument(
+        "--use-event-features",
+        action="store_true",
+        default=False,
+        help="kinexon path only. Extend the 8 positions.csv-derived sequence "
+             "features with 24 window-aggregated events.csv features "
+             "(acceleration/deceleration/sprint/jump/change-of-direction/"
+             "possession/pass/shot). Default False keeps the original "
+             "8-feature model byte-for-byte reproducible.",
     )
     p_tr.add_argument(
         "--save-serve-state",
@@ -1711,15 +2148,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── evaluate ──────────────────────────────────────────────────────────────
-    p_ev = sub.add_parser("evaluate", help="Score model against ground truth")
-    p_ev.add_argument("--data-dir", default="data", help="CSV source directory")
+    p_ev = sub.add_parser("evaluate", help="Score model against ground truth / real-data diagnostics")
+    p_ev.add_argument(
+        "--data-source",
+        choices=["synthetic", "kinexon"],
+        default="synthetic",
+        help="synthetic: ROC-AUC/PR-AUC/precision@k against ground_truth_labels.csv "
+             "(unchanged default). kinexon: descriptive loss/confidence/calibration "
+             "diagnostics over real model output -- no classification metrics, since "
+             "real Kinexon sessions carry no ground-truth anomaly labels.",
+    )
+    p_ev.add_argument("--data-dir", default="data", help="CSV/Kinexon-export source directory")
     p_ev.add_argument("--model-dir", default="models", help="Checkpoint directory")
     p_ev.add_argument("--out", default="metrics/eval.json", help="Metrics output file")
+    p_ev.add_argument(
+        "--session-id",
+        default="3387",
+        help="Kinexon session identifier to evaluate (kinexon path only)",
+    )
+    p_ev.add_argument(
+        "--use-event-features",
+        action="store_true",
+        default=False,
+        help="kinexon path only. Must match the value used for --use-event-features "
+             "at train time -- evaluating an 8-feature model with this on (or "
+             "vice versa) will mismatch the trained input dimensionality.",
+    )
     p_ev.add_argument(
         "--min-auc",
         type=float,
         default=0.60,
-        help="Minimum acceptable mean ROC-AUC (exit 3 if below)",
+        help="Minimum acceptable mean ROC-AUC (exit 3 if below; synthetic path only)",
     )
 
     # ── serve ─────────────────────────────────────────────────────────────────
@@ -1775,10 +2234,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_au.add_argument("--out", default="metrics/audit.json", help="Audit report output")
 
+    # ── ingest ────────────────────────────────────────────────────────────────
+    p_in = sub.add_parser(
+        "ingest", help="Multi-match dataset pipeline: scan data/match_*/, validate, build unified Parquet datasets"
+    )
+    p_in.add_argument("--data-dir", default="data", help="Root directory containing match_<id>/ subdirectories")
+    p_in.add_argument(
+        "--output-dir", default="data/processed",
+        help="Output directory for matches/players/events/positions.parquet and reports",
+    )
+
     return parser
 
 
 def main() -> None:
+    # Windows consoles often default stdout to a legacy codepage (cp1252),
+    # which raises UnicodeEncodeError on any non-Latin-1 character -- e.g.
+    # FairnessMonitor.generate_audit_report()'s "⚠" warning marker, printed
+    # by cmd_audit whenever a fairness alert actually fires (encountered
+    # while verifying `audit` against real-data metadata; unrelated to
+    # data-source and not previously surfaced because `audit` had
+    # apparently never been run to completion with an active alert before).
+    # reconfigure() is a no-op-safe best effort -- swallow failures (e.g.
+    # stdout already redirected to a pipe that doesn't support it).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -1791,6 +2274,7 @@ def main() -> None:
         "evaluate": cmd_evaluate,
         "serve": cmd_serve,
         "audit": cmd_audit,
+        "ingest": cmd_ingest,
     }
 
     try:

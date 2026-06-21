@@ -1744,7 +1744,24 @@ def generate_dataset(n_seasons: int = 2,
 # ─────────────────────────────────────────────────────────────────────────────
 # Save + report
 # ─────────────────────────────────────────────────────────────────────────────
-def save_dataset(data: dict, apply_corruption: bool = True) -> None:
+def save_dataset(data: dict, apply_corruption: bool = True, output_dir: Optional[Path] = None) -> None:
+    """
+    output_dir=None (default): writes to OUTPUT_DIR (PlayerDynamics/data),
+    unchanged behaviour for every existing caller.
+
+    Previously this parameter did not exist at all -- cmd_generate's
+    --data-dir flag was validated/echoed in its summary output but never
+    actually passed here, so every `generate` run silently wrote into
+    OUTPUT_DIR regardless of --data-dir. That collided with the real
+    Kinexon export files which also live in PlayerDynamics/data by default
+    (positions.csv, statistics.csv survive a collision since their
+    filenames differ from the synthetic five-CSV set, but events.csv does
+    not -- a `generate` run silently overwrites the real Kinexon events.csv
+    with synthetic data). Passing output_dir now makes --data-dir effective.
+    """
+    target_dir = Path(output_dir) if output_dir is not None else OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+
     events_df = pd.DataFrame(data["events"])
     if apply_corruption and not events_df.empty:
         logger.info("Applying sensor corruption layer (R12)…")
@@ -1755,7 +1772,7 @@ def save_dataset(data: dict, apply_corruption: bool = True) -> None:
             logger.warning("No rows for %s — skipping", key)
             continue
         df = pd.DataFrame(rows) if key != "events" else events_df
-        path = OUTPUT_DIR / f"{key}.csv"
+        path = target_dir / f"{key}.csv"
         df.to_csv(path, index=False)
         logger.info("Saved %s: %d rows → %s", key, len(df), path)
 

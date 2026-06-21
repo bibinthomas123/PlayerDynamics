@@ -239,8 +239,54 @@ class PlayersDataAnalysisPipeline:
         build_from_session()'s windowing logic — the wrapper calls the
         same, unmodified SequenceWindowBuilder.build_from_session().
         """
+        all_windows = self._build_all_windows(use_gap_aware_windowing)
+        if not all_windows:
+            logger.warning("No eligible players — shared model training aborted")
+            return {}
 
-        # ── Phase 1: build sequences for every eligible player ──────────────
+        # ── Phase 2: train ONE shared model across all players ───────────────
+        result = self.pattern_engine.train_player_model(all_windows)
+        logger.info(
+            "Shared backbone trained | players=%d | total_windows=%d | version=%s",
+            result.get("n_players", 0),
+            result.get("n_windows", 0),
+            self.pattern_engine._shared_model.model_version
+            if self.pattern_engine._shared_model else "n/a",
+        )
+
+        return self._finalize_shared_model(all_windows, result)
+
+    def load_shared_model(self, backbone_path, use_gap_aware_windowing: bool = True) -> dict:
+        """Load an already-promoted shared backbone checkpoint (no fitting)
+        and calibrate per-player thresholds + XAI backgrounds against it.
+
+        Mirrors train_all_models() exactly except Phase 2 loads
+        PatternAnalysisEngine.load_player_model() instead of
+        train_player_model() -- the backbone's weights are never fit here,
+        only loaded from backbone_path and used for inference/calibration.
+        """
+        all_windows = self._build_all_windows(use_gap_aware_windowing)
+        if not all_windows:
+            logger.warning("No eligible players — shared model load aborted")
+            return {}
+
+        result = self.pattern_engine.load_player_model(backbone_path, all_windows)
+        logger.info(
+            "Shared backbone loaded (not retrained) | players=%d | total_windows=%d | version=%s",
+            result.get("n_players", 0),
+            result.get("n_windows", 0),
+            self.pattern_engine._shared_model.model_version
+            if self.pattern_engine._shared_model else "n/a",
+        )
+
+        return self._finalize_shared_model(all_windows, result)
+
+    def _build_all_windows(
+        self, use_gap_aware_windowing: bool
+    ) -> Dict[int, List[Tuple[np.ndarray, np.ndarray]]]:
+        """Phase 1 of train_all_models()/load_shared_model(): build sliding-
+        window sequences for every eligible player. Extracted so both
+        callers build windows identically."""
         all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]] = {}
 
         for pid in self.registry.all_player_ids():
@@ -273,21 +319,16 @@ class PlayersDataAnalysisPipeline:
             all_windows[pid] = sequences
             logger.info("Player %d: %d training sequences built", pid, len(sequences))
 
-        if not all_windows:
-            logger.warning("No eligible players — shared model training aborted")
-            return {}
+        return all_windows
 
-        # ── Phase 2: train ONE shared model across all players ───────────────
-        result = self.pattern_engine.train_player_model(all_windows)
-        logger.info(
-            "Shared backbone trained | players=%d | total_windows=%d | version=%s",
-            result.get("n_players", 0),
-            result.get("n_windows", 0),
-            self.pattern_engine._shared_model.model_version
-            if self.pattern_engine._shared_model else "n/a",
-        )
-
-        # ── Phase 3: per-player XAI background registration ─────────────────
+    def _finalize_shared_model(
+        self,
+        all_windows: Dict[int, List[Tuple[np.ndarray, np.ndarray]]],
+        result: dict,
+    ) -> dict:
+        """Phase 3 of train_all_models()/load_shared_model(): per-player XAI
+        background registration, identical regardless of whether the shared
+        model was just fit or just loaded."""
         results: Dict[int, dict] = {}
 
         for pid, sequences in all_windows.items():
