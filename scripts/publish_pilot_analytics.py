@@ -14,8 +14,12 @@ eligible player: reconstruction_loss, confidence, threshold,
 raw_threshold_breach, and the real top-3 SHAP features for that window.
 
 LOADS the promoted checkpoint (scripts/evaluate_pilot_model.py's
-_build_pipeline_and_load(), which calls PlayersDataAnalysisPipeline.
-load_shared_model() -> SharedBackboneAutoencoder.load() -- no fitting).
+_build_pipeline_and_load(use_event_features=True), which calls
+PlayersDataAnalysisPipeline.load_shared_model() -> SharedBackboneAutoencoder.
+load() -- no fitting). use_event_features=True merges the 24 event-derived
+columns onto the resampled data, matching the model's actual 32-feature
+input (same loader scripts/run_live_player_analytics.py uses) -- previously
+this script ran the promoted checkpoint on only 8 of its 32 trained inputs.
 Per-player threshold calibration is still recomputed against the loaded
 model, since that state is not persisted to disk, but the backbone's
 weights are the promoted checkpoint's, unmodified. This script remains a
@@ -50,7 +54,11 @@ def main() -> None:
     print("Publishing PILOT player analytics to analytics.players -- real session 3387")
     print(LINE)
 
-    pipeline, events_by_player, sessions_df, meta, eligible, load_result = _build_pipeline_and_load()
+    # The promoted checkpoint's LSTM input is 32 features (8 resampled +
+    # 24 event-derived) -- matches scripts/run_live_player_analytics.py.
+    pipeline, events_by_player, sessions_df, meta, eligible, load_result = _build_pipeline_and_load(
+        use_event_features=True,
+    )
     engine = pipeline.pattern_engine
     model_version = engine._shared_model.model_version if engine._shared_model else "unknown"
     print(f"\nLoaded promoted checkpoint (not retrained): {load_result['shared_model']} "

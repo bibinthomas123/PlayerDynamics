@@ -27,10 +27,11 @@ Real-time anomaly detection platform for professional football. Transforms high-
 14. [Reliability & Hardening](#reliability--hardening)
 15. [Replay Consistency Guarantees](#replay-consistency-guarantees)
 16. [Fairness & Recalibration](#fairness--recalibration)
-17. [Logging & Observability](#logging--observability)
-18. [Exit Codes](#exit-codes)
-19. [Known Limitations & Roadmap](#known-limitations--roadmap)
-20. [References](#references)
+17. [Kinexon Real-Data Pilot Pipeline](#kinexon-real-data-pilot-pipeline)
+18. [Logging & Observability](#logging--observability)
+19. [Exit Codes](#exit-codes)
+20. [Known Limitations & Roadmap](#known-limitations--roadmap)
+21. [References](#references)
 
 ---
 
@@ -330,6 +331,23 @@ A single telemetry event passes through ten distinct processing stages before re
 | File | Responsibility |
 | :--- | :--- |
 | `data/data_generator.py` | v4 Decision-Agent synthetic data simulator; realistic anomaly seeding |
+
+### Kinexon Real-Data Pilot Pipeline
+
+See [Kinexon Real-Data Pilot Pipeline](#kinexon-real-data-pilot-pipeline) for the full picture.
+
+| File | Class / Entry Point | Responsibility |
+| :--- | :--- | :--- |
+| `ingestion/kinexon_adapter.py` | `KinexonAdapter` | Parses real Kinexon `positions.csv`/`statistics.csv` exports into `RawPlayerObservation`s |
+| `ingestion/kinexon_resampler.py` | `KinexonResampler` | Resamples raw Kinexon ticks into 15 s buckets (8 base columns) |
+| `ingestion/kinexon_events_features.py` | `merge_event_features()` | Merges 24 window-aggregated `events.csv` features onto the resampled data — the 8→32 feature completion step |
+| `analysis/player_workload.py` | `compute_player_workload_windows`, `assign_workload_status` | Model-free, per-tick coach workload aggregation (distance, sprint/accel/decel load, workload status) |
+| `analysis/player_workload_event.py` | `PlayerWorkloadEvent` | Model-free dataclass published to `analytics.player_workload` |
+| `analysis/player_analytics_event.py` | `PilotPlayerAnalyticsEvent`, `to_pilot_player_analytics_event()` | Model-output dataclass published to `analytics.players` (reconstruction_loss, confidence, SHAP, regime) |
+| `scripts/publish_player_workload.py` | `main()` | One-shot batch publisher, model-free, 32-feature loader |
+| `scripts/publish_pilot_analytics.py` | `main()` | One-shot batch publisher, real promoted-checkpoint inference, 32-feature loader |
+| `scripts/run_live_player_analytics.py` | `main()` | Continuous production runtime — paced replay through `LiveWindowAccumulator`, publishes incrementally |
+| `scripts/evaluate_pilot_model.py` | `_build_pipeline_and_load()`, `_build_pipeline_and_train()` | Shared checkpoint-loading helper (`use_event_features` flag controls 8 vs. 32 features) and standalone evaluation report |
 
 ---
 
@@ -936,6 +954,41 @@ All threshold adjustments are recorded in `MutationJournal` for full auditabilit
 
 ---
 
+## Kinexon Real-Data Pilot Pipeline
+
+Everything above this section describes the synthetic-data CLI (`generate · train · evaluate · serve`). A separate, real-data pilot pipeline runs alongside it, ingesting actual Kinexon UWB tracking exports (handball, not football GPS) for `analytics.players` / `analytics.player_workload` Redis Streams consumed by the Backend `AnalyticsBridgeService` / Frontend "Player Analytics" tab. It reuses the same `SharedBackboneAutoencoder` / `PatternAnalysisEngine` / SHAP stack documented above — no separate model architecture.
+
+### Data Source
+
+Real Kinexon CSV exports under `data/` (`positions.csv`, `statistics.csv`, `events.csv`), loaded via `ingestion/kinexon_adapter.py` (`KinexonAdapter`) → `ingestion/kinexon_resampler.py` (`KinexonResampler`, 15 s buckets). `ingestion/kinexon_events_features.py::merge_event_features()` merges 24 additional window-aggregated event features onto the 8 resampled columns, matching the **32-feature** input the promoted checkpoint (`models/shared_backbone.pt`) is actually trained on. As of this pipeline's current data, exactly one real match exists (session `3387`, HSG Wetzlar vs. SC Magdeburg, 2026-06-07) — multi-match history is a designed-but-not-yet-implemented roadmap item (see below).
+
+### Pipeline Scripts (`scripts/`)
+
+| Script | Model? | Feature count | Mode | Output stream |
+| :--- | :--- | :--- | :--- | :--- |
+| `publish_player_workload.py` | No — model-free aggregation (`analysis/player_workload.py`) | 32 (loader-level only; not fed to a model) | Batch (one-shot) | `analytics.player_workload` |
+| `publish_pilot_analytics.py` | Yes — loads promoted checkpoint, never retrains | 32 | Batch (one-shot) | `analytics.players` |
+| `run_live_player_analytics.py` | Yes — loads promoted checkpoint once at startup, never retrains/reloads | 32 | **Continuous** — paced replay of real session ticks through `LiveWindowAccumulator`, publishing incrementally per completed window | `analytics.player_workload` and `analytics.players` |
+| `evaluate_pilot_model.py` | Yes — trains (`_build_pipeline_and_train()`) or loads (`_build_pipeline_and_load()`) | 8 by default; `use_event_features=True` for the loader path | One-shot diagnostic report | none (writes `_pilot_eval_windows.csv`) |
+
+All three model-driven entrypoints (`publish_pilot_analytics.py`, `run_live_player_analytics.py`, and the loader path in `evaluate_pilot_model.py` when invoked with `use_event_features=True`) now route through the **same 32-feature loader** (`evaluate_pilot_model.py::_build_pipeline_and_load(use_event_features=True)`), eliminating an earlier train/serve skew where the promoted checkpoint was scored on only 8 of its 32 trained inputs.
+
+`main.py serve` (the synthetic-data CLI documented above) is **architecturally separate** from this pilot pipeline: it has no Kinexon loader, depends entirely on whatever JSON its stdin producer supplies, uses a mismatched `LiveWindowAccumulator(24, 24)` against the model's real `window_steps=8`, and never publishes to Redis — it writes to `logs/inference_log.jsonl` and drives the synthetic system's own alert/NLG narrative instead. It is not part of the Kinexon production path.
+
+### Continuous Inference (`run_live_player_analytics.py`)
+
+The canonical production runtime for `analytics.players`. Loads the promoted checkpoint once, then replays real per-tick session data in chronological order across all players (paced via `--tick-interval-seconds`), pushing each tick through the same `LiveWindowAccumulator` class `main.py serve` uses (configured at the model's real `window_size=8, stride=8`). On each completed window it runs one real inference and publishes immediately — no end-of-run batch dump. No live Kinexon hardware feed exists yet in this codebase (`tracking.events` has no producer), so this is a paced replay of recorded data rather than a stadium connection, but it is a genuine long-running process otherwise.
+
+```bash
+python scripts/run_live_player_analytics.py [--tick-interval-seconds 0.2] [--max-ticks N]
+```
+
+### Multi-Match Player History (designed, not implemented)
+
+A canonical append-only `player_match_history` store (one record per `(player_id, match_id)`, never updated) has been designed to support trend analysis once additional matches are ingested — distance, sprint/acceleration/deceleration counts, workload metric summaries, and reconstruction-loss/confidence/anomaly summaries per player per match. Not yet built. With only one real match currently available, multi-match analytics (workload trend, ACWR, performance trend, match-to-match consistency) cannot be computed yet regardless of engineering effort — this is a data-volume limitation, not a missing-feature one. See [Known Limitations & Roadmap](#known-limitations--roadmap).
+
+---
+
 ## Logging & Observability
 
 ### Log Formats
@@ -1003,6 +1056,8 @@ Replay-specific TVL issues (`replay_non_monotonic_timestamp`, `replay_timestamp_
 - `TransformerAutoencoder` is experimental and disabled in production.
 - Redis CAG TTL is uniform across all artefact types. SHAP attributions and `SemanticFinding` objects have different useful lifetimes (SHAP: ~1 match; findings: ~1 session) that a tiered TTL policy would address.
 - Historical replay streams may interleave telemetry from unrelated source sessions. Anomaly scores in replay mode will vary across gate windows as the stream cycles through different historical sessions.
+- The Kinexon pilot pipeline (see [Kinexon Real-Data Pilot Pipeline](#kinexon-real-data-pilot-pipeline)) currently has exactly one real match (session 3387). Multi-match analytics (workload trend, ACWR, performance trend, match-to-match consistency) cannot be computed until additional matches are ingested — a data-volume limitation, not an engineering gap.
+- `main.py serve` and the Kinexon pilot pipeline are architecturally separate runtimes with no shared data loader; `serve` does not publish to Redis and is not part of the `analytics.players` production path.
 
 **Roadmap:**
 
