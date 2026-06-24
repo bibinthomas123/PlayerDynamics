@@ -529,6 +529,41 @@ class KinexonConfig:
     # When False, heart_rate_bpm=0.0 means "sensor absent", NOT "malfunction".
     hr_sensor_present: bool       = False
 
+    # Ownership classification: every Kinexon export contains both SC
+    # Magdeburg's own roster AND the opposing team's roster (Group name ==
+    # the opponent's club name). Training intentionally uses ALL of it (more
+    # real tracking data for the shared backbone); coach-facing outputs
+    # (player_trends.json, PlayerMatchHistory, Match Intelligence, rankings,
+    # dashboards, Coach AI) must filter to SC Magdeburg's own players only.
+    # Single source of truth for "is this player ours" -- see
+    # classify_ownership() below.
+    scm_team_name: str             = "SC Magdeburg"
+
+
+# ─────────────────────────────────────────────
+# Ownership classification (SCM / OPPONENT / BALL)
+# ─────────────────────────────────────────────
+OWNERSHIP_SCM      = "SCM"
+OWNERSHIP_OPPONENT = "OPPONENT"
+OWNERSHIP_BALL      = "BALL"
+
+
+def classify_ownership(group_name: Optional[str], scm_team_name: str = "SC Magdeburg") -> str:
+    """Single source of truth for SCM vs OPPONENT vs BALL classification,
+    used identically by ingestion (kinexon_adapter.py, multi_match_pipeline.
+    py, dataset_discovery.py), training (pilot_pipeline.py, main.py), and
+    every coach-facing filter (analysis/player_trends.py and friends).
+    Never infers -- an empty/unknown group_name is treated as OPPONENT
+    (the conservative choice: an unrecognised roster entry must never be
+    mistaken for SC Magdeburg's own players in a coach-facing output)."""
+    if not isinstance(group_name, str) or not group_name.strip():
+        return OWNERSHIP_OPPONENT
+    if group_name.strip() == "Ball":
+        return OWNERSHIP_BALL
+    if group_name.strip() == scm_team_name:
+        return OWNERSHIP_SCM
+    return OWNERSHIP_OPPONENT
+
 
 # ─────────────────────────────────────────────
 # Feedback / Recalibration

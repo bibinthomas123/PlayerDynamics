@@ -319,6 +319,7 @@ A single telemetry event passes through ten distinct processing stages before re
 | File | Class | Responsibility |
 | :--- | :--- | :--- |
 | `ingestion/pipeline.py` | `GPSIngestionAdapter`, `SportRadarAPIAdapter`, `IngestionPipeline` | NMEA/TCP GPS, REST polling, WebSocket events, MQTT sensor bridge |
+| `ingestion/dataset_discovery.py` | `DatasetDiscoveryService` | Scans `data/incoming/`, classifies Kinexon export CSVs by column headers (never filename), extracts metadata, pairs positions/statistics/events by timestamp+roster overlap, organizes into `data/raw_matches/<session_id>/` |
 | `config/settings.py` | `PlayersDataConfig` | All configuration via environment variables and typed dataclasses |
 | `config/ollama_client.py` | `OllamaClient` | Async HTTP wrapper for Qwen2.5:14b; response caching, timeout guard |
 | `utils/schema.py` | ORM models | SQLAlchemy models for `Player`, `Session`, `PlayerEvent`, audit log |
@@ -344,10 +345,11 @@ See [Kinexon Real-Data Pilot Pipeline](#kinexon-real-data-pilot-pipeline) for th
 | `analysis/player_workload.py` | `compute_player_workload_windows`, `assign_workload_status` | Model-free, per-tick coach workload aggregation (distance, sprint/accel/decel load, workload status) |
 | `analysis/player_workload_event.py` | `PlayerWorkloadEvent` | Model-free dataclass published to `analytics.player_workload` |
 | `analysis/player_analytics_event.py` | `PilotPlayerAnalyticsEvent`, `to_pilot_player_analytics_event()` | Model-output dataclass published to `analytics.players` (reconstruction_loss, confidence, SHAP, regime) |
+| `analysis/pilot_pipeline.py` | `build_pipeline_and_load()`, `build_pipeline_and_train()`, `score_window_and_build_event()` | Shared Kinexon loading / checkpoint-load / per-window scoring logic — single home, used by `main.py publish` and `scripts/evaluate_pilot_model.py` |
 | `scripts/publish_player_workload.py` | `main()` | One-shot batch publisher, model-free, 32-feature loader |
-| `scripts/publish_pilot_analytics.py` | `main()` | One-shot batch publisher, real promoted-checkpoint inference, 32-feature loader |
-| `scripts/run_live_player_analytics.py` | `main()` | Continuous production runtime — paced replay through `LiveWindowAccumulator`, publishes incrementally |
-| `scripts/evaluate_pilot_model.py` | `_build_pipeline_and_load()`, `_build_pipeline_and_train()` | Shared checkpoint-loading helper (`use_event_features` flag controls 8 vs. 32 features) and standalone evaluation report |
+| `main.py publish --historical-replay` | `cmd_publish()` | One-shot batch publisher, real promoted-checkpoint inference, 32-feature loader |
+| `main.py publish --continuous` | `cmd_publish()` | Continuous production runtime — paced replay through `LiveWindowAccumulator`, publishes incrementally |
+| `scripts/evaluate_pilot_model.py` | `main()` | Standalone deep-diagnostic evaluation report (calibration audit, SHAP examples, per-window CSV) |
 
 ---
 
@@ -478,9 +480,22 @@ Exits 1 if validation fails (zero anomalies seeded, missing columns, empty event
 python main.py train [OPTIONS]
 
 Options:
-  --data-dir PATH              CSV source directory               [default: data]
-  --model-dir PATH             Checkpoint output directory        [default: models]
-  --sessions-per-player INT    Most-recent N sessions per player  [default: 60]
+  --data-source {synthetic,kinexon}   synthetic: five-CSV generated dataset (regression-
+                                       testing path). kinexon: real UWB tracking export via
+                                       KinexonAdapter -> KinexonResampler -> gap-aware
+                                       windowing -> BaselineBuilder.compute_with_fallback()
+                                       (preferred for production runs)        [default: synthetic]
+  --data-dir PATH              CSV/Kinexon-export source directory          [default: data]
+  --model-dir PATH             Checkpoint output directory                  [default: models]
+  --sessions-per-player INT    Most-recent N sessions per player (synthetic only) [default: 60]
+  --session-id STR             Kinexon session identifier to train on (kinexon only) [default: 3387]
+  --use-event-features         kinexon only. Extend the 8 positions.csv-derived sequence
+                                features with the 24 window-aggregated events.csv features
+                                (acceleration/deceleration/sprint/jump/change-of-direction/
+                                possession/pass/shot). Default off keeps the original
+                                8-feature model byte-for-byte reproducible.
+  --checkpoint-path PATH       If set, also copies the trained checkpoint here in addition
+                                to --model-dir/shared_backbone.pt
   --log-level LEVEL                                               [default: INFO]
 ```
 
@@ -490,24 +505,81 @@ Options:
 
 Exits 2 if training produces a degenerate model or the checkpoint is missing.
 
+The real-data (Kinexon) pilot checkpoint currently promoted to `models/shared_backbone.pt` was trained with `--data-source kinexon --use-event-features` (32 features: 8 resampled + 24 event-derived). The shared loading/training logic this path uses lives in `analysis/pilot_pipeline.py` — see [Kinexon Real-Data Pilot Pipeline](#kinexon-real-data-pilot-pipeline) below.
+
 ---
 
-### `evaluate` — Score Against Ground Truth
+### `evaluate` — Score Against Ground Truth / Real-Data Diagnostics
 
 ```bash
 python main.py evaluate [OPTIONS]
 
 Options:
-  --data-dir PATH          CSV source directory                   [default: data]
-  --model-dir PATH         Checkpoint directory                   [default: models]
-  --out PATH               Metrics output (JSON)                  [default: metrics/eval.json]
-  --min-auc FLOAT          CI gate: exit 3 if mean ROC-AUC below [default: 0.60]
+  --data-source {synthetic,kinexon}   Same meaning as `train`'s flag          [default: synthetic]
+  --data-dir PATH          CSV/Kinexon-export source directory     [default: data]
+  --model-dir PATH         Checkpoint directory                    [default: models]
+  --session-id STR         Kinexon session identifier (kinexon only) [default: 3387]
+  --use-event-features     kinexon only — see `train`'s flag of the same name
+  --out PATH               Metrics output (JSON)                   [default: metrics/eval.json]
+  --min-auc FLOAT          synthetic only — CI gate: exit 3 if mean ROC-AUC below [default: 0.60]
   --log-level LEVEL                                               [default: INFO]
 ```
 
-**Metrics computed per player:** ROC-AUC, PR-AUC, precision@k, FP-per-90-min, TP/FP/FN/TN. Aggregated as micro (global TP/FP sums) and macro (per-player mean).
+**`--data-source synthetic`:** ROC-AUC, PR-AUC, precision@k, FP-per-90-min, TP/FP/FN/TN per player, against `ground_truth_labels.csv`. Aggregated as micro (global TP/FP sums) and macro (per-player mean). Exits 3 if mean ROC-AUC < `--min-auc` or no players produced evaluable windows.
 
-Exits 3 if mean ROC-AUC < `--min-auc` or no players produced evaluable windows.
+**`--data-source kinexon`:** Real Kinexon sessions carry no ground-truth anomaly labels, so this path reports descriptive statistics instead of classification accuracy — reconstruction-loss/confidence distributions, per-player calibration coverage, raw (pre-EMA) threshold-breach rate. `--min-auc` has no effect here (logged, not silently dropped).
+
+**Deeper diagnostics** (calibration-state audit, SHAP examples on real windows, full per-window CSV export) are intentionally *not* duplicated into this command — they remain in `scripts/evaluate_pilot_model.py`, a retained diagnostic tool (see [Validation & Diagnostic Scripts](#validation--diagnostic-scripts)).
+
+---
+
+### `publish` — Publish Pilot Player Analytics
+
+```bash
+python main.py publish [OPTIONS]
+
+Options:
+  --historical-replay          One-shot batch publish: scores and publishes every real
+                                session window immediately, then exits.   [default mode]
+  --continuous                 Long-running paced replay: real per-tick rows fed one at a
+                                time through LiveWindowAccumulator; publishes incrementally
+                                as each player's window completes. Also publishes
+                                analytics.player_workload per tick.
+  --model-dir PATH             Directory containing the promoted shared_backbone.pt [default: models]
+  --tick-interval-seconds FLOAT  --continuous only: pacing between ticks    [default: 0.2]
+  --max-ticks INT               --continuous only: stop after N ticks (verification runs)
+  --log-level LEVEL                                               [default: INFO]
+```
+
+LOADS the promoted checkpoint (`analysis/pilot_pipeline.py::build_pipeline_and_load()`, no fitting) and publishes `PilotPlayerAnalyticsEvent` entries to the `analytics.players` Redis Stream for Backend's `AnalyticsBridgeService` / SSE relay / Frontend "Player Analytics" tab. Never retrains — per-player threshold calibration is recomputed against the loaded model (that state isn't persisted to disk), but the backbone's weights are the promoted checkpoint's, unmodified.
+
+---
+
+### `ingest` — Automated Discovery + Multi-Match Dataset Pipeline
+
+**Workflow for new matches: drop files → run ingest → everything updates automatically. No manual renaming, no hardcoded session IDs, no manual match registration.**
+
+1. Download Kinexon exports for a match (whatever filenames Kinexon gives them — `Bergischer_HC_vs._SC_Magdeburg_Match_positions.csv`, `-Overview-Match_THW_Kiel_vs__SC_Magdeburg-hz_01_hz_02.csv`, etc. all work as-is).
+2. Copy/drop those CSVs into `data/incoming/` (flat, any filenames).
+3. Run `python main.py ingest`.
+4. The system automatically: discovers and classifies every file by its actual columns (not filename), extracts session_id/date/player_count/team names from file contents, pairs positions+statistics+events files by timestamp-window and roster overlap, organizes complete bundles into `data/raw_matches/<session_id>/`, skips anything already ingested, then runs the existing Parquet/player-trends/match-inventory pipeline over every known match.
+
+```bash
+python main.py ingest [OPTIONS]
+
+Options:
+  --data-dir PATH          Root directory containing match_<id>/ subdirectories     [default: data]
+  --output-dir PATH        Output directory for matches/players/events/positions.parquet + reports [default: data/processed]
+  --incoming-dir PATH      Drop zone for newly-downloaded Kinexon export CSVs        [default: data/incoming]
+  --raw-matches-dir PATH   Canonical organized-by-session_id home for discovered bundles [default: data/raw_matches]
+  --log-level LEVEL                                                                  [default: INFO]
+```
+
+**Step 0 (new) — Dataset Discovery** (`ingestion/dataset_discovery.py::DatasetDiscoveryService`): scans `--incoming-dir` recursively for `*.csv`, classifies each by column-header inspection only (`ts in ms` + `x in m` → positions; `Session ID` + a `Distance (m)`-style column → statistics; `Timestamp (ms)` + `Player ID` + `Event type` → events — never the filename), extracts session_id/date/player_count/team_name/opponent_name from each file's actual data rows. Since only `statistics.csv` carries an explicit Session ID, positions/events files are paired to a statistics bundle by timestamp-window overlap (tie-broken by player-roster overlap) — also metadata, never filename. Complete bundles (`has_positions` and `has_statistics`) are moved into `--raw-matches-dir/<session_id>/{positions,statistics,events}.csv`; already-organized sessions are detected and left untouched (`status: "duplicate"`), incomplete bundles are left in `--incoming-dir` (`status: "incomplete"`) for you to investigate rather than silently dropped. Writes the full pre-ingestion readiness table to `--output-dir/discovery_inventory.json`.
+
+Every `--raw-matches-dir/<session_id>/` directory (this run's and every prior run's) is then exposed to the unmodified `MultiMatchDatasetBuilder` as `--data-dir/match_<session_id>/` via symlinks — zero hardcoded session IDs anywhere in this chain, and idempotent (safe to re-run; existing symlinks are left alone).
+
+**Step 1 (unchanged) — Multi-Match Dataset Pipeline:** scans `--data-dir` for `match_<id>/{positions.csv,events.csv,statistics.csv}` subdirectories, validates each export, and writes/updates Parquet datasets plus `dataset_summary.json`, `data_quality_report.json`, and `match_inventory.json` under `--output-dir`. Also writes `player_trends.json` (per-player physical/workload metrics). Incremental — a match directory whose files are unchanged since the last run is not re-parsed. Exits 1 if 0 `match_*` directories are found (including any just organized by Step 0).
 
 ---
 
@@ -962,26 +1034,43 @@ Everything above this section describes the synthetic-data CLI (`generate · tra
 
 Real Kinexon CSV exports under `data/` (`positions.csv`, `statistics.csv`, `events.csv`), loaded via `ingestion/kinexon_adapter.py` (`KinexonAdapter`) → `ingestion/kinexon_resampler.py` (`KinexonResampler`, 15 s buckets). `ingestion/kinexon_events_features.py::merge_event_features()` merges 24 additional window-aggregated event features onto the 8 resampled columns, matching the **32-feature** input the promoted checkpoint (`models/shared_backbone.pt`) is actually trained on. As of this pipeline's current data, exactly one real match exists (session `3387`, HSG Wetzlar vs. SC Magdeburg, 2026-06-07) — multi-match history is a designed-but-not-yet-implemented roadmap item (see below).
 
-### Pipeline Scripts (`scripts/`)
+### Production Entry Points
 
-| Script | Model? | Feature count | Mode | Output stream |
+| Entry point | Model? | Feature count | Mode | Output stream |
 | :--- | :--- | :--- | :--- | :--- |
-| `publish_player_workload.py` | No — model-free aggregation (`analysis/player_workload.py`) | 32 (loader-level only; not fed to a model) | Batch (one-shot) | `analytics.player_workload` |
-| `publish_pilot_analytics.py` | Yes — loads promoted checkpoint, never retrains | 32 | Batch (one-shot) | `analytics.players` |
-| `run_live_player_analytics.py` | Yes — loads promoted checkpoint once at startup, never retrains/reloads | 32 | **Continuous** — paced replay of real session ticks through `LiveWindowAccumulator`, publishing incrementally per completed window | `analytics.player_workload` and `analytics.players` |
-| `evaluate_pilot_model.py` | Yes — trains (`_build_pipeline_and_train()`) or loads (`_build_pipeline_and_load()`) | 8 by default; `use_event_features=True` for the loader path | One-shot diagnostic report | none (writes `_pilot_eval_windows.csv`) |
+| `python main.py publish --historical-replay` (default) | Yes — loads promoted checkpoint, never retrains | 32 | Batch (one-shot) | `analytics.players` |
+| `python main.py publish --continuous` | Yes — loads promoted checkpoint once at startup, never retrains/reloads | 32 | **Continuous** — paced replay of real session ticks through `LiveWindowAccumulator`, publishing incrementally per completed window | `analytics.player_workload` and `analytics.players` |
+| `python main.py train --data-source kinexon --use-event-features` | Yes — genuine retrain, saves+promotes checkpoint | 32 | One-shot | none (writes `models/shared_backbone.pt`) |
+| `scripts/publish_player_workload.py` | No — model-free aggregation (`analysis/player_workload.py`) | 32 (loader-level only; not fed to a model) | Batch (one-shot) | `analytics.player_workload` |
 
-All three model-driven entrypoints (`publish_pilot_analytics.py`, `run_live_player_analytics.py`, and the loader path in `evaluate_pilot_model.py` when invoked with `use_event_features=True`) now route through the **same 32-feature loader** (`evaluate_pilot_model.py::_build_pipeline_and_load(use_event_features=True)`), eliminating an earlier train/serve skew where the promoted checkpoint was scored on only 8 of its 32 trained inputs.
+Both `publish` modes and `main.py train --data-source kinexon`'s pilot path route through the same shared module, **`analysis/pilot_pipeline.py`** (`build_pipeline_and_load()`, `build_pipeline_and_train()`, `score_window_and_build_event()`) — the single home for Kinexon loading, checkpoint-loading, and per-window scoring/event-construction logic that used to be duplicated across `scripts/publish_pilot_analytics.py`, `scripts/run_live_player_analytics.py`, and `scripts/evaluate_pilot_model.py` (those first two scripts have been removed; their functionality is now `main.py publish`).
 
 `main.py serve` (the synthetic-data CLI documented above) is **architecturally separate** from this pilot pipeline: it has no Kinexon loader, depends entirely on whatever JSON its stdin producer supplies, uses a mismatched `LiveWindowAccumulator(24, 24)` against the model's real `window_steps=8`, and never publishes to Redis — it writes to `logs/inference_log.jsonl` and drives the synthetic system's own alert/NLG narrative instead. It is not part of the Kinexon production path.
 
-### Continuous Inference (`run_live_player_analytics.py`)
+### Continuous Inference (`main.py publish --continuous`)
 
 The canonical production runtime for `analytics.players`. Loads the promoted checkpoint once, then replays real per-tick session data in chronological order across all players (paced via `--tick-interval-seconds`), pushing each tick through the same `LiveWindowAccumulator` class `main.py serve` uses (configured at the model's real `window_size=8, stride=8`). On each completed window it runs one real inference and publishes immediately — no end-of-run batch dump. No live Kinexon hardware feed exists yet in this codebase (`tracking.events` has no producer), so this is a paced replay of recorded data rather than a stadium connection, but it is a genuine long-running process otherwise.
 
 ```bash
-python scripts/run_live_player_analytics.py [--tick-interval-seconds 0.2] [--max-ticks N]
+python main.py publish --continuous [--tick-interval-seconds 0.2] [--max-ticks N]
 ```
+
+### Validation & Diagnostic Scripts
+
+The following `scripts/*.py` remain as standalone tools (not folded into `main.py` — each provides diagnostic depth a production CLI command shouldn't carry as default output):
+
+| Script | Purpose |
+| :--- | :--- |
+| `evaluate_pilot_model.py` | Deep diagnostic report on the pilot checkpoint: calibration-state audit, real SHAP examples (lowest/highest/borderline-loss windows), full per-window CSV export (`_pilot_eval_windows.csv`). Imports its checkpoint-load/train logic from `analysis/pilot_pipeline.py`. |
+| `feature_importance_comparison.py` | OLD (8-feature) vs. NEW (32-feature) training comparison — mean \|SHAP\| by feature. |
+| `compare_persistence.py` | Measures `AlertManager.min_persistence` impact on anomaly signal. |
+| `baseline_fix_validation.py`, `baseline_threshold_audit.py` | Validate/audit `BaselineBuilder` provisional-window thresholds. |
+| `gap_validation.py`, `window_gap_trace.py` | Validate gap-aware windowing behaviour against real session gaps. |
+| `resampler_validation.py` | Validates `KinexonResampler` bucket/window counts. |
+| `kinexon_trace.py`, `semantic_trace.py`, `phase_a_trace.py` | Before/after traces of specific real-data calibration fixes. |
+| `export_match_roster.py` | Exports per-player position + playing-time JSON for Backend. |
+
+`scripts/publish_pilot_analytics.py`, `scripts/run_live_player_analytics.py`, and `scripts/train_pilot_session_3387.py` have been **removed** — fully superseded by `main.py publish` (`--historical-replay` / `--continuous`) and `main.py train --data-source kinexon --use-event-features`.
 
 ### Multi-Match Player History (designed, not implemented)
 

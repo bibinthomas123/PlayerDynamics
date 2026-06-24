@@ -2,21 +2,29 @@
 Players Data — IBM CIC Germany
 Production ML Pipeline Entry Point
 
-Five independent commands, each with a defined contract:
+Independent commands, each with a defined contract:
 
     generate   — synthesise or validate data in data/
     train      — fit shared backbone + per-player thresholds, save to models/
     evaluate   — score model against ground truth labels, write metrics JSON
     serve      — stream live events from stdin (newline-delimited JSON) and
                  emit alerts to stdout; runs until EOF or SIGTERM
+    publish    — publish pilot player analytics (session 3387, promoted
+                 checkpoint) to analytics.players (Redis), batch or continuous
+    ingest     — multi-match dataset pipeline: scan data/match_*/, build
+                 unified Parquet datasets + player_trends.json
     audit      — run fairness + recalibration checks against the inference log
 
 Usage
 ─────
     python main.py generate [--seasons N] [--matchdays N] [--anomaly-rate F]
     python main.py train    [--data-dir PATH] [--model-dir PATH] [--sessions-per-player N]
+                             [--data-source {synthetic,kinexon}] [--use-event-features]
     python main.py evaluate [--data-dir PATH] [--model-dir PATH] [--out PATH]
+                             [--data-source {synthetic,kinexon}] [--use-event-features]
     python main.py serve    [--model-dir PATH] [--min-alert-windows N]
+    python main.py publish  [--historical-replay | --continuous] [--model-dir PATH]
+    python main.py ingest   [--data-dir PATH] [--output-dir PATH]
     python main.py audit    [--log PATH] [--out PATH]
 
 Exit codes
@@ -376,6 +384,22 @@ def cmd_train(args: argparse.Namespace) -> None:
         _cmd_train_synthetic(args)
 
 
+def _maybe_copy_checkpoint(backbone_path: Path, args: argparse.Namespace) -> None:
+    """If --checkpoint-path was given, copies the just-written checkpoint
+    there in addition to its normal --model-dir/shared_backbone.pt location.
+    Pure file copy after training/saving has already completed -- does not
+    change what gets trained, how it's trained, or the canonical save path
+    SharedBackboneAutoencoder.save() / cmd_serve / cmd_publish read from."""
+    dest = getattr(args, "checkpoint_path", None)
+    if not dest:
+        return
+    import shutil
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(backbone_path, dest_path)
+    logger.info("Checkpoint also copied -> %s", dest_path)
+
+
 def _cmd_train_kinexon(args: argparse.Namespace) -> None:
     """
     Real-data training path, preferred for production runs:
@@ -398,6 +422,81 @@ def _cmd_train_kinexon(args: argparse.Namespace) -> None:
     model_dir = Path(args.model_dir)
     session_id = args.session_id
     use_event_features = getattr(args, "use_event_features", False)
+    all_matches = getattr(args, "all_matches", False)
+
+    if all_matches:
+        from analysis.pilot_pipeline import discover_match_dirs, build_multi_match_pipeline_and_train
+        from config.settings import OWNERSHIP_SCM, OWNERSHIP_OPPONENT
+
+        match_dirs = discover_match_dirs(data_dir)
+        logger.info(
+            "train | data_source=kinexon  data=%s  model=%s  ALL MATCHES=%s  use_event_features=%s",
+            data_dir, model_dir, [d.name for d in match_dirs], use_event_features,
+        )
+        if not match_dirs:
+            _exit(1, f"No data/match_<id>/ directories with positions.csv + statistics.csv found under {data_dir}")
+
+        # Multi-match retrain always saves to models/shared_backbone.pt
+        # (PlayersDataAnalysisPipeline's default model dir) -- redirect via
+        # MODEL_DIR-style construction is not supported by the multi-match
+        # path today, so --model-dir is only honoured for the checkpoint copy below.
+        t0 = time.perf_counter()
+        pipeline, events_by_player, sessions_df, meta, eligible, ownership, match_ids_used, result = (
+            build_multi_match_pipeline_and_train(
+                match_dirs=match_dirs, use_event_features=use_event_features, include_ownership=None,
+            )
+        )
+        elapsed = time.perf_counter() - t0
+        logger.info("Training complete in %.1f s | status=%s", elapsed, result.get("status"))
+
+        n_scm = sum(1 for pid in eligible if ownership.get(pid) == OWNERSHIP_SCM)
+        n_opponent = sum(1 for pid in eligible if ownership.get(pid) == OWNERSHIP_OPPONENT)
+
+        top_status = result.get("status", "")
+        if not top_status or top_status.startswith("error") or top_status.startswith("fail"):
+            _exit(2, f"Training returned error status: {result}")
+
+        shared_info = result.get("shared_model", {})
+        n_windows = shared_info.get("n_windows", 0)
+        n_players_trained = shared_info.get("n_players", len(eligible))
+        model_version = shared_info.get("model_version", "unknown")
+
+        if n_windows == 0:
+            _exit(2, "Training produced 0 sequence windows — model is empty")
+
+        backbone_path = Path("models") / "shared_backbone.pt"
+        if not backbone_path.exists():
+            _exit(2, f"Expected checkpoint not found at {backbone_path}")
+        _maybe_copy_checkpoint(backbone_path, args)
+
+        from config.settings import N_SEQUENCE_FEATURES as _n_feat
+
+        summary = {
+            "status": "ok",
+            "data_source": "kinexon",
+            "all_matches": True,
+            "match_ids_used": match_ids_used,
+            "use_event_features": use_event_features,
+            "n_sequence_features": _n_feat,
+            "trained_at": datetime.now(tz=timezone.utc).isoformat(),
+            "model_dir": str(backbone_path.parent.resolve()),
+            "n_players": n_players_trained,
+            "n_players_scm": n_scm,
+            "n_players_opponent": n_opponent,
+            "n_windows": n_windows,
+            "n_baselines": len(eligible),
+            "elapsed_s": round(elapsed, 2),
+            "backbone_path": str(backbone_path),
+            "model_version": model_version,
+        }
+        summary_path = backbone_path.parent / "train_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2))
+        logger.info("Summary written → %s", summary_path)
+        print(json.dumps(summary, indent=2))
+
+        serve_state_path = backbone_path.parent / "serve_state.json"
+        _save_serve_state(pipeline, serve_state_path)
+        return
 
     logger.info(
         "train | data_source=kinexon  data=%s  model=%s  session_id=%s  use_event_features=%s",
@@ -440,6 +539,7 @@ def _cmd_train_kinexon(args: argparse.Namespace) -> None:
     backbone_path = model_dir / "shared_backbone.pt"
     if not backbone_path.exists():
         _exit(2, f"Expected checkpoint not found at {backbone_path}")
+    _maybe_copy_checkpoint(backbone_path, args)
 
     from config.settings import N_SEQUENCE_FEATURES as _n_feat
 
@@ -602,6 +702,7 @@ def _cmd_train_synthetic(args: argparse.Namespace) -> None:
     backbone_path = model_dir / "shared_backbone.pt"
     if not backbone_path.exists():
         _exit(2, f"Expected checkpoint not found at {backbone_path}")
+    _maybe_copy_checkpoint(backbone_path, args)
 
     # ── Write training summary ────────────────────────────────────────────────
     summary = {
@@ -1866,7 +1967,25 @@ def _save_serve_state(pipeline, path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def cmd_ingest(args: argparse.Namespace) -> None:
     """
-    Multi-match dataset pipeline: scan --data-dir for match_<id>/ subdirectories,
+    Drop files -> run ingest -> everything updates automatically.
+
+    Step 0 (new): DatasetDiscoveryService scans --incoming-dir for loose
+    Kinexon export CSVs with arbitrary, team-name-embedded filenames,
+    classifies each by column headers (never filename), extracts session_id
+    /date/player_count/team names from file contents, pairs positions/
+    statistics/events files by timestamp-window + roster overlap (never
+    filename), and moves complete bundles into
+    --raw-matches-dir/<session_id>/{positions,statistics,events}.csv.
+    Already-organized sessions are detected as duplicates and skipped
+    (never overwritten). Writes the pre-ingestion readiness inventory to
+    --output-dir/discovery_inventory.json.
+
+    Every --raw-matches-dir/<session_id>/ directory (this run's and prior
+    runs') is then exposed to the unmodified MultiMatchDatasetBuilder below
+    as --data-dir/match_<session_id>/ via symlinks -- no hardcoded session
+    IDs anywhere in this chain.
+
+    Step 1 (unchanged): scan --data-dir for match_<id>/ subdirectories,
     validate each export, build the match metadata index, and write/update
     matches.parquet, players.parquet, events.parquet, positions.parquet under
     --output-dir. Incremental: a match directory whose files are unchanged
@@ -1876,13 +1995,43 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     reports (dataset_summary.json, data_quality_report.json,
     match_inventory.json) into --output-dir and prints the dataset summary.
 
-    Exits 1 if 0 match_* directories are found.
+    Exits 1 if 0 match_* directories are found (including any just organized).
     """
+    from ingestion.dataset_discovery import DatasetDiscoveryService
     from ingestion.multi_match_pipeline import MultiMatchDatasetBuilder
     from analysis.player_trends import build_and_write_player_trends
 
     data_root = Path(args.data_dir)
     output_dir = Path(args.output_dir)
+    incoming_dir = Path(args.incoming_dir)
+    raw_matches_dir = Path(args.raw_matches_dir)
+
+    discovery = DatasetDiscoveryService(
+        incoming_dir=incoming_dir, raw_matches_dir=raw_matches_dir, processed_dir=output_dir,
+    )
+    discovery_result = discovery.run()
+    logger.info(
+        "Dataset discovery | scanned=%d ready=%d duplicate=%d incomplete=%d orphaned=%d organized=%s",
+        discovery_result["discovered_files"], discovery_result["ready"], discovery_result["duplicate"],
+        discovery_result["incomplete"], discovery_result["orphaned"], discovery_result["organized_sessions"],
+    )
+
+    # Expose every organized raw_matches/<session_id>/ as data_dir/match_<id>/
+    # via symlinks, so MultiMatchDatasetBuilder.scan()'s unmodified
+    # `data_root.glob("match_*")` picks up real sessions with zero
+    # hardcoding. Idempotent -- safe to re-run every time.
+    if raw_matches_dir.exists():
+        for session_dir in sorted(raw_matches_dir.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            match_link_dir = data_root / f"match_{session_dir.name}"
+            if match_link_dir.exists() or match_link_dir.is_symlink():
+                continue
+            match_link_dir.mkdir(parents=True, exist_ok=True)
+            for fname in ("positions.csv", "events.csv", "statistics.csv"):
+                src = session_dir / fname
+                if src.exists():
+                    (match_link_dir / fname).symlink_to(src.resolve())
 
     builder = MultiMatchDatasetBuilder(data_root=data_root, output_dir=output_dir)
     match_dirs = builder.scan()
@@ -1897,7 +2046,251 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         output_dir / "player_trends.json", trends["n_matches_in_dataset"], len(trends["players"]),
     )
 
-    print(json.dumps(result["dataset_summary"], indent=2))
+    print(json.dumps({"discovery": discovery_result["inventory"], **result["dataset_summary"]}, indent=2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subcommand: publish
+# ─────────────────────────────────────────────────────────────────────────────
+def cmd_publish(args: argparse.Namespace) -> None:
+    """
+    Publishes real PlayerDynamics pilot outputs (session 3387, the PROMOTED
+    checkpoint at models/shared_backbone.pt) onto the analytics.players Redis
+    Stream as PilotPlayerAnalyticsEvent entries, for Backend's
+    AnalyticsBridgeService / SSE relay / Frontend "Player Analytics" tab to
+    consume. LOADS the promoted checkpoint (analysis.pilot_pipeline.
+    build_pipeline_and_load(), no fitting) -- never retrains.
+
+    Two modes (mutually exclusive):
+      --historical-replay (default): one-shot batch -- scores and publishes
+          every one of the real session's windows immediately, then exits.
+          Consolidates the former scripts/publish_pilot_analytics.py.
+      --continuous: long-running paced replay -- real per-tick rows are fed
+          one at a time, in chronological order across all players, through
+          the same LiveWindowAccumulator class cmd_serve uses; each time a
+          player's window completes, runs one real inference and publishes
+          immediately. Also publishes analytics.player_workload per tick
+          (same model-free aggregation as publish_player_workload.py).
+          Consolidates the former scripts/run_live_player_analytics.py.
+
+    Both modes reuse the same checkpoint-loading and per-window scoring
+    logic (analysis/pilot_pipeline.py) -- no duplicated pipeline code.
+    """
+    if args.continuous:
+        _cmd_publish_continuous(args)
+    else:
+        _cmd_publish_historical_replay(args)
+
+
+def _cmd_publish_historical_replay(args: argparse.Namespace) -> None:
+    from config.redis_client import RedisStreamProducer, StreamTopics
+    from config.settings import OWNERSHIP_SCM
+    from analysis.gap_aware_windowing import build_training_sequences_gap_aware
+    from analysis.regime import SessionRegimeClassifier
+    from analysis import pilot_pipeline as pp
+
+    LINE = "=" * 90
+    SUB = "-" * 90
+    print(LINE)
+    print("Publishing PILOT player analytics to analytics.players -- real session 3387 (historical replay)")
+    print(LINE)
+
+    # The promoted checkpoint's LSTM input is 32 features (8 resampled +
+    # 24 event-derived) -- matches the --continuous path below.
+    pipeline, events_by_player, sessions_df, meta, eligible, load_result = pp.build_pipeline_and_load(
+        backbone_path=Path(args.model_dir) / "shared_backbone.pt",
+        use_event_features=True,
+    )
+    engine = pipeline.pattern_engine
+    model_version = engine._shared_model.model_version if engine._shared_model else "unknown"
+    print(f"\nLoaded promoted checkpoint (not retrained): {load_result['shared_model']} "
+          f"(model_version={model_version})")
+
+    # Calibration/XAI backgrounds above are built from ALL eligible players
+    # (own roster + opponents) -- unchanged, since the checkpoint itself was
+    # trained on all of them. Publishing to the coach-facing analytics.
+    # players stream is restricted to SC Magdeburg's own roster only.
+    scm_eligible = [pid for pid in eligible if (meta.get(pid).ownership if meta.get(pid) else None) == OWNERSHIP_SCM]
+    n_opponent_skipped = len(eligible) - len(scm_eligible)
+    print(f"Eligible players: {len(eligible)} total ({len(scm_eligible)} SCM, {n_opponent_skipped} opponent -- "
+          f"opponent players are scored for calibration but never published)")
+
+    producer = RedisStreamProducer()
+    producer.ensure_stream(StreamTopics.ANALYTICS_PLAYERS)
+
+    clf = SessionRegimeClassifier()
+    n_published = 0
+    n_failed = 0
+
+    for pid in scm_eligible:
+        df = events_by_player[pid].sort_values("ts").reset_index(drop=True)
+        player_sessions = sessions_df[sessions_df["player_id"] == pid]
+        windows, _audit = build_training_sequences_gap_aware(
+            pattern_engine=engine, events_df=df, sessions_df=player_sessions,
+        )
+        elapsed_starts = pp.windows_with_elapsed(df)
+        if len(elapsed_starts) != len(windows):
+            elapsed_starts = [None] * len(windows)
+
+        m = meta.get(pid)
+        player_name = m.player_name if m else f"player_{pid}"
+        position = m.position_label if m else "unknown"
+
+        for w_idx, ((seq, mask, _sid), elapsed) in enumerate(zip(windows, elapsed_starts)):
+            try:
+                event = pp.score_window_and_build_event(
+                    pipeline=pipeline, engine=engine, clf=clf, pid=pid, seq=seq, mask=mask,
+                    elapsed_s=elapsed, player_sessions=player_sessions, meta=meta,
+                    model_version=model_version,
+                )
+                producer.publish_dataclass(StreamTopics.ANALYTICS_PLAYERS, event)
+                n_published += 1
+            except Exception as exc:
+                n_failed += 1
+                print(f"  FAILED player={pid} window={w_idx}: {exc}")
+
+        print(f"Player {pid} ({player_name}, {position}): {len(windows)} windows published")
+
+    print(f"\n{SUB}\nDONE: {n_published} events published to {StreamTopics.ANALYTICS_PLAYERS}, "
+          f"{n_failed} failed\n{SUB}")
+
+
+def _cmd_publish_continuous(args: argparse.Namespace) -> None:
+    import signal
+    import time as _time
+    from datetime import timezone as _timezone
+    from config.settings import CONFIG
+    from config.redis_client import RedisStreamProducer, StreamTopics
+    from analysis.regime import SessionRegimeClassifier
+    from analysis.player_workload import compute_player_workload_windows, assign_workload_status
+    from analysis.player_workload_event import PlayerWorkloadEvent
+    from analysis.live_window_accumulator import LiveWindowAccumulator
+    from analysis import pilot_pipeline as pp
+    from config.settings import OWNERSHIP_SCM
+
+    LINE = "=" * 90
+    SUB = "-" * 90
+    SESSION_MATCH_ID = pp.SESSION_MATCH_ID
+
+    running = {"value": True}
+
+    def _shutdown(signum, _frame):
+        print(f"\nReceived signal {signum} -- finishing current tick then shutting down.")
+        running["value"] = False
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    print(LINE)
+    print("LIVE player analytics pipeline -- real session 3387, promoted checkpoint, no retraining")
+    print(LINE)
+
+    pipeline, events_by_player, sessions_df, meta, eligible, load_result = pp.build_pipeline_and_load(
+        backbone_path=Path(args.model_dir) / "shared_backbone.pt",
+        use_event_features=True,
+    )
+    engine = pipeline.pattern_engine
+    model_version = engine._shared_model.model_version if engine._shared_model else "unknown"
+    print(f"\nLoaded promoted checkpoint (once, not retrained): {load_result['shared_model']} "
+          f"(model_version={model_version})")
+
+    # Calibration above used ALL eligible players (own roster + opponents) --
+    # the checkpoint was trained on all of them. The live replay + every
+    # coach-facing stream below (analytics.player_workload, analytics.
+    # players) is restricted to SC Magdeburg's own roster: there's no real
+    # "live opponent feed" to replay for a coach dashboard.
+    scm_eligible = [pid for pid in eligible if (meta.get(pid).ownership if meta.get(pid) else None) == OWNERSHIP_SCM]
+    print(f"Eligible players: {len(eligible)} total ({len(scm_eligible)} SCM, "
+          f"{len(eligible) - len(scm_eligible)} opponent -- opponent players are scored for "
+          f"calibration but never replayed/published)")
+
+    hi_threshold = CONFIG.kinexon.high_intensity_threshold_ms
+    dfs_by_player = {pid: events_by_player[pid].sort_values("ts").reset_index(drop=True) for pid in scm_eligible}
+    workload_rows_by_player = {}
+    for pid, df in dfs_by_player.items():
+        rows = compute_player_workload_windows(pid, df, hi_threshold)
+        if rows:
+            workload_rows_by_player[pid] = rows
+    assign_workload_status(workload_rows_by_player)
+
+    ticks = []
+    for pid, df in dfs_by_player.items():
+        for row_idx in range(len(df)):
+            ticks.append((df["ts"].iloc[row_idx], pid, row_idx))
+    ticks.sort(key=lambda t: t[0])
+    if args.max_ticks:
+        ticks = ticks[: args.max_ticks]
+    print(f"Replaying {len(ticks)} real ticks across {len(scm_eligible)} SCM players, "
+          f"tick_interval={args.tick_interval_seconds}s")
+
+    accumulator = LiveWindowAccumulator(
+        window_size=CONFIG.window.window_steps,
+        stride=CONFIG.window.window_steps,
+    )
+
+    producer = RedisStreamProducer()
+    producer.ensure_stream(StreamTopics.ANALYTICS_PLAYER_WORKLOAD)
+    producer.ensure_stream(StreamTopics.ANALYTICS_PLAYERS)
+    clf = SessionRegimeClassifier()
+
+    n_workload_published = 0
+    n_players_published = 0
+
+    for ts, pid, row_idx in ticks:
+        if not running["value"]:
+            break
+
+        m = meta.get(pid)
+        player_name = m.player_name if m else f"player_{pid}"
+        position = m.position_label if m else "unknown"
+        df = dfs_by_player[pid]
+        row = df.iloc[row_idx]
+        player_sessions = sessions_df[sessions_df["player_id"] == pid]
+
+        wl_row = workload_rows_by_player.get(pid, [None] * len(df))[row_idx] if pid in workload_rows_by_player else None
+        if wl_row is not None:
+            wl_ts = wl_row["ts"]
+            if hasattr(wl_ts, "to_pydatetime"):
+                wl_ts = wl_ts.to_pydatetime()
+            if wl_ts.tzinfo is None:
+                wl_ts = wl_ts.replace(tzinfo=_timezone.utc)
+            workload_event = PlayerWorkloadEvent(
+                player_id=pid, external_id=str(pid), player_name=player_name, position=position,
+                match_id=SESSION_MATCH_ID, timestamp=wl_ts, elapsed_s=wl_row["elapsed_s"],
+                current_load=wl_row["current_load"], load_trend=wl_row["load_trend"],
+                acceleration_load=wl_row["acceleration_load"], deceleration_load=wl_row["deceleration_load"],
+                sprint_load=wl_row["sprint_load"], high_intensity_load=wl_row["high_intensity_load"],
+                distance_covered=wl_row["distance_covered"], performance_trend=wl_row["performance_trend"],
+                workload_status=wl_row["workload_status"],
+            )
+            producer.publish_dataclass(StreamTopics.ANALYTICS_PLAYER_WORKLOAD, workload_event)
+            n_workload_published += 1
+
+        live_tick = row.to_dict()
+        window = accumulator.push(player_id=str(pid), event=live_tick)
+
+        if window is not None:
+            seq, mask = engine.window_builder.build_live_window(window)
+            elapsed_s = float(window[-1].get("elapsed_s", 0.0))
+
+            event = pp.score_window_and_build_event(
+                pipeline=pipeline, engine=engine, clf=clf, pid=pid, seq=seq, mask=mask,
+                elapsed_s=elapsed_s, player_sessions=player_sessions, meta=meta,
+                model_version=model_version,
+            )
+            producer.publish_dataclass(StreamTopics.ANALYTICS_PLAYERS, event)
+            n_players_published += 1
+
+            top_feat = event.top_shap_features[0]["feature"] if event.top_shap_features else "n/a"
+            print(f"[{event.timestamp.isoformat()}] player={pid} ({player_name}) window_end_ts={ts} "
+                  f"model_version={model_version} reconstruction_loss={event.reconstruction_loss:.4f} "
+                  f"confidence={event.confidence:.4f} top_shap={top_feat} -> analytics.players "
+                  f"(published #{n_players_published})")
+
+        _time.sleep(args.tick_interval_seconds)
+
+    print(f"\n{SUB}\nSTOPPED: {n_workload_published} workload ticks published, "
+          f"{n_players_published} model predictions published to {StreamTopics.ANALYTICS_PLAYERS}\n{SUB}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2142,9 +2535,26 @@ def _build_parser() -> argparse.ArgumentParser:
              "8-feature model byte-for-byte reproducible.",
     )
     p_tr.add_argument(
+        "--all-matches",
+        action="store_true",
+        default=False,
+        help="kinexon path only. Auto-discovers every data/match_<id>/ directory "
+             "(see ingestion/dataset_discovery.py) and trains the shared backbone "
+             "on ALL of them merged, using ALL players (SC Magdeburg + opponents) "
+             "by default -- maximizes real training data. Ignores --session-id. "
+             "Reports SCM vs OPPONENT player counts and matches/windows used in "
+             "train_summary.json. Coach-facing outputs remain SCM-only regardless "
+             "(filtered downstream in analysis/player_trends.py and main.py publish).",
+    )
+    p_tr.add_argument(
         "--save-serve-state",
         action="store_true",
         help="Save serve state (baselines, thresholds) for faster serving",
+    )
+    p_tr.add_argument(
+        "--checkpoint-path", default=None,
+        help="If set, also copies the trained checkpoint here after training "
+             "(in addition to its normal --model-dir/shared_backbone.pt location).",
     )
 
     # ── evaluate ──────────────────────────────────────────────────────────────
@@ -2243,6 +2653,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output-dir", default="data/processed",
         help="Output directory for matches/players/events/positions.parquet and reports",
     )
+    p_in.add_argument(
+        "--incoming-dir", default="data/incoming",
+        help="Drop zone for newly-downloaded Kinexon export CSVs (any filenames) -- "
+             "discovered, classified, paired, and organized automatically before "
+             "the match_*/ scan below runs",
+    )
+    p_in.add_argument(
+        "--raw-matches-dir", default="data/raw_matches",
+        help="Canonical organized-by-session_id home for discovered match bundles "
+             "(<raw-matches-dir>/<session_id>/{positions,statistics,events}.csv)",
+    )
+
+    # ── publish ───────────────────────────────────────────────────────────────
+    p_pub = sub.add_parser(
+        "publish", help="Publish pilot player analytics (session 3387, promoted checkpoint) to analytics.players"
+    )
+    p_pub.add_argument(
+        "--continuous", action="store_true", default=False,
+        help="Long-running paced replay, incremental per-window publish (formerly "
+             "scripts/run_live_player_analytics.py). Default (omit this flag) is "
+             "--historical-replay: one-shot batch publish of every window, then exit "
+             "(formerly scripts/publish_pilot_analytics.py).",
+    )
+    p_pub.add_argument(
+        "--historical-replay", action="store_true", default=False,
+        help="One-shot batch publish (the default behaviour) -- accepted explicitly "
+             "for symmetry with --continuous; has no effect beyond documenting intent.",
+    )
+    p_pub.add_argument("--model-dir", default="models", help="Directory containing the promoted shared_backbone.pt")
+    p_pub.add_argument(
+        "--tick-interval-seconds", type=float, default=0.2,
+        help="--continuous only: pacing between ticks.",
+    )
+    p_pub.add_argument(
+        "--max-ticks", type=int, default=None,
+        help="--continuous only: stop after N ticks (for verification runs).",
+    )
 
     return parser
 
@@ -2275,6 +2722,7 @@ def main() -> None:
         "serve": cmd_serve,
         "audit": cmd_audit,
         "ingest": cmd_ingest,
+        "publish": cmd_publish,
     }
 
     try:

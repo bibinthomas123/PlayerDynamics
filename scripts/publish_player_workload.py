@@ -28,7 +28,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from config.settings import CONFIG
+from config.settings import CONFIG, OWNERSHIP_SCM
 from config.redis_client import RedisStreamProducer, StreamTopics
 from analysis.player_workload import compute_player_workload_windows, assign_workload_status
 from analysis.player_workload_event import PlayerWorkloadEvent
@@ -52,6 +52,16 @@ def main() -> None:
     events_by_player, sessions_df, meta = _load_kinexon_frames(
         Path(args.data_dir), args.session_id, use_event_features=True,
     )
+
+    # Coach-facing stream -- SC Magdeburg's own roster only. Every Kinexon
+    # export also carries the opposing team's full roster (meta[pid].
+    # ownership == "OPPONENT"); never published here.
+    n_opponent = sum(1 for pid in events_by_player if meta.get(pid) and meta[pid].ownership != OWNERSHIP_SCM)
+    events_by_player = {
+        pid: df for pid, df in events_by_player.items()
+        if meta.get(pid) and meta[pid].ownership == OWNERSHIP_SCM
+    }
+    print(f"Roster: {len(events_by_player)} SCM players, {n_opponent} opponent players excluded")
 
     hi_threshold = CONFIG.kinexon.high_intensity_threshold_ms
     rows_by_player = {}

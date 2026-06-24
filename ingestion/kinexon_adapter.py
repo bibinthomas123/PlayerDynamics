@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
 
-from config.settings import KinexonConfig
+from config.settings import KinexonConfig, classify_ownership
 from ingestion.pipeline import RawPlayerObservation
 
 logger = logging.getLogger(__name__)
@@ -152,6 +152,7 @@ class KinexonPlayerMeta:
     position_label: str    # human-readable English role
     group_name: str        # team name
     session_id: str        # Kinexon session identifier (use as match_id context)
+    ownership: str = ""    # "SCM" | "OPPONENT" -- see config.settings.classify_ownership(); Ball entities are excluded before this dataclass is built
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,6 +214,7 @@ class KinexonAdapter:
                         position_label=_POSITION_LABELS.get(pos_code, pos_code.lower()),
                         group_name=group,
                         session_id=row.get("Session ID", "").strip(),
+                        ownership=classify_ownership(group, self.config.scm_team_name),
                     )
         except FileNotFoundError:
             logger.warning("statistics.csv not found at %s — player meta unavailable", path)

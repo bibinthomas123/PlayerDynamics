@@ -36,9 +36,8 @@ import numpy as np
 import pandas as pd
 
 from config.settings import CONFIG, SEQUENCE_FEATURE_NAMES as _SFN
-from ingestion.kinexon_adapter import KinexonAdapter
-from ingestion.kinexon_resampler import KinexonResampler
-from analysis.gap_aware_windowing import build_training_sequences_gap_aware, detect_window_gaps
+from analysis.gap_aware_windowing import build_training_sequences_gap_aware
+from analysis import pilot_pipeline as _pp
 
 # Pilot mode: pools calibration losses across all eligible players into one
 # shared RegimeAwareThresholdStore (analysis/anomaly_detection.py
@@ -47,138 +46,27 @@ from analysis.gap_aware_windowing import build_training_sequences_gap_aware, det
 # purpose is to measure pilot-mode's effect on anomaly detection.
 CONFIG.scoring.pilot_mode = True
 
-DATA_DIR = _ROOT / "data"
-POSITIONS_PATH = DATA_DIR / "statistics.csv"
-SESSION_ID = "3387"
+DATA_DIR = _pp.DATA_DIR
+POSITIONS_PATH = _pp.POSITIONS_PATH
+SESSION_ID = _pp.SESSION_ID
 LINE = "=" * 90
 SUB = "-" * 90
 
-WINDOW_STEPS = CONFIG.window.window_steps
-STRIDE = WINDOW_STEPS
-GAP_THRESHOLD_S = CONFIG.window.gap_threshold_s
+WINDOW_STEPS = _pp.WINDOW_STEPS
+STRIDE = _pp.STRIDE
+GAP_THRESHOLD_S = _pp.GAP_THRESHOLD_S
 
-_IDX = {n: i for i, n in enumerate(_SFN)}
+_IDX = _pp.IDX
 
-
-def _load_session_data_and_pipeline(use_event_features: bool = False):
-    """Shared by _build_pipeline_and_train() and _build_pipeline_and_load():
-    loads session 3387's real Kinexon data, computes baselines, determines
-    eligible players, and returns a pipeline with players/historical data
-    registered but no shared model trained or loaded yet.
-
-    use_event_features=False (default, unchanged): events_by_player has only
-    the 8 columns KinexonResampler.resample() produces directly -- exactly
-    what every existing caller of this function already gets, so neither
-    _build_pipeline_and_train() nor _build_pipeline_and_load() (and therefore
-    publish_pilot_analytics.py) change behaviour.
-
-    use_event_features=True: additionally merges the 24 window-aggregated
-    events.csv features (ingestion/kinexon_events_features.py), matching the
-    full 32-feature input the model was actually trained on (train_summary.
-    json: use_event_features=true) and what scripts/publish_player_workload.py
-    already loads via main.py's _load_kinexon_frames(). Opt-in only -- no
-    existing caller is affected unless it explicitly passes True.
-    """
-    from analysis.orchestrator import PlayersDataAnalysisPipeline
-
-    adapter = KinexonAdapter()
-    meta = adapter.load_player_meta(DATA_DIR / "statistics.csv")
-    observations = list(
-        adapter.stream_positions(DATA_DIR / "positions.csv", meta, session_id=SESSION_ID, match_id=SESSION_ID)
-    )
-    resampler = KinexonResampler()
-    events_by_player, sessions_df = resampler.resample(observations, session_id=SESSION_ID)
-
-    if use_event_features:
-        from ingestion.kinexon_events_features import merge_event_features
-        events_by_player = merge_event_features(
-            events_by_player=events_by_player,
-            events_csv_path=DATA_DIR / "events.csv",
-            real_player_ids=meta.keys(),
-            bucket_seconds=resampler.bucket_seconds,
-        )
-
-    from analysis.baseline import BaselineBuilder
-    builder = BaselineBuilder()
-    baselines = {}
-    for pid, df in events_by_player.items():
-        player_sessions = sessions_df[sessions_df["player_id"] == pid]
-        profile = builder.compute_with_fallback(
-            player_id=pid, external_id=str(pid), sessions_df=player_sessions, events_df=df, window_days=28,
-        )
-        if profile is not None:
-            baselines[pid] = profile
-
-    gap_counts = {}
-    for pid, df in events_by_player.items():
-        gap_info = detect_window_gaps(df, WINDOW_STEPS, STRIDE, GAP_THRESHOLD_S)
-        gap_counts[pid] = sum(1 for ok, _ in gap_info if ok)
-
-    eligible = [pid for pid in events_by_player if pid in baselines and gap_counts.get(pid, 0) > 0]
-
-    pipeline = PlayersDataAnalysisPipeline()
-    for pid in eligible:
-        m = meta.get(pid)
-        pipeline.register_player(
-            player_id=pid, external_id=str(pid),
-            name=m.player_name if m else f"player_{pid}",
-            position=m.position_label if m else "unknown",
-            age=25,
-        )
-        player_sessions = sessions_df[sessions_df["player_id"] == pid]
-        pipeline.load_historical_data(player_id=pid, sessions_df=player_sessions, events_df=events_by_player[pid])
-
-    pipeline.compute_baselines(window_days=28, use_provisional_fallback=True)
-
-    return pipeline, events_by_player, sessions_df, meta, eligible
-
-
-def _build_pipeline_and_train():
-    """Mirrors scripts/train_pilot_session_3387.py Phase 2 exactly -- same
-    data, same flags -- to obtain a live, FRESHLY TRAINED pipeline object.
-    Retained for genuine retrain-and-evaluate comparisons; the production
-    publisher (scripts/publish_pilot_analytics.py) uses
-    _build_pipeline_and_load() instead -- see that function below."""
-    pipeline, events_by_player, sessions_df, meta, eligible = _load_session_data_and_pipeline()
-    result = pipeline.train_all_models(use_gap_aware_windowing=True)
-    return pipeline, events_by_player, sessions_df, meta, eligible, result
-
-
-def _build_pipeline_and_load(backbone_path=None, use_event_features: bool = False):
-    """Loads the promoted shared backbone checkpoint (analysis.anomaly_
-    detection.SharedBackboneAutoencoder.load(), no fitting) instead of
-    retraining. Per-player threshold calibration is still recomputed against
-    the loaded model -- it is genuinely not retraining: the backbone's
-    weights come unmodified from backbone_path (default
-    models/shared_backbone.pt, the promoted checkpoint), only the per-player
-    RegimeAwareThresholdStore calibration state is (re)computed, exactly as
-    it would have to be even right after a real train() call -- see
-    InferenceEngine.load_and_calibrate()'s docstring.
-
-    use_event_features defaults to False so publish_pilot_analytics.py's
-    existing behaviour/values are unaffected -- the live pipeline
-    (scripts/run_live_player_analytics.py) explicitly passes True instead."""
-    backbone_path = Path(backbone_path) if backbone_path else _ROOT / "models" / "shared_backbone.pt"
-    pipeline, events_by_player, sessions_df, meta, eligible = _load_session_data_and_pipeline(use_event_features)
-    result = pipeline.load_shared_model(backbone_path, use_gap_aware_windowing=True)
-    return pipeline, events_by_player, sessions_df, meta, eligible, result
-
-
-def _windows_with_elapsed(df: pd.DataFrame):
-    """Real elapsed_s (window start) for every GAP-FREE window, in the exact
-    same order build_training_sequences_gap_aware() returns its (seq, mask)
-    pairs -- verified identical ordering/count in the prior turn's audit."""
-    sorted_df = df.sort_values("ts").reset_index(drop=True)
-    n = len(sorted_df)
-    elapsed_starts = []
-    for start in range(0, n - WINDOW_STEPS + 1, STRIDE):
-        end = start + WINDOW_STEPS
-        ts = pd.to_datetime(sorted_df["ts"].iloc[start:end], utc=True)
-        max_gap = ts.diff().dt.total_seconds().dropna().max() if end - start > 1 else 0.0
-        max_gap = 0.0 if pd.isna(max_gap) else float(max_gap)
-        if max_gap <= GAP_THRESHOLD_S:
-            elapsed_starts.append(float(sorted_df["elapsed_s"].iloc[start]))
-    return elapsed_starts
+# Kept as module-level aliases (not redefinitions) so existing importers --
+# scripts/compare_persistence.py, scripts/publish_pilot_analytics.py,
+# scripts/run_live_player_analytics.py -- are unaffected by this pipeline
+# logic moving to analysis/pilot_pipeline.py (single shared implementation,
+# eliminating the duplication that used to exist across these scripts).
+_load_session_data_and_pipeline = _pp.load_session_data_and_pipeline
+_build_pipeline_and_train = _pp.build_pipeline_and_train
+_build_pipeline_and_load = _pp.build_pipeline_and_load
+_windows_with_elapsed = _pp.windows_with_elapsed
 
 
 def main() -> None:

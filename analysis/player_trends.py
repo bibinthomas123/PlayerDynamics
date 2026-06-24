@@ -72,10 +72,21 @@ def rolling_metric(series: np.ndarray) -> dict:
 
 def compute_player_trends(players_df: pd.DataFrame) -> dict:
     """players_df: the concatenated statistics.csv rows (one per match_id,
-    player_id) from players.parquet."""
+    player_id) from players.parquet.
+
+    Coach-facing output -- restricted to SC Magdeburg's own roster
+    (Ownership == "SCM", persisted by ingestion/multi_match_pipeline.py).
+    Every Kinexon export also contains the opposing team's full roster
+    (Ownership == "OPPONENT"), kept in players.parquet for training/
+    research but never surfaced here."""
     df = players_df.copy()
     if df.empty or "Player ID" not in df.columns:
         return {"n_matches_in_dataset": 0, "players": []}
+
+    if "Ownership" in df.columns:
+        df = df[df["Ownership"] == "SCM"]
+        if df.empty:
+            return {"n_matches_in_dataset": 0, "players": []}
 
     for col in _HIGH_INTENSITY_COLUMNS:
         if col not in df.columns:

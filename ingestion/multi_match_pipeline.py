@@ -43,6 +43,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from ingestion.kinexon_adapter import _BALL_GROUP
+from config.settings import CONFIG, classify_ownership
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +124,18 @@ def validate_match_directory(match_dir: Path) -> MatchValidation:
     session_ids = stats_df["Session ID"].dropna().unique().tolist()
     if len(session_ids) != 1:
         v.warnings.append(f"statistics.csv has {len(session_ids)} distinct Session IDs (expected 1): {session_ids}")
-    v.match_id = str(session_ids[0]) if session_ids else match_dir.name
+    if session_ids:
+        sid_raw = session_ids[0]
+        # pandas infers "Session ID" as float64 whenever the column has any
+        # NaN (e.g. a blank row) elsewhere in the CSV -- str(3268.0) would
+        # silently rename this match to "3268.0" instead of "3268". Session
+        # 3387's column happened to have no NaNs (int64 dtype), which is why
+        # this wasn't caught until a real second match was ingested.
+        v.match_id = (
+            str(int(sid_raw)) if isinstance(sid_raw, float) and sid_raw.is_integer() else str(sid_raw)
+        )
+    else:
+        v.match_id = match_dir.name
 
     dir_id_match = re.match(r"^match_(.+)$", match_dir.name)
     if dir_id_match and dir_id_match.group(1) != v.match_id:
@@ -368,6 +380,16 @@ class MultiMatchDatasetBuilder:
 
             players_df = v._stats_df.copy()           # type: ignore[attr-defined]
             players_df.insert(0, "match_id", v.match_id)
+            # Ownership persisted at the source -- every downstream consumer
+            # (player_trends.json, PlayerMatchHistory, Match Intelligence,
+            # rankings, dashboards, Coach AI) filters on this column instead
+            # of re-deriving "is this SC Magdeburg's own player" itself.
+            players_df.insert(
+                1, "Ownership",
+                players_df.get("Group name", pd.Series(dtype=str)).map(
+                    lambda g: classify_ownership(g, CONFIG.kinexon.scm_team_name)
+                ),
+            )
             new_players_frames.append(players_df)
 
             new_events_frames.append(_events_to_long_df(v, v.match_id))
