@@ -11,21 +11,31 @@ Independent commands, each with a defined contract:
                  emit alerts to stdout; runs until EOF or SIGTERM
     publish    — publish pilot player analytics (session 3387, promoted
                  checkpoint) to analytics.players (Redis), batch or continuous
-    ingest     — multi-match dataset pipeline: scan data/match_*/, build
-                 unified Parquet datasets + player_trends.json
-    audit      — run fairness + recalibration checks against the inference log
+    ingest      — multi-match dataset pipeline: scan data/match_*/, build
+                  unified Parquet datasets + player_trends.json
+    audit       — run fairness + recalibration checks against the inference log
+    orchestrate — tactical analytics orchestrator. --mode live (default):
+                  consumes match.events / match.context from Backend's Redis
+                  streams and publishes analytics.* back. --mode replay:
+                  delegates to the replay engine (same as `main.py replay`).
+    replay      — replay a previously ingested match through the full analytics
+                  pipeline (tactical + LSTM/workload). Auto-discovers all
+                  CSV files from --match-id. No file paths required. Produces
+                  identical Redis output to a live match.
 
 Usage
 ─────
-    python main.py generate [--seasons N] [--matchdays N] [--anomaly-rate F]
-    python main.py train    [--data-dir PATH] [--model-dir PATH] [--sessions-per-player N]
-                             [--data-source {synthetic,kinexon}] [--use-event-features]
-    python main.py evaluate [--data-dir PATH] [--model-dir PATH] [--out PATH]
-                             [--data-source {synthetic,kinexon}] [--use-event-features]
-    python main.py serve    [--model-dir PATH] [--min-alert-windows N]
-    python main.py publish  [--historical-replay | --continuous] [--model-dir PATH]
-    python main.py ingest   [--data-dir PATH] [--output-dir PATH]
-    python main.py audit    [--log PATH] [--out PATH]
+    python main.py generate    [--seasons N] [--matchdays N] [--anomaly-rate F]
+    python main.py train       [--data-dir PATH] [--model-dir PATH] [--sessions-per-player N]
+                                [--data-source {synthetic,kinexon}] [--use-event-features]
+    python main.py evaluate    [--data-dir PATH] [--model-dir PATH] [--out PATH]
+                                [--data-source {synthetic,kinexon}] [--use-event-features]
+    python main.py serve       [--model-dir PATH] [--min-alert-windows N]
+    python main.py publish     [--historical-replay | --continuous] [--model-dir PATH]
+    python main.py ingest      [--data-dir PATH] [--output-dir PATH]
+    python main.py audit       [--log PATH] [--out PATH]
+    python main.py orchestrate --match-id MATCH_ID [--mode live|replay] [--speed N] [--tick-interval-seconds N]
+    python main.py replay      --match-id MATCH_ID [--speed N]
 
 Exit codes
 ──────────
@@ -2824,7 +2834,260 @@ def _build_parser() -> argparse.ArgumentParser:
     p_st.add_argument("--model-dir", default="models", help="Directory containing shared_backbone.pt / train_summary.json")
     p_st.add_argument("--data-dir", default="data/processed", help="Directory containing dataset_summary.json / match_inventory.json")
 
+    # ── orchestrate ───────────────────────────────────────────────────────────
+    p_orch = sub.add_parser(
+        "orchestrate",
+        help=(
+            "Run the tactical analytics orchestrator. "
+            "Match is auto-discovered (active Redis match → last-used → most recent ingested). "
+            "--mode live (default): consume match.events/match.context from Backend's Redis streams "
+            "and publish analytics.* back. "
+            "--mode replay: auto-discover the match dataset and replay it "
+            "(same as `main.py replay` but tactical-pipeline only)."
+        ),
+    )
+    p_orch.add_argument(
+        "--match-id", default=None,
+        help="[optional] Match ID override (e.g. 3387). Omit for automatic discovery.",
+    )
+    p_orch.add_argument(
+        "--mode", choices=["live", "replay"], default="live",
+        help="live (default): listen to Backend's Redis streams. replay: load ingested match data automatically.",
+    )
+    p_orch.add_argument(
+        "--speed", type=float, default=1.0,
+        help="Replay speed multiplier (replay mode only). 1.0=realtime, 5.0=5× faster, 0=instant. [default: 1.0]",
+    )
+    p_orch.add_argument(
+        "--model-dir", default="models",
+        help="Directory containing shared_backbone.pt (replay mode — LSTM pipeline). [default: models]",
+    )
+    p_orch.add_argument(
+        "--tick-interval-seconds", type=float, default=5.0,
+        help="How often (wall-clock seconds) to recompute and publish in live mode. [default: 5.0]",
+    )
+    p_orch.add_argument(
+        "--consumer-name", default="playerdynamics-1",
+        help="Stable consumer name for Redis consumer groups (live mode). Must stay the same across restarts.",
+    )
+    p_orch.add_argument(
+        "--read-count", type=int, default=200,
+        help="Max entries to read per Redis stream per tick (live mode). [default: 200]",
+    )
+
+    # ── replay ────────────────────────────────────────────────────────────────
+    p_rep = sub.add_parser(
+        "replay",
+        help=(
+            "Replay a previously ingested match through the full analytics pipeline "
+            "(tactical + LSTM/workload). Files are discovered automatically from --match-id. "
+            "Produces identical Redis stream output to a live match."
+        ),
+    )
+    p_rep.add_argument(
+        "--match-id", default=None,
+        help="[optional] Match ID override (e.g. 3387). Omit for automatic discovery (last-used → most recent).",
+    )
+    p_rep.add_argument(
+        "--speed", type=float, default=1.0,
+        help="Replay speed multiplier. 1.0=realtime, 5.0=5× faster, 0=instant (no delay). [default: 1.0]",
+    )
+    p_rep.add_argument(
+        "--model-dir", default="models",
+        help="Directory containing shared_backbone.pt for LSTM scoring. [default: models]",
+    )
+
     return parser
+
+
+def cmd_orchestrate(args: argparse.Namespace) -> None:
+    """
+    Tactical analytics orchestrator. Two modes:
+
+    --mode live (default)
+      Auto-discovers the active match (Redis match.context → active_match.json
+      → most recent ingested). Listens to Backend's Redis streams and publishes
+      analytics.* back on every tick. --match-id overrides discovery.
+
+    --mode replay
+      Auto-discovers the match (active_match.json → most recent ingested).
+      Delegates to the full ReplayEngine (tactical + LSTM). --match-id overrides.
+    """
+    from analysis.match_resolver import MatchResolver
+
+    mode = getattr(args, "mode", "live")
+    if mode == "replay":
+        _run_replay(args)
+        return
+
+    # ── Live mode — resolve match ID ──────────────────────────────────────────
+    resolver = MatchResolver()
+    try:
+        match_id = resolver.resolve(hint=getattr(args, "match_id", None), prefer_live=True)
+    except RuntimeError as exc:
+        logger.error("orchestrate: %s", exc)
+        sys.exit(1)
+
+    import signal
+    from analysis.match_orchestrator import MatchOrchestrator
+    from config.redis_client import (
+        RedisStreamConsumer,
+        RedisStreamProducer,
+        StreamTopics,
+        check_redis_connection,
+    )
+
+    if not check_redis_connection():
+        logger.error(
+            "orchestrate: Cannot reach Redis (REDIS_HOST/REDIS_PORT) — aborting. "
+            "This process has nothing to do without a broker."
+        )
+        sys.exit(1)
+
+    orchestrator = MatchOrchestrator(match_id=match_id)
+
+    producer = RedisStreamProducer()
+    group = "playerdynamics-runtime"
+    tracking_consumer = RedisStreamConsumer(StreamTopics.TRACKING_EVENTS, group=group, consumer_name=args.consumer_name)
+    match_events_consumer = RedisStreamConsumer(StreamTopics.MATCH_EVENTS, group=group, consumer_name=args.consumer_name)
+    match_context_consumer = RedisStreamConsumer(StreamTopics.MATCH_CONTEXT, group=group, consumer_name=args.consumer_name)
+
+    running = True
+
+    def _shutdown(signum, _frame):
+        nonlocal running
+        logger.info("orchestrate: received signal %s — finishing current tick then shutting down.", signum)
+        running = False
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    logger.info(
+        "orchestrate: live mode started — match_id=%s source=%s tick_interval=%.1fs",
+        match_id, resolver.last_resolved_via, args.tick_interval_seconds,
+    )
+    while running:
+        n_tracking = orchestrator.consume_tracking_events(tracking_consumer, count=args.read_count)
+        n_match = orchestrator.consume_match_events(match_events_consumer, count=args.read_count)
+        n_context = orchestrator.consume_match_context(match_context_consumer, count=args.read_count)
+        if n_tracking or n_match or n_context:
+            logger.info("orchestrate: consumed tracking=%d match_events=%d match_context=%d", n_tracking, n_match, n_context)
+
+        # Detect Backend starting a new match — match.context carries the current match_id.
+        # When it changes, reinitialise the orchestrator and persist the new active match.
+        ctx = orchestrator.latest_match_context
+        if ctx is not None and str(ctx.match_id) != str(match_id):
+            new_mid = str(ctx.match_id)
+            new_label = resolver._label_for(new_mid)
+            logger.info(
+                "orchestrate: Backend started new match %s (replacing %s) — "
+                "reinitialising orchestrator and updating active_match.json",
+                new_mid, match_id,
+            )
+            print(
+                f"New match detected: {new_label} [ID: {new_mid}] — active_match.json updated.",
+                flush=True,
+            )
+            match_id = new_mid
+            resolver.persist(new_mid, new_label, "redis_context_live")
+            orchestrator = MatchOrchestrator(match_id=new_mid)
+
+        new_objects = orchestrator.tick()
+        published = MatchOrchestrator.publish(producer, new_objects)
+        if published:
+            logger.info("orchestrate: published %d analytics objects across %d streams", published, len(StreamTopics.OUTBOUND))
+
+        time.sleep(args.tick_interval_seconds)
+
+    logger.info("orchestrate: finalizing match_id=%s before exit...", match_id)
+    final_objects = orchestrator.finalize()
+    published = MatchOrchestrator.publish(producer, final_objects)
+    logger.info("orchestrate: final publish %d objects — shutdown complete.", published)
+
+
+def _run_replay(args: argparse.Namespace) -> None:
+    """
+    Shared replay implementation used by both `cmd_replay` and
+    `cmd_orchestrate --mode replay`. Auto-discovers the match from the resolver
+    (active_match.json → most recent ingested) unless --match-id is provided.
+    """
+    import signal
+    import threading
+
+    from analysis.dataset_manager import MatchDatasetManager
+    from analysis.match_resolver import MatchResolver
+    from analysis.replay_engine import ReplayEngine
+    from config.redis_client import check_redis_connection
+
+    if not check_redis_connection():
+        logger.error(
+            "replay: Cannot reach Redis (REDIS_HOST/REDIS_PORT) — aborting. "
+            "Redis must be running for replay to publish analytics to the frontend."
+        )
+        sys.exit(1)
+
+    # Resolve match ID — prefer_live=False so replay never looks at Redis
+    try:
+        match_id = MatchResolver().resolve(hint=getattr(args, "match_id", None), prefer_live=False)
+    except RuntimeError as exc:
+        logger.error("replay: %s", exc)
+        sys.exit(1)
+
+    speed = float(getattr(args, "speed", 1.0))
+    model_dir = Path(getattr(args, "model_dir", "models"))
+
+    manager = MatchDatasetManager()
+    try:
+        dataset = manager.get(match_id)
+    except KeyError as exc:
+        logger.error("replay: %s", exc)
+        sys.exit(1)
+
+    logger.info(
+        "replay: match=%s (%s) speed=%.1f×",
+        match_id, dataset.label, speed if speed > 0 else float("inf"),
+    )
+    print(f"\nReplaying: {dataset.label}")
+    print(f"  positions  : {dataset.positions_path}")
+    print(f"  statistics : {dataset.statistics_path}")
+    print(f"  events     : {dataset.events_path or '(none)'}")
+    print(f"  speed      : {'instant' if speed == 0 else f'{speed}×'}\n")
+
+    stop = threading.Event()
+
+    def _shutdown(signum, _frame):
+        logger.info("replay: received signal %s — stopping...", signum)
+        stop.set()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    engine = ReplayEngine(dataset=dataset, model_dir=model_dir, speed=speed)
+    summary = engine.run(stop)
+
+    print(
+        f"\nReplay complete — "
+        f"tactical: {summary.get('tactical_published', 0)} objects, "
+        f"workload: {summary.get('workload_published', 0)} ticks, "
+        f"LSTM: {summary.get('lstm_published', 0)} windows"
+    )
+
+
+def cmd_replay(args: argparse.Namespace) -> None:
+    """
+    First-class replay command. Replays a previously ingested match through
+    both the tactical pipeline (analytics.possessions / .teamstate / .trends /
+    .insights / .situations) and the LSTM/workload pipeline
+    (analytics.players / .player_workload) — identical Redis output to a
+    live match. The frontend requires no changes.
+
+    Usage
+    -----
+        python main.py replay --match-id 3387
+        python main.py replay --match-id 3268 --speed 5
+        python main.py replay --match-id 3279 --speed 0   # instant
+    """
+    _run_replay(args)
 
 
 def main() -> None:
@@ -2857,6 +3120,8 @@ def main() -> None:
         "ingest": cmd_ingest,
         "publish": cmd_publish,
         "status": cmd_status,
+        "orchestrate": cmd_orchestrate,
+        "replay": cmd_replay,
     }
 
     try:
