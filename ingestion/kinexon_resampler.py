@@ -77,7 +77,7 @@ compares cross-player wall-clock alignment, so anchoring per-player avoids
 sparse leading buckets for players who enter the match late (substitutes).
 
 Resolved gap (was open as of this module's introduction, fixed in the
-baseline-threshold audit -- see scripts/baseline_threshold_audit.py)
+baseline-threshold audit -- see scripts/archive/baseline_threshold_audit.py)
 -------------------------------------------------------------------------------
 BaselineBuilder.compute_provisional() used to reject every 120s window
 because of a hardcoded MIN_EVENTS_PER_WINDOW=30, copy-pasted from a

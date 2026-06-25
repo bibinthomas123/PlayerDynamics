@@ -235,7 +235,7 @@ class AnomalyScoringConfig:
     # > threshold, computed in analyze_window()) must repeat on 3 CONSECUTIVE
     # windows before AnomalyResult.is_anomaly ever goes True.
     #
-    # Measured on real session 3387 (scripts/compare_persistence.py, model
+    # Measured on real session 3387 (scripts/archive/compare_persistence.py, model
     # trained once, only this value varied across replays): min_persistence
     # 1, 2, and 3 are INDISTINGUISHABLE on this data -- all three produce 0
     # alerts. Root cause is NOT persistence: analyze_window()'s EMA smoothing
@@ -290,7 +290,7 @@ class BaselineConfig:
     # validity in the live accumulator, not provisional-baseline window
     # acceptance) and with proportionally rescaling
     # MIN_EVENTS_PER_SEGMENT=30 from a 900s to a 120s window (30 * 120/900
-    # ≈ 4). See scripts/baseline_threshold_audit.py for the full sweep.
+    # ≈ 4). See scripts/archive/baseline_threshold_audit.py for the full sweep.
     min_events_per_provisional_window: int = 6
 
 

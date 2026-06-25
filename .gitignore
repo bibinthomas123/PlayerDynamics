@@ -5,6 +5,17 @@ __pycache__/
 
 *.pt
 
+# Generated diagnostic outputs (scripts/evaluate_pilot_model.py,
+# scripts/archive/compare_persistence.py) -- regenerate by re-running the
+# script, never hand-edited, not part of the supported pipeline output.
+scripts/_*.csv
+
+# Guards against accidentally writing model.pt artifacts here -- main.py's
+# train/publish commands write relative to cwd; running them from inside
+# scripts/ instead of the repo root previously left a stale duplicate
+# checkpoint under scripts/models/ that diverged from the real models/.
+scripts/models/
+
 venv/
 data/
 .DS_Store

@@ -764,10 +764,11 @@ def _cmd_evaluate_kinexon(args: argparse.Namespace) -> None:
     --min-auc is ignored on this path (logged, not silently dropped) — there
     is no AUC to gate on without ground truth.
     """
+    start_time = monotonic()
     data_dir = Path(args.data_dir)
     session_id = args.session_id
 
-    logger.info("evaluate | data_source=kinexon  data=%s  session_id=%s", data_dir, session_id)
+    logger.info("evaluate START | data_source=kinexon  data=%s  session_id=%s", data_dir, session_id)
     if args.min_auc != 0.60:  # the argparse default; a non-default value means the caller set it
         logger.warning("--min-auc has no effect for --data-source kinexon (no ground truth labels exist)")
 
@@ -887,6 +888,10 @@ def _cmd_evaluate_kinexon(args: argparse.Namespace) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(aggregate, indent=2))
     logger.info("Metrics written → %s", out_path)
+    logger.info(
+        "evaluate FINISH | duration=%.1fs n_windows_evaluated=%d n_players_evaluated=%d",
+        monotonic() - start_time, len(df_rows), len(baselines),
+    )
     print(json.dumps(aggregate, indent=2))
 
 
@@ -920,10 +925,11 @@ def _cmd_evaluate_synthetic(args: argparse.Namespace) -> None:
                 logger.info("%s …", desc)
             return it
 
+    start_time = monotonic()
     data_dir = Path(args.data_dir)
     model_dir = Path(args.model_dir)
 
-    logger.info("evaluate | data=%s  model=%s", data_dir, model_dir)
+    logger.info("evaluate START | data_source=synthetic  data=%s  model=%s", data_dir, model_dir)
 
     backbone_path = model_dir / "shared_backbone.pt"
     if not backbone_path.exists():
@@ -1193,6 +1199,10 @@ def _cmd_evaluate_synthetic(args: argparse.Namespace) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(aggregate, indent=2))
     logger.info("Metrics written → %s", out_path)
+    logger.info(
+        "evaluate FINISH | duration=%.1fs n_players_evaluated=%d",
+        monotonic() - start_time, len(all_player_metrics),
+    )
 
     print(
         json.dumps({k: v for k, v in aggregate.items() if k != "per_player"}, indent=2)
@@ -2001,10 +2011,13 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     from ingestion.multi_match_pipeline import MultiMatchDatasetBuilder
     from analysis.player_trends import build_and_write_player_trends
 
+    start_time = monotonic()
     data_root = Path(args.data_dir)
     output_dir = Path(args.output_dir)
     incoming_dir = Path(args.incoming_dir)
     raw_matches_dir = Path(args.raw_matches_dir)
+
+    logger.info("ingest START | data_dir=%s output_dir=%s incoming_dir=%s", data_root, output_dir, incoming_dir)
 
     discovery = DatasetDiscoveryService(
         incoming_dir=incoming_dir, raw_matches_dir=raw_matches_dir, processed_dir=output_dir,
@@ -2044,6 +2057,15 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     logger.info(
         "Player trends written -> %s (n_matches_in_dataset=%d, n_players=%d)",
         output_dir / "player_trends.json", trends["n_matches_in_dataset"], len(trends["players"]),
+    )
+
+    elapsed_s = monotonic() - start_time
+    logger.info(
+        "ingest FINISH | duration=%.1fs matches_total=%s matches_processed_this_run=%s matches_failed_validation=%s",
+        elapsed_s,
+        result["dataset_summary"].get("matches_total"),
+        result["dataset_summary"].get("matches_processed_this_run"),
+        result["dataset_summary"].get("matches_failed_validation"),
     )
 
     print(json.dumps({"discovery": discovery_result["inventory"], **result["dataset_summary"]}, indent=2))
@@ -2088,6 +2110,9 @@ def _cmd_publish_historical_replay(args: argparse.Namespace) -> None:
     from analysis.gap_aware_windowing import build_training_sequences_gap_aware
     from analysis.regime import SessionRegimeClassifier
     from analysis import pilot_pipeline as pp
+
+    start_time = monotonic()
+    logger.info("publish START | mode=historical-replay model_dir=%s", args.model_dir)
 
     LINE = "=" * 90
     SUB = "-" * 90
@@ -2147,12 +2172,17 @@ def _cmd_publish_historical_replay(args: argparse.Namespace) -> None:
                 n_published += 1
             except Exception as exc:
                 n_failed += 1
+                logger.warning("publish: FAILED player=%s window=%d -- %s", pid, w_idx, exc)
                 print(f"  FAILED player={pid} window={w_idx}: {exc}")
 
         print(f"Player {pid} ({player_name}, {position}): {len(windows)} windows published")
 
     print(f"\n{SUB}\nDONE: {n_published} events published to {StreamTopics.ANALYTICS_PLAYERS}, "
           f"{n_failed} failed\n{SUB}")
+    logger.info(
+        "publish FINISH | mode=historical-replay duration=%.1fs n_published=%d n_failed=%d",
+        monotonic() - start_time, n_published, n_failed,
+    )
 
 
 def _cmd_publish_continuous(args: argparse.Namespace) -> None:
@@ -2180,6 +2210,9 @@ def _cmd_publish_continuous(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
+
+    start_time = monotonic()
+    logger.info("publish START | mode=continuous model_dir=%s tick_interval_s=%s", args.model_dir, args.tick_interval_seconds)
 
     print(LINE)
     print("LIVE player analytics pipeline -- real session 3387, promoted checkpoint, no retraining")
@@ -2291,6 +2324,10 @@ def _cmd_publish_continuous(args: argparse.Namespace) -> None:
 
     print(f"\n{SUB}\nSTOPPED: {n_workload_published} workload ticks published, "
           f"{n_players_published} model predictions published to {StreamTopics.ANALYTICS_PLAYERS}\n{SUB}")
+    logger.info(
+        "publish FINISH | mode=continuous duration=%.1fs n_workload_published=%d n_players_published=%d",
+        monotonic() - start_time, n_workload_published, n_players_published,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2461,6 +2498,95 @@ def cmd_audit(args: argparse.Namespace) -> None:
     if audit_output["bias_detected"]:
         biased = audit_output["biased_groups"]
         _exit(5, f"Bias detected in groups: {biased}  — see {out_path}")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """
+    Read-only health/status report for PlayerDynamics itself (Productionization
+    Phase 3 -- "Health Monitoring"). Prints structured JSON to stdout and
+    nothing else, so it can be invoked from a shell health check, a cron
+    job, or backend's PlatformStatusService (which reads the same artifacts
+    directly off disk) without needing a running HTTP server -- PlayerDynamics
+    is a batch/CLI pipeline, not a service, so there is no endpoint to poll.
+
+    Computed entirely from already-written artifacts (models/train_summary.json,
+    data/processed/dataset_summary.json, data/processed/match_inventory.json)
+    plus a live Redis ping for last-publish timestamps -- nothing here is
+    recomputed or invented; a missing artifact is reported as null, not
+    fabricated as zero/healthy.
+
+    Exit code is always 0 -- this command reports status, it does not assert
+    health (a calling health-check script should inspect the JSON's `ok`
+    field itself, since "model not yet trained" is a normal state on a
+    fresh checkout, not a crash).
+    """
+    model_dir = Path(args.model_dir)
+    data_dir = Path(args.data_dir)
+
+    train_summary_path = model_dir / "train_summary.json"
+    train_summary = None
+    if train_summary_path.exists():
+        try:
+            train_summary = json.loads(train_summary_path.read_text())
+        except Exception:
+            logger.warning("status: failed to parse %s", train_summary_path)
+
+    dataset_summary_path = data_dir / "dataset_summary.json"
+    dataset_summary = None
+    if dataset_summary_path.exists():
+        try:
+            dataset_summary = json.loads(dataset_summary_path.read_text())
+        except Exception:
+            logger.warning("status: failed to parse %s", dataset_summary_path)
+
+    match_inventory_path = data_dir / "match_inventory.json"
+    matches_available = None
+    if match_inventory_path.exists():
+        try:
+            match_inventory = json.loads(match_inventory_path.read_text())
+            matches_available = len(match_inventory.get("matches", []))
+        except Exception:
+            logger.warning("status: failed to parse %s", match_inventory_path)
+
+    model_loaded = (model_dir / "shared_backbone.pt").exists()
+
+    last_publish = {"analytics.players": None, "analytics.player_workload": None}
+    redis_available = False
+    try:
+        from config.redis_client import RedisConnectionPool, check_redis_connection
+
+        redis_available = check_redis_connection()
+        if redis_available:
+            client = RedisConnectionPool.client()
+            for stream in last_publish:
+                try:
+                    entries = client.xrevrange(stream, count=1)
+                    if entries:
+                        last_publish[stream] = entries[0][0]  # Redis stream entry ID encodes its own ms timestamp
+                except Exception:
+                    pass  # stream may not exist yet -- leave as null, not an error
+    except Exception as exc:
+        logger.warning("status: could not check Redis -- %s", exc)
+
+    report = {
+        "ok": model_loaded or matches_available is not None,
+        "model": {
+            "loaded": model_loaded,
+            "model_version": (train_summary or {}).get("model_version"),
+            "trained_at": (train_summary or {}).get("trained_at"),
+            "n_training_windows": (train_summary or {}).get("n_windows"),
+        },
+        "ingestion": {
+            "matches_available": matches_available,
+            "matches_total": (dataset_summary or {}).get("matches_total"),
+            "matches_failed_validation": (dataset_summary or {}).get("matches_failed_validation"),
+        },
+        "redis": {
+            "available": redis_available,
+            "last_publish": last_publish,
+        },
+    }
+    print(json.dumps(report, indent=2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2691,6 +2817,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="--continuous only: stop after N ticks (for verification runs).",
     )
 
+    # ── status ────────────────────────────────────────────────────────────────
+    p_st = sub.add_parser(
+        "status", help="Read-only health/status report (model/ingestion/Redis) as structured JSON"
+    )
+    p_st.add_argument("--model-dir", default="models", help="Directory containing shared_backbone.pt / train_summary.json")
+    p_st.add_argument("--data-dir", default="data/processed", help="Directory containing dataset_summary.json / match_inventory.json")
+
     return parser
 
 
@@ -2723,6 +2856,7 @@ def main() -> None:
         "audit": cmd_audit,
         "ingest": cmd_ingest,
         "publish": cmd_publish,
+        "status": cmd_status,
     }
 
     try:

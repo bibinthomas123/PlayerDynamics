@@ -681,6 +681,20 @@ Exits 5 if bias is detected in any protected group (flag-rate disparity > `fairn
 
 ---
 
+### `status` — Health/Status Report (Productionization Phase 3)
+
+```bash
+python main.py status [OPTIONS]
+
+Options:
+  --model-dir PATH   Directory containing shared_backbone.pt / train_summary.json   [default: models]
+  --data-dir PATH    Directory containing dataset_summary.json / match_inventory.json [default: data/processed]
+```
+
+Read-only, structured-JSON report to stdout: model loaded/version/trained_at, matches available/total/failed, and live Redis last-publish timestamps per stream (`analytics.players`, `analytics.player_workload`). Computed entirely from already-written artifacts plus a live Redis ping — nothing here is recomputed. Always exits 0; a fresh checkout with no model trained yet is a normal reported state, not a crash. This is PlayerDynamics' half of the platform health check (see `backend/README.md#health-check` for the other half, which reads the same artifacts from the Backend side).
+
+---
+
 ## Data Schema
 
 Five CSVs are produced by `generate` and consumed by `train` / `evaluate`:
@@ -1055,26 +1069,49 @@ The canonical production runtime for `analytics.players`. Loads the promoted che
 python main.py publish --continuous [--tick-interval-seconds 0.2] [--max-ticks N]
 ```
 
-### Validation & Diagnostic Scripts
+### Scripts Directory: One Supported Path
 
-The following `scripts/*.py` remain as standalone tools (not folded into `main.py` — each provides diagnostic depth a production CLI command shouldn't carry as default output):
+`scripts/` is split into two tiers so it's unambiguous which files are part of the supported production pipeline:
+
+**`scripts/` (root) — supported, actively used by Backend or the documented pipeline:**
 
 | Script | Purpose |
 | :--- | :--- |
-| `evaluate_pilot_model.py` | Deep diagnostic report on the pilot checkpoint: calibration-state audit, real SHAP examples (lowest/highest/borderline-loss windows), full per-window CSV export (`_pilot_eval_windows.csv`). Imports its checkpoint-load/train logic from `analysis/pilot_pipeline.py`. |
-| `feature_importance_comparison.py` | OLD (8-feature) vs. NEW (32-feature) training comparison — mean \|SHAP\| by feature. |
-| `compare_persistence.py` | Measures `AlertManager.min_persistence` impact on anomaly signal. |
-| `baseline_fix_validation.py`, `baseline_threshold_audit.py` | Validate/audit `BaselineBuilder` provisional-window thresholds. |
-| `gap_validation.py`, `window_gap_trace.py` | Validate gap-aware windowing behaviour against real session gaps. |
-| `resampler_validation.py` | Validates `KinexonResampler` bucket/window counts. |
-| `kinexon_trace.py`, `semantic_trace.py`, `phase_a_trace.py` | Before/after traces of specific real-data calibration fixes. |
-| `export_match_roster.py` | Exports per-player position + playing-time JSON for Backend. |
+| `evaluate_pilot_model.py` | Deep diagnostic report on the pilot checkpoint: calibration-state audit, real SHAP examples (lowest/highest/borderline-loss windows), full per-window CSV export (`_pilot_eval_windows.csv`). Imports its checkpoint-load/train logic from `analysis/pilot_pipeline.py`. Referenced by `main.py evaluate`'s docstring as the source of its validated procedure. |
+| `publish_player_workload.py` | One-shot batch publisher, model-free, 32-feature loader (see Production Entry Points table above). |
+| `export_match_roster.py` | Exports per-player position + playing-time JSON. Read directly by Backend's `PlayerMatchHistoryService`/`backfill-player-match-history.mjs`. |
+| `export_match_timeline.py` | Exports 15-minute-segment workload timeline JSON. Read directly by Backend's `TimelineIntelligenceService`. |
+| `export_player_match_metrics.py` | Exports per-(match, player) physical/workload metrics JSON. Read directly by Backend's `backfill-player-match-history.mjs`. |
+
+**`scripts/archive/` — one-off historical validation/trace scripts, kept for audit trail only, not part of any supported workflow and not referenced by Backend or `main.py`:**
+
+| Script | Purpose |
+| :--- | :--- |
+| `feature_importance_comparison.py` | OLD (8-feature) vs. NEW (32-feature) training comparison — mean \|SHAP\| by feature. One-time migration record. |
+| `compare_persistence.py` | Measured `AlertManager.min_persistence` impact on anomaly signal during calibration tuning. |
+| `baseline_fix_validation.py`, `baseline_threshold_audit.py` | Validated/audited `BaselineBuilder` provisional-window thresholds during calibration tuning. |
+| `gap_validation.py`, `window_gap_trace.py` | Validated gap-aware windowing behaviour against real session gaps during that fix. |
+| `resampler_validation.py` | Validated `KinexonResampler` bucket/window counts during that fix. |
+| `kinexon_trace.py`, `semantic_trace.py`, `phase_a_trace.py` | Before/after traces of specific real-data calibration fixes, kept as the historical record of what changed and why. |
+
+If you need to re-run one of the archived scripts, it still works as-is from its new path (`python scripts/archive/<name>.py`) — nothing about its logic changed, only its location.
 
 `scripts/publish_pilot_analytics.py`, `scripts/run_live_player_analytics.py`, and `scripts/train_pilot_session_3387.py` have been **removed** — fully superseded by `main.py publish` (`--historical-replay` / `--continuous`) and `main.py train --data-source kinexon --use-event-features`.
 
-### Multi-Match Player History (designed, not implemented)
+### Multi-Match Player History
 
-A canonical append-only `player_match_history` store (one record per `(player_id, match_id)`, never updated) has been designed to support trend analysis once additional matches are ingested — distance, sprint/acceleration/deceleration counts, workload metric summaries, and reconstruction-loss/confidence/anomaly summaries per player per match. Not yet built. With only one real match currently available, multi-match analytics (workload trend, ACWR, performance trend, match-to-match consistency) cannot be computed yet regardless of engineering effort — this is a data-volume limitation, not a missing-feature one. See [Known Limitations & Roadmap](#known-limitations--roadmap).
+Implemented on the Backend side: `PlayerMatchHistory` (PostgreSQL, one append-only row per `(player_id, match_id)`, written by `backend/scripts/backfill-player-match-history.mjs` from this pipeline's own `match_roster.json`/`player_match_metrics.json` exports + the crosswalk to Postgres player IDs). 4 real matches are ingested as of this writing, enabling real multi-match trend analysis (workload trend, match-to-match consistency) in Backend's Match Intelligence layer — see the root `ARCHITECTURE.md`. `acuteLoad`/`chronicLoad`/`acwr` are attached only to each player's own chronologically-latest match (never back-computed for earlier matches, to avoid fabricating a point-in-time value that doesn't exist).
+
+### Tactical Event Pipeline (`run_match_orchestrator.py`)
+
+A second, separate production entrypoint from `main.py` — owns live possession/team-state/tactical-insight analytics, not the player-workload/LSTM pipeline documented above. `run_match_orchestrator.py --match-id <id>` instantiates `MatchOrchestrator` and runs a continuous consume→tick→publish loop:
+
+- **Consumes** `match.events`/`match.context` from Backend (coach-entered actions/score/clock — Backend is the source of truth for these) and `tracking.events` (PlayerDynamics-internal Kinexon tactical-event hand-off).
+- **Publishes** to `analytics.possessions`, `analytics.teamstate`, `analytics.trends`, `analytics.insights`, `analytics.situations` (Backend's `AnalyticsBridgeService` relays these onto `GET /api/analytics/stream` for the live dashboard).
+- Graceful shutdown on SIGINT/SIGTERM: finishes the current tick, calls `finalize()`, publishes one last batch, then exits — nothing "tail"/provisional is lost.
+- This is the process `docker-compose.yml`'s `playerdynamics` service runs (`--match-id ${MATCH_ID} --tick-interval-seconds 5`).
+
+`main.py`'s subcommands (`ingest`/`train`/`evaluate`/`publish`/`serve`/`audit`/`status`) and `run_match_orchestrator.py` are independent processes that happen to share the same Redis instance and the same `data/processed/` filesystem artifacts — neither imports the other.
 
 ---
 

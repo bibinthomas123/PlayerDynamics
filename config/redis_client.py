@@ -1369,24 +1369,3 @@ def check_redis_connection() -> bool:
     except Exception as exc:
         logger.warning("check_redis_connection: Redis unreachable — %s", exc)
         return False
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience: verify connectivity at import time (non-fatal)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_redis_connection() -> bool:
-    """
-    Ping Redis and return True if reachable.
-
-    Call during application startup to surface misconfiguration early.
-    Does NOT raise — returns False so callers can decide whether to abort
-    or fall back to JsonFileCheckpointStore.
-    """
-    if not _REDIS_AVAILABLE:
-        logger.info("check_redis_connection: redis-py not installed — skipping")
-        return False
-    try:
-        client = RedisConnectionPool.client()
-        return client.ping()
-    except Exception as exc:
-        logger.warning("check_redis_connection: Redis unreachable — %s", exc)
-        return False
