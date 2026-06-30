@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 from pathlib import Path
 
 # ─────────────────────────────────────────────
@@ -317,18 +317,60 @@ class PossessionConfig:
 
     possession_quality = quality_outcome_weight * outcome_score
                         + quality_attack_weight  * min(1, attack_intensity / reference_attack_rate_per_min)
-      where outcome_score = 1.0 (shot) / 0.5 (neutral) / 0.0 (turnover)
 
-    The two weights are an even 50/50 split between "what happened"
-    (outcome) and "how much attacking pressure was generated" (rate) --
-    neither signal alone fully captures possession quality.
-    reference_attack_rate_per_min = 15.0 is a normalisation ceiling for the
-    attack-rate component only, not a hard cap on attack_intensity itself
-    (which is reported uncapped).
+    outcome_score is selected from the shot outcome fields below when
+    EventFusionEngine has annotated a shot with metadata["shot_outcome"]
+    (GOAL / SAVED / MISSED / UNKNOWN). Without fusion enrichment every shot
+    uses outcome_score_shot_unknown, which matches the pre-fusion behaviour
+    (score 0.85 ≈ old hardcoded 1.0 slightly discounted for ambiguity).
+
+    These are deterministic heuristic weights, not learned parameters.
+    They rank possession quality by how much scoring threat was realised:
+      goal   — highest (shot converted)
+      saved  — high (shot on target, dangerous but stopped)
+      missed — medium (shot attempted but off target)
+      unknown — slightly below goal (Kinexon confirmed shot, no coach data)
+      neutral — baseline (no explicit terminator)
+      turnover — lowest (ball lost without a shot)
     """
     quality_outcome_weight: float        = 0.5
     quality_attack_weight: float         = 0.5
     reference_attack_rate_per_min: float = 15.0
+
+    # Shot outcome scores (used when shot_outcome metadata is present)
+    outcome_score_goal: float         = 1.00
+    outcome_score_saved: float        = 0.70
+    outcome_score_missed: float       = 0.40
+    outcome_score_shot_unknown: float = 0.85  # Kinexon shot, no coach annotation
+    outcome_score_neutral: float      = 0.50
+    outcome_score_turnover: float     = 0.00
+
+
+# ─────────────────────────────────────────────
+# Event Fusion (EventFusionEngine)
+# ─────────────────────────────────────────────
+@dataclass
+class EventFusionConfig:
+    """
+    Tunables for EventFusionEngine (analysis/event_fusion.py).
+
+    dedup_window_seconds: maximum time delta between a coach MatchEvent and a
+    Kinexon TacticalEvent for them to be considered the same physical action.
+    Coach events arrive via the Backend → Redis → PlayerDynamics path with
+    typical human reaction latency of 1–3 s; 5 s provides margin for slow
+    networks without accidentally merging adjacent events in fast exchanges
+    (handball shots rarely occur closer than 5 s apart in open play).
+
+    team_id_aliases: maps the compact Backend team identifiers (e.g. "SCM")
+    to the full Kinexon team names (e.g. "SC Magdeburg") so both sources can
+    be normalised to a single canonical form before timestamp matching.
+    Add entries for both SCM and any common opponent abbreviations used in
+    the Backend/frontend.
+    """
+    dedup_window_seconds: float = 5.0
+    team_id_aliases: Dict[str, str] = field(
+        default_factory=lambda: {"SCM": "SC Magdeburg"}
+    )
 
 
 # ─────────────────────────────────────────────
@@ -606,8 +648,9 @@ class PlayersDataConfig:
     baseline:    BaselineConfig               = field(default_factory=BaselineConfig)
     fatigue:     FatigueCurveConfig           = field(default_factory=FatigueCurveConfig)
     positional:  PositionalDriftConfig        = field(default_factory=PositionalDriftConfig)
-    possession:  PossessionConfig             = field(default_factory=PossessionConfig)
-    team_state:  TeamStateConfig              = field(default_factory=TeamStateConfig)
+    possession:    PossessionConfig           = field(default_factory=PossessionConfig)
+    event_fusion:  EventFusionConfig          = field(default_factory=EventFusionConfig)
+    team_state:    TeamStateConfig            = field(default_factory=TeamStateConfig)
     team_state_trend: TeamStateTrendConfig    = field(default_factory=TeamStateTrendConfig)
     coach_insight: CoachInsightConfig         = field(default_factory=CoachInsightConfig)
     coach_situation: CoachSituationConfig     = field(default_factory=CoachSituationConfig)

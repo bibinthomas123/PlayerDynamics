@@ -218,8 +218,9 @@ class TestMetrics:
         assert p.attack_intensity == 0.0
         assert p.physical_intensity == 0.0
         assert p.transition_intensity == 0.0
-        # possession_quality is still defined (outcome_score contributes even at zero duration)
-        assert p.possession_quality == pytest.approx(0.5)  # 0.5*1.0(shot) + 0.5*0.0(no rate)
+        # possession_quality is still defined (outcome_score contributes even at zero duration).
+        # A Kinexon-only shot with no coach annotation uses outcome_score_shot_unknown=0.85.
+        assert p.possession_quality == pytest.approx(0.5 * 0.85)  # 0.5*0.85(shot_unknown) + 0.5*0.0(no rate)
 
 
 # ---------------------------------------------------------------------------

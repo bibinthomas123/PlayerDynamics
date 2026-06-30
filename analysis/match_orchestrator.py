@@ -79,8 +79,10 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from config.redis_client import RedisStreamConsumer, RedisStreamProducer, StreamTopics
+from config.settings import CONFIG
 from analysis.coach_insight import CoachInsightEngine
 from analysis.coach_situation import CoachSituationEngine
+from analysis.event_fusion import EventFusionEngine
 from analysis.possession import PossessionEngine
 from analysis.team_state import TeamStateBuilder
 from analysis.team_state_trend import TeamStateTrendBuilder
@@ -158,15 +160,13 @@ class MatchOrchestrator:
         self.player_meta = player_meta
         self.events: List[TacticalEvent] = []
 
-        # Backend-owned context (see ingestion/match_event.py) -- received
-        # and held for downstream consumers, never recomputed or validated
-        # here. Not yet fused into the analytics engines below (TeamState/
-        # Possession/etc. still derive purely from Kinexon TacticalEvents);
-        # that fusion is deliberately out of scope for this integration --
-        # see BACKEND_INTEGRATION_IMPLEMENTATION.md's "not done here" section.
+        # Backend-owned context (see ingestion/match_event.py). Fused with
+        # self.events by EventFusionEngine on every _recompute() call to
+        # produce a single canonical TacticalEvent stream.
         self.match_events: List[MatchEvent] = []
         self.latest_match_context: Optional[MatchContext] = None
 
+        self._fusion = EventFusionEngine(config=CONFIG.event_fusion)
         self._team_state_builder = TeamStateBuilder()
         self._trend_builder = TeamStateTrendBuilder()
         self._insight_engine = CoachInsightEngine()
@@ -251,6 +251,33 @@ class MatchOrchestrator:
     # Recomputation
     # ─────────────────────────────────────────────────────────────────────
 
+    def _opponent_team_id(self) -> Optional[str]:
+        """
+        Return the opponent's canonical team_id for EventFusionEngine's save
+        inversion logic. Prefers an explicit "opponent_team_id" key on the
+        latest MatchContext metadata; falls back to the most-frequent non-SCM
+        team_id seen in the Kinexon event stream (robust for replay mode where
+        no MatchContext has arrived yet).  Returns None if neither source can
+        resolve it — EventFusionEngine will then drop PARADE events rather
+        than guess.
+        """
+        if self.latest_match_context is not None:
+            oid = (self.latest_match_context.metadata or {}).get("opponent_team_id")
+            if oid:
+                return oid
+
+        aliases = CONFIG.event_fusion.team_id_aliases
+        scm_canonical = aliases.get("SCM", "SCM")
+        team_counts: Dict[str, int] = {}
+        for e in self.events:
+            if e.team_id:
+                canonical = aliases.get(e.team_id, e.team_id)
+                if canonical != scm_canonical:
+                    team_counts[e.team_id] = team_counts.get(e.team_id, 0) + 1
+        if not team_counts:
+            return None
+        return max(team_counts, key=team_counts.__getitem__)
+
     def _recompute(self, include_tail_possession: bool) -> Dict[str, Any]:
         """
         include_tail_possession=False (tick()): the last possession in the
@@ -268,9 +295,14 @@ class MatchOrchestrator:
         event list would produce. It must be included so the final window's
         situation matches that ground truth.
         """
-        possessions = self._possession_engine.generate(self.events)
+        canonical = self._fusion.fuse(
+            self.events,
+            self.match_events,
+            opponent_team_id=self._opponent_team_id(),
+        )
+        possessions = self._possession_engine.generate(canonical)
         situation_possessions = possessions if include_tail_possession else possessions[:-1]
-        team_states = self._team_state_builder.build_dual_window(self.events)
+        team_states = self._team_state_builder.build_dual_window(canonical)
         window_lengths = tuple(team_states.keys())
         trends = {ws: self._trend_builder.build(team_states[ws]) for ws in window_lengths}
         insights = {ws: self._insight_engine.generate(trends[ws]) for ws in window_lengths}

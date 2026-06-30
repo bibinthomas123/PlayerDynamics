@@ -2,40 +2,36 @@
 Players Data — IBM CIC Germany
 Production ML Pipeline Entry Point
 
-Independent commands, each with a defined contract:
+Primary workflow (three commands cover every normal use case):
+──────────────────────────────────────────────────────────────
 
-    generate   — synthesise or validate data in data/
-    train      — fit shared backbone + per-player thresholds, save to models/
-    evaluate   — score model against ground truth labels, write metrics JSON
-    serve      — stream live events from stdin (newline-delimited JSON) and
-                 emit alerts to stdout; runs until EOF or SIGTERM
-    publish    — publish pilot player analytics (session 3387, promoted
-                 checkpoint) to analytics.players (Redis), batch or continuous
-    ingest      — multi-match dataset pipeline: scan data/match_*/, build
-                  unified Parquet datasets + player_trends.json
-    audit       — run fairness + recalibration checks against the inference log
-    orchestrate — tactical analytics orchestrator. --mode live (default):
-                  consumes match.events / match.context from Backend's Redis
-                  streams and publishes analytics.* back. --mode replay:
-                  delegates to the replay engine (same as `main.py replay`).
-    replay      — replay a previously ingested match through the full analytics
-                  pipeline (tactical + LSTM/workload). Auto-discovers all
-                  CSV files from --match-id. No file paths required. Produces
-                  identical Redis output to a live match.
+    python main.py ingest   — discover new Kinexon datasets, organise matches,
+                              validate files, update inventory, regenerate
+                              processed datasets (Parquet, trends, roster).
+                              Drop new exports into data/incoming/ first.
 
-Usage
-─────
-    python main.py generate    [--seasons N] [--matchdays N] [--anomaly-rate F]
-    python main.py train       [--data-dir PATH] [--model-dir PATH] [--sessions-per-player N]
-                                [--data-source {synthetic,kinexon}] [--use-event-features]
-    python main.py evaluate    [--data-dir PATH] [--model-dir PATH] [--out PATH]
-                                [--data-source {synthetic,kinexon}] [--use-event-features]
-    python main.py serve       [--model-dir PATH] [--min-alert-windows N]
-    python main.py publish     [--historical-replay | --continuous] [--model-dir PATH]
-    python main.py ingest      [--data-dir PATH] [--output-dir PATH]
-    python main.py audit       [--log PATH] [--out PATH]
-    python main.py orchestrate --match-id MATCH_ID [--mode live|replay] [--speed N] [--tick-interval-seconds N]
-    python main.py replay      --match-id MATCH_ID [--speed N]
+    python main.py train    — load all ingested matches, train the shared
+                              backbone across all players, save checkpoint to
+                              models/shared_backbone.pt, write train_summary.json.
+
+    python main.py run      — single runtime entry point.
+                              Auto-selects mode:
+                                Live   — Backend connected + active match in Redis
+                                         → consume match.events/match.context
+                                         → publish analytics.* back to Redis
+                                Replay — no live backend detected
+                                         → replay the active match from disk
+                                         → publish identical Redis output
+
+Developer / CI commands:
+─────────────────────────────────────────────────
+    evaluate    score model against ground truth / real-data diagnostics
+    serve       stdin→events inference loop (newline-delimited JSON)
+    publish     publish pilot analytics to analytics.players (historical / continuous)
+    orchestrate tactical orchestrator (live or replay mode)
+    replay      replay a match through the full pipeline
+    audit       fairness audit + recalibration check
+    generate    synthesise training data
 
 Exit codes
 ──────────
@@ -126,6 +122,41 @@ def _exit(code: int, message: str) -> None:
     fn = logger.error if code != 0 else logger.info
     fn(message)
     sys.exit(code)
+
+
+def _detect_live_backend() -> Optional[str]:
+    """
+    Returns the active match_id if a live Backend session is writing to Redis
+    within the last 120 seconds, otherwise None.
+
+    Inspects match.context then match.events (most-to-least authoritative)
+    for a recent entry.  An entry written more than 120 s ago means the
+    Backend is idle or stopped — replay mode is the right choice.
+    """
+    import time as _time
+    from config.redis_client import RedisConnectionPool, StreamTopics
+
+    try:
+        client = RedisConnectionPool.client()
+        for stream in (StreamTopics.MATCH_CONTEXT, StreamTopics.MATCH_EVENTS):
+            entries = client.xrevrange(stream, count=1)
+            if not entries:
+                continue
+            raw_id = entries[0][0]
+            entry_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+            entry_ms = int(entry_id.split("-")[0])
+            age_s = (_time.time() * 1000.0 - entry_ms) / 1000.0
+            if age_s > 120.0:
+                continue  # stale — backend not currently active
+            fields = entries[0][1]
+            for key in (b"match_id", b"matchId", "match_id", "matchId"):
+                val = fields.get(key)
+                if val:
+                    return val.decode() if isinstance(val, bytes) else str(val)
+        return None
+    except Exception as exc:
+        logger.debug("_detect_live_backend: Redis inspection failed — %s", exc)
+        return None
 
 
 def _load_csvs(data_dir: Path) -> Dict[str, pd.DataFrame]:
@@ -388,7 +419,19 @@ def cmd_train(args: argparse.Namespace) -> None:
     train_summary.json, serve_state.json) so cmd_serve and downstream
     consumers are unaffected by which path trained the model.
     """
-    if args.data_source == "kinexon":
+    data_source = getattr(args, "data_source", "kinexon")
+    all_matches = getattr(args, "all_matches", True)
+    scope = "all ingested matches" if (data_source == "kinexon" and all_matches) else (
+        f"session {getattr(args, 'session_id', '?')}" if data_source == "kinexon" else "synthetic data"
+    )
+    print("\nPlayerDynamics Train")
+    print("─" * 42)
+    print(f"  Source     : {data_source}")
+    print(f"  Scope      : {scope}")
+    print(f"  Model dir  : {getattr(args, 'model_dir', 'models')}")
+    print("─" * 42 + "\n")
+
+    if data_source == "kinexon":
         _cmd_train_kinexon(args)
     else:
         _cmd_train_synthetic(args)
@@ -2027,6 +2070,13 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     incoming_dir = Path(args.incoming_dir)
     raw_matches_dir = Path(args.raw_matches_dir)
 
+    print("\nPlayerDynamics Ingest")
+    print("─" * 42)
+    print(f"  Drop zone  : {incoming_dir}")
+    print(f"  Matches    : {data_root}")
+    print(f"  Output     : {output_dir}")
+    print("─" * 42 + "\n")
+
     logger.info("ingest START | data_dir=%s output_dir=%s incoming_dir=%s", data_root, output_dir, incoming_dir)
 
     discovery = DatasetDiscoveryService(
@@ -2633,65 +2683,45 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # ── train ─────────────────────────────────────────────────────────────────
-    p_tr = sub.add_parser("train", help="Train model and save checkpoint")
+    p_tr = sub.add_parser(
+        "train",
+        help=(
+            "Train the shared backbone on all ingested matches and save the "
+            "checkpoint to models/shared_backbone.pt. Run `ingest` first if "
+            "you have new match exports."
+        ),
+    )
+    p_tr.add_argument("--data-dir", default="data", help="Root directory containing match_<id>/ subdirectories")
+    p_tr.add_argument("--model-dir", default="models", help="Checkpoint output directory")
     p_tr.add_argument(
         "--data-source",
         choices=["synthetic", "kinexon"],
-        default="synthetic",
-        help="synthetic: five-CSV generated dataset (regression-testing path, "
-             "unchanged default). kinexon: real UWB tracking export via "
-             "KinexonAdapter -> KinexonResampler -> gap-aware windowing -> "
-             "BaselineBuilder.compute_with_fallback() (preferred for production "
-             "runs against real session data).",
+        default="kinexon",
+        help=(
+            "kinexon (default): train on all real ingested match data — "
+            "the normal production path. "
+            "synthetic: five-CSV generated dataset (developer / CI path)."
+        ),
     )
-    p_tr.add_argument("--data-dir", default="data", help="CSV/Kinexon-export source directory")
+    # --all-matches defaults to True for the simplified production interface;
+    # --no-all-matches reverts to single-session training for developers.
+    p_tr.add_argument("--all-matches", action="store_true", default=True, help=argparse.SUPPRESS)
     p_tr.add_argument(
-        "--model-dir", default="models", help="Checkpoint output directory"
+        "--no-all-matches",
+        dest="all_matches",
+        action="store_false",
+        help="kinexon only: train on --session-id only instead of all matches.",
     )
-    p_tr.add_argument(
-        "--sessions-per-player",
-        type=int,
-        default=60,
-        help="Max sessions per player loaded for training (synthetic path only)",
-    )
-    p_tr.add_argument(
-        "--session-id",
-        default="3387",
-        help="Kinexon session identifier to train on (kinexon path only; "
-             "validated against the real session 3387 export so far)",
-    )
+    p_tr.add_argument("--session-id", default="3387", help=argparse.SUPPRESS)
     p_tr.add_argument(
         "--use-event-features",
         action="store_true",
         default=False,
-        help="kinexon path only. Extend the 8 positions.csv-derived sequence "
-             "features with 24 window-aggregated events.csv features "
-             "(acceleration/deceleration/sprint/jump/change-of-direction/"
-             "possession/pass/shot). Default False keeps the original "
-             "8-feature model byte-for-byte reproducible.",
+        help="kinexon only: merge 24 event-derived features into the input window.",
     )
-    p_tr.add_argument(
-        "--all-matches",
-        action="store_true",
-        default=False,
-        help="kinexon path only. Auto-discovers every data/match_<id>/ directory "
-             "(see ingestion/dataset_discovery.py) and trains the shared backbone "
-             "on ALL of them merged, using ALL players (SC Magdeburg + opponents) "
-             "by default -- maximizes real training data. Ignores --session-id. "
-             "Reports SCM vs OPPONENT player counts and matches/windows used in "
-             "train_summary.json. Coach-facing outputs remain SCM-only regardless "
-             "(filtered downstream in analysis/player_trends.py and main.py publish).",
-    )
-    p_tr.add_argument(
-        "--save-serve-state",
-        action="store_true",
-        help="Save serve state (baselines, thresholds) for faster serving",
-    )
-    p_tr.add_argument(
-        "--checkpoint-path", default=None,
-        help="If set, also copies the trained checkpoint here after training "
-             "(in addition to its normal --model-dir/shared_backbone.pt location).",
-    )
+    p_tr.add_argument("--sessions-per-player", type=int, default=60, help=argparse.SUPPRESS)
+    p_tr.add_argument("--save-serve-state", action="store_true", help=argparse.SUPPRESS)
+    p_tr.add_argument("--checkpoint-path", default=None, help=argparse.SUPPRESS)
 
     # ── evaluate ──────────────────────────────────────────────────────────────
     p_ev = sub.add_parser("evaluate", help="Score model against ground truth / real-data diagnostics")
@@ -2897,6 +2927,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory containing shared_backbone.pt for LSTM scoring. [default: models]",
     )
 
+    # ── run (primary: single runtime entry point) ─────────────────────────────
+    p_run = sub.add_parser(
+        "run",
+        help=(
+            "Start the PlayerDynamics runtime. "
+            "Automatically selects Live mode (Backend connected + active match) "
+            "or Replay mode (no live backend → replays the active match from disk). "
+            "All analytics are published to Redis in both modes."
+        ),
+    )
+    p_run.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help=(
+            "Replay mode only: speed multiplier. "
+            "1.0 = realtime, 5.0 = 5× faster, 0 = instant (no delay). [default: 1.0]"
+        ),
+    )
+    p_run.add_argument(
+        "--model-dir",
+        default="models",
+        help="Directory containing shared_backbone.pt for LSTM scoring. [default: models]",
+    )
+
     return parser
 
 
@@ -3090,6 +3145,325 @@ def cmd_replay(args: argparse.Namespace) -> None:
     _run_replay(args)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime health dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_status_display(
+    stop: "threading.Event",
+    engine_thread: "threading.Thread",
+) -> None:
+    """
+    Draws a live-updating health panel on stdout while the engine thread runs.
+    Polls Redis and the in-process RuntimeStatusTracker every 1.5 s; exits
+    when stop is set or engine_thread finishes.
+    """
+    import time
+    import threading
+
+    from config.redis_client import RedisConnectionPool, StreamTopics
+    from config.runtime_status import get_tracker
+
+    G = "\033[32m"   # green
+    R = "\033[31m"   # red
+    Y = "\033[33m"   # yellow
+    B = "\033[1m"    # bold
+    D = "\033[2m"    # dim
+    N = "\033[0m"    # reset
+    CLR = "\033[2J\033[H"  # clear + cursor home
+
+    STREAMS = [
+        (StreamTopics.ANALYTICS_PLAYERS,         "analytics.players"),
+        (StreamTopics.ANALYTICS_PLAYER_WORKLOAD,  "analytics.player_workload"),
+        (StreamTopics.ANALYTICS_POSSESSIONS,      "analytics.possessions"),
+        (StreamTopics.ANALYTICS_TEAMSTATE,        "analytics.teamstate"),
+        (StreamTopics.ANALYTICS_TRENDS,           "analytics.trends"),
+        (StreamTopics.ANALYTICS_INSIGHTS,         "analytics.insights"),
+        (StreamTopics.ANALYTICS_SITUATIONS,       "analytics.situations"),
+    ]
+
+    tracker = get_tracker()
+
+    def _age(t: float) -> str:
+        s = time.time() - t
+        if s < 2:   return "just now"
+        if s < 60:  return f"{int(s)} seconds ago"
+        return f"{int(s // 60)}m {int(s % 60)}s ago"
+
+    def _ok(label: str) -> str:
+        return f"  {G}✓{N} {label}"
+
+    def _no(label: str) -> str:
+        return f"  {R}✗{N} {label}"
+
+    while not stop.is_set() and engine_thread.is_alive():
+        now = time.time()
+        lines: list[str] = []
+
+        # ── header ─────────────────────────────────────────────────────────
+        elapsed = int(now - tracker.start_time)
+        uptime  = f"{elapsed // 60}m {elapsed % 60:02d}s"
+        lines.append(f"\n{B}PlayerDynamics Runtime{N}  {D}uptime {uptime}{N}")
+        lines.append("─" * 52)
+        lines.append(f"  Mode    : {tracker.mode.capitalize()}")
+        lines.append(f"  Match   : {tracker.match_id}  ({tracker.match_label})")
+        if tracker.mode == "replay":
+            speed_str = "instant" if tracker.speed == 0 else f"{tracker.speed}×"
+            lines.append(f"  Speed   : {speed_str}")
+        lines.append("")
+
+        # ── redis ──────────────────────────────────────────────────────────
+        client = None
+        try:
+            client = RedisConnectionPool.client()
+            client.ping()
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+            client = None
+
+        lines.append(f"{B}Redis:{N}")
+        lines.append(_ok("Connected") if redis_ok else _no("Not Connected"))
+        lines.append("")
+
+        # ── backend connection ─────────────────────────────────────────────
+        backend_consuming = False
+        backend_producing = False
+        backend_consumer_count = 0
+
+        if client:
+            try:
+                groups = client.xinfo_groups(StreamTopics.ANALYTICS_PLAYERS)
+                for g in groups:
+                    c = g.get(b"consumers", g.get("consumers", 0))
+                    if isinstance(c, (int, float)) and int(c) > 0:
+                        backend_consuming = True
+                        backend_consumer_count = int(c)
+            except Exception:
+                pass
+
+            try:
+                for s in (StreamTopics.MATCH_CONTEXT, StreamTopics.MATCH_EVENTS):
+                    entries = client.xrevrange(s, count=1)
+                    if not entries:
+                        continue
+                    raw_id = entries[0][0]
+                    eid = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+                    age_s = (now * 1000.0 - int(eid.split("-")[0])) / 1000.0
+                    if age_s < 120:
+                        backend_producing = True
+                        break
+            except Exception:
+                pass
+
+        backend_connected = backend_consuming or backend_producing
+        lines.append(f"{B}Backend Connection:{N}")
+        if backend_connected:
+            detail = "consuming analytics" if backend_consuming else "producing match events"
+            lines.append(_ok(f"Connected  {D}({detail}){N}"))
+        else:
+            lines.append(_no("Not Detected"))
+        lines.append("")
+
+        # ── streams ────────────────────────────────────────────────────────
+        lines.append(f"{B}Streams Publishing:{N}")
+        for topic, name in STREAMS:
+            count  = tracker.stream_count(topic)
+            xlen   = 0
+            if client:
+                try:
+                    xlen = client.xlen(topic)
+                except Exception:
+                    pass
+            if count > 0 or xlen > 0:
+                detail = f"{count} published this run" if count > 0 else f"{xlen} in stream"
+                lines.append(_ok(f"{name:<35}  {D}{detail}{N}"))
+            else:
+                lines.append(_no(f"{name:<35}  {D}no data yet{N}"))
+        lines.append("")
+
+        # ── backend consumer ───────────────────────────────────────────────
+        lines.append(f"{B}Backend Consumer:{N}")
+        if backend_consuming:
+            noun = "consumer" if backend_consumer_count == 1 else "consumers"
+            lines.append(_ok(f"Active  {D}({backend_consumer_count} {noun}){N}"))
+        else:
+            lines.append(_no("Not Detected"))
+        lines.append("")
+
+        # ── last publish ───────────────────────────────────────────────────
+        last_any = tracker.last_publish_any()
+        lines.append(f"{B}Last Publish:{N}")
+        if last_any:
+            lines.append(f"  {_age(last_any)}")
+        else:
+            lines.append(f"  {Y}waiting for first publish…{N}")
+        lines.append("")
+        lines.append(f"  {D}Ctrl+C to stop{N}")
+
+        sys.stdout.write(CLR + "\n".join(lines) + "\n")
+        sys.stdout.flush()
+        stop.wait(1.5)
+
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Primary command: run
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """
+    Single runtime entry point. Automatically selects the correct mode:
+
+    Live mode
+        Condition : a live Backend is publishing to Redis (match.context or
+                    match.events has an entry written within the last 120 s).
+        Behaviour : consume match.events / match.context and publish
+                    analytics.possessions / .teamstate / .trends / .insights /
+                    .situations / .players / .player_workload back to Redis,
+                    on every tick.
+
+    Replay mode
+        Condition : no live backend detected.
+        Behaviour : replay the active match from its ingested CSV files through
+                    the full pipeline (tactical + LSTM/workload), publishing
+                    identical Redis output to what a live match would produce.
+                    Active match is resolved via active_match.json → most
+                    recent in match_inventory.json (same as `main.py replay`).
+
+    The user never needs to choose between replay / publish / orchestrate.
+    """
+    import signal
+    import threading
+
+    from config.redis_client import check_redis_connection
+    from analysis.match_resolver import MatchResolver
+    from analysis.dataset_manager import MatchDatasetManager
+
+    _TITLE = "PlayerDynamics Runtime"
+    _LINE  = "─" * 42
+
+    from config.runtime_status import get_tracker
+
+    # ── Redis is required in both modes ───────────────────────────────────────
+    if not check_redis_connection():
+        logger.error(
+            "run: Redis is not reachable at the configured address. "
+            "Start Redis and retry."
+        )
+        sys.exit(1)
+
+    # ── Mode detection ────────────────────────────────────────────────────────
+    live_match_id = _detect_live_backend()
+    speed         = float(getattr(args, "speed", 1.0))
+    model_dir     = getattr(args, "model_dir", "models")
+
+    if live_match_id:
+        # ── LIVE MODE ─────────────────────────────────────────────────────────
+        resolver = MatchResolver()
+        label    = resolver._label_for(live_match_id)
+        label_str = f"  ({label})" if label else ""
+
+        print(f"\n{_TITLE}")
+        print(_LINE)
+        print(f"  Mode    : Live")
+        print(f"  Match   : {live_match_id}{label_str}")
+        print(f"  Source  : Redis  (Backend active)")
+        print(_LINE + "\n")
+
+        logger.info("run: LIVE mode selected — match=%s label=%s", live_match_id, label)
+
+        # Populate args fields cmd_orchestrate expects
+        args.match_id             = live_match_id
+        args.mode                 = "live"
+        args.tick_interval_seconds = float(getattr(args, "tick_interval_seconds", 5.0))
+        args.consumer_name        = getattr(args, "consumer_name", "playerdynamics-1")
+        args.read_count           = int(getattr(args, "read_count", 200))
+
+        tracker = get_tracker()
+        tracker.mode        = "live"
+        tracker.match_id    = live_match_id
+        tracker.match_label = label or live_match_id
+        tracker.speed       = 1.0
+
+        stop = threading.Event()
+        dashboard = threading.Thread(
+            target=_run_status_display,
+            args=(stop, threading.main_thread()),
+            daemon=True,
+            name="status-display",
+        )
+        dashboard.start()
+        try:
+            cmd_orchestrate(args)
+        finally:
+            stop.set()
+
+    else:
+        # ── REPLAY MODE ───────────────────────────────────────────────────────
+        resolver = MatchResolver()
+        try:
+            match_id = resolver.resolve(hint=None, prefer_live=False)
+        except RuntimeError as exc:
+            logger.error(
+                "run: cannot resolve a match for replay — %s\n"
+                "     Run `python main.py ingest` first to register match data.",
+                exc,
+            )
+            sys.exit(1)
+
+        manager = MatchDatasetManager()
+        try:
+            dataset = manager.get(match_id)
+        except KeyError:
+            logger.error(
+                "run: match %s is not in the dataset manager. "
+                "Run `python main.py ingest` to rebuild the inventory.",
+                match_id,
+            )
+            sys.exit(1)
+
+        speed_label = "instant  (no delay)" if speed == 0 else f"{speed}×"
+
+        print(f"\n{_TITLE}")
+        print(_LINE)
+        print(f"  Mode    : Replay")
+        print(f"  Match   : {match_id}  ({dataset.label})")
+        print(f"  Source  : Active Match  (no live backend detected)")
+        print(f"  Speed   : {speed_label}")
+        print(_LINE + "\n")
+
+        logger.info(
+            "run: REPLAY mode selected — match=%s label=%s speed=%.1f",
+            match_id, dataset.label, speed,
+        )
+
+        tracker = get_tracker()
+        tracker.mode        = "replay"
+        tracker.match_id    = match_id
+        tracker.match_label = dataset.label
+        tracker.speed       = speed
+
+        args.match_id  = match_id
+        args.speed     = speed
+        args.model_dir = model_dir
+
+        stop = threading.Event()
+        dashboard = threading.Thread(
+            target=_run_status_display,
+            args=(stop, threading.main_thread()),
+            daemon=True,
+            name="status-display",
+        )
+        dashboard.start()
+        try:
+            _run_replay(args)
+        finally:
+            stop.set()
+
+
 def main() -> None:
     # Windows consoles often default stdout to a legacy codepage (cp1252),
     # which raises UnicodeEncodeError on any non-Latin-1 character -- e.g.
@@ -3112,16 +3486,19 @@ def main() -> None:
     logger.info("Players Data pipeline | command=%s", args.command)
 
     dispatch = {
-        "generate": cmd_generate,
-        "train": cmd_train,
-        "evaluate": cmd_evaluate,
-        "serve": cmd_serve,
-        "audit": cmd_audit,
-        "ingest": cmd_ingest,
-        "publish": cmd_publish,
-        "status": cmd_status,
+        # ── Primary commands ───────────────────────────────────────────────────
+        "ingest":     cmd_ingest,
+        "train":      cmd_train,
+        "run":        cmd_run,
+        # ── Developer / CI commands (still fully functional) ──────────────────
+        "generate":   cmd_generate,
+        "evaluate":   cmd_evaluate,
+        "serve":      cmd_serve,
+        "publish":    cmd_publish,
         "orchestrate": cmd_orchestrate,
-        "replay": cmd_replay,
+        "replay":     cmd_replay,
+        "audit":      cmd_audit,
+        "status":     cmd_status,
     }
 
     try:

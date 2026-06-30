@@ -1174,7 +1174,17 @@ class RedisStreamProducer:
 
         try:
             entry_id = _with_retry(_do, self._max_attempts, self._backoff_s)
-            logger.debug("RedisStreamProducer.publish: stream=%s id=%s", stream, entry_id)
+            payload_type = fields.get("type", fields.get(b"type", "unknown"))
+            payload_size = len(fields.get("payload", fields.get(b"payload", "")))
+            logger.info(
+                "COMMS → PUBLISH  stream=%-40s  id=%s  type=%s  bytes=%d",
+                stream, entry_id, payload_type, payload_size,
+            )
+            try:
+                from config.runtime_status import get_tracker
+                get_tracker().record_publish(stream)
+            except Exception:
+                pass
             return entry_id
         except RedisError:
             logger.exception("RedisStreamProducer.publish: failed for stream=%s", stream)
@@ -1280,7 +1290,14 @@ class RedisStreamConsumer:
 
         try:
             result = _with_retry(_do, self._max_attempts, self._backoff_s)
-            return _flatten_xreadgroup(result)
+            entries = _flatten_xreadgroup(result)
+            if entries:
+                ids = [eid for eid, _ in entries]
+                logger.info(
+                    "COMMS ← READ_NEW stream=%-40s  count=%d  ids=%s",
+                    self.stream, len(entries), ids,
+                )
+            return entries
         except RedisError:
             logger.exception("RedisStreamConsumer.read_new: failed stream=%s group=%s",
                               self.stream, self.group)
@@ -1302,7 +1319,14 @@ class RedisStreamConsumer:
 
         try:
             result = _with_retry(_do, self._max_attempts, self._backoff_s)
-            return _flatten_xreadgroup(result)
+            entries = _flatten_xreadgroup(result)
+            if entries:
+                ids = [eid for eid, _ in entries]
+                logger.info(
+                    "COMMS ← READ_PND stream=%-40s  count=%d  ids=%s  (pending/retry)",
+                    self.stream, len(entries), ids,
+                )
+            return entries
         except RedisError:
             logger.exception("RedisStreamConsumer.read_pending: failed stream=%s group=%s",
                               self.stream, self.group)

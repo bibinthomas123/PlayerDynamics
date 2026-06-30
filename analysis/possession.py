@@ -91,7 +91,6 @@ from ingestion.tactical_event import TacticalEvent
 
 logger = logging.getLogger(__name__)
 
-_OUTCOME_SCORE = {"shot": 1.0, "neutral": 0.5, "turnover": 0.0}
 _TERMINATOR_TYPES = ("shot", "turnover")
 
 
@@ -107,7 +106,10 @@ class Possession:
 
     # Counts
     pass_count: int
-    shot_count: int
+    shot_count: int          # total shots (goal + saved + missed + unknown)
+    goal_count: int          # subset of shot_count confirmed as GOAL by coach
+    saved_shot_count: int    # subset confirmed as SAVED by coach
+    missed_shot_count: int   # subset confirmed as MISSED by coach
     turnover_count: int
     sprint_count: int
     acceleration_count: int
@@ -152,6 +154,18 @@ def _build_possession(
     acceleration_count = _count(events, "acceleration_event")
     physical_action_count = sum(_count(events, t) for t in PHYSICAL_EVENT_TYPES)
 
+    # Coach-annotated shot outcome sub-counts (zero when no fusion has occurred)
+    def _shot_outcome_count(label: str) -> int:
+        return sum(
+            1 for e in events
+            if e.event_type == "shot"
+            and (e.metadata or {}).get("shot_outcome") == label
+        )
+
+    goal_count = _shot_outcome_count("GOAL")
+    saved_shot_count = _shot_outcome_count("SAVED")
+    missed_shot_count = _shot_outcome_count("MISSED")
+
     duration_seconds = max((end_ts - start_ts).total_seconds(), 0.0)
     per_minute = (60.0 / duration_seconds) if duration_seconds > 0 else 0.0
 
@@ -159,7 +173,25 @@ def _build_possession(
     physical_intensity = physical_action_count * per_minute
     transition_intensity = (sprint_count + acceleration_count) * per_minute
 
-    outcome_score = _OUTCOME_SCORE[outcome]
+    # Outcome score — shot possessions use the finer-grained label when available.
+    if outcome == "shot":
+        shot_events = [e for e in events if e.event_type == "shot"]
+        shot_outcome_label = (
+            (shot_events[-1].metadata or {}).get("shot_outcome", "UNKNOWN")
+            if shot_events else "UNKNOWN"
+        )
+        _shot_score_map = {
+            "GOAL":    config.outcome_score_goal,
+            "SAVED":   config.outcome_score_saved,
+            "MISSED":  config.outcome_score_missed,
+            "UNKNOWN": config.outcome_score_shot_unknown,
+        }
+        outcome_score = _shot_score_map.get(shot_outcome_label, config.outcome_score_shot_unknown)
+    elif outcome == "turnover":
+        outcome_score = config.outcome_score_turnover
+    else:
+        outcome_score = config.outcome_score_neutral
+
     attack_norm = (
         min(1.0, attack_intensity / config.reference_attack_rate_per_min)
         if config.reference_attack_rate_per_min > 0 else 0.0
@@ -177,6 +209,9 @@ def _build_possession(
         duration_seconds=round(duration_seconds, 3),
         pass_count=pass_count,
         shot_count=shot_count,
+        goal_count=goal_count,
+        saved_shot_count=saved_shot_count,
+        missed_shot_count=missed_shot_count,
         turnover_count=turnover_count,
         sprint_count=sprint_count,
         acceleration_count=acceleration_count,

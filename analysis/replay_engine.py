@@ -194,7 +194,7 @@ class ReplayEngine:
         tactical_adapter = KinexonTacticalEventAdapter()
         events = sorted(
             tactical_adapter.parse(dataset.events_path, player_meta=player_meta, match_id=dataset.match_id),
-            key=lambda e: e.ts_ms,
+            key=lambda e: e.timestamp,
         )
         logger.info("ReplayEngine [tactical]: %d events loaded", len(events))
 
@@ -203,28 +203,33 @@ class ReplayEngine:
 
         orchestrator = MatchOrchestrator(match_id=dataset.match_id, player_meta=player_meta)
         timer = ReplayTimer(self._speed)
-        timer.calibrate(events[0].ts_ms)
 
-        last_tick_match_ms = events[0].ts_ms
+        def _ts_ms(e) -> float:
+            return e.timestamp.timestamp() * 1000.0
+
+        timer.calibrate(_ts_ms(events[0]))
+
+        last_tick_match_ms = _ts_ms(events[0])
         tick_interval_ms = self._tick_interval_match_s * 1000.0
         n_published = 0
 
         for event in events:
             if stop.is_set():
                 break
-            timer.wait_until(event.ts_ms)
+            event_ms = _ts_ms(event)
+            timer.wait_until(event_ms)
             orchestrator.ingest_event(event)
 
-            if (event.ts_ms - last_tick_match_ms) >= tick_interval_ms:
+            if (event_ms - last_tick_match_ms) >= tick_interval_ms:
                 new_objects = orchestrator.tick()
                 published = MatchOrchestrator.publish(producer, new_objects)
                 if published:
                     n_published += published
                     logger.debug(
-                        "ReplayEngine [tactical]: tick at match_ms=%d → %d objects published",
-                        event.ts_ms, published,
+                        "ReplayEngine [tactical]: tick at match_ms=%.0f → %d objects published",
+                        event_ms, published,
                     )
-                last_tick_match_ms = event.ts_ms
+                last_tick_match_ms = event_ms
 
         # Final tick + finalize
         if not stop.is_set():
